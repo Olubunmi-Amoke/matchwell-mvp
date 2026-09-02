@@ -1,0 +1,11 @@
+entrypoint = "app/main.py"
+run = ["streamlit", "run", "app/main.py", "--server.address=0.0.0.0", "--server.port=7860"]
+modules = ["python-3.12"]
+
+[[ports]]
+localPort = 7860
+externalPort = 80
+
+[deployment]
+deploymentTarget = "autoscale"
+run = ["streamlit", "run", "app/main.py", "--server.address=0.0.0.0", "--server.port=7860"]
