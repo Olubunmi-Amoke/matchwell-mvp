@@ -1,6 +1,8 @@
+import logging
+
 import streamlit as st
 from alembic.util.exc import CommandError
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
@@ -29,6 +31,8 @@ st.set_page_config(
     page_icon=":handshake:",
     layout="wide",
 )
+
+logger = logging.getLogger(__name__)
 
 
 @st.cache_resource
@@ -132,18 +136,47 @@ if not bool(getattr(st.user, "is_logged_in", False)):
 
 try:
     service = build_service(settings)
+except CommandError:
+    logger.exception("Database migration configuration failed.")
+    st.title("Matchwell")
+    st.error("Database migration configuration failed.")
+    st.caption("Confirm MATCHWELL_AUTO_MIGRATE = true, save secrets, and reboot.")
+    st.stop()
+except OperationalError:
+    logger.exception("Database connection failed during application startup.")
+    st.title("Matchwell")
+    st.error("The database became unavailable during application startup.")
+    st.caption("Verify the hosted DATABASE_URL and that the database is active.")
+    st.stop()
+except (RuntimeError, SQLAlchemyError):
+    logger.exception("Database migration failed during application startup.")
+    st.title("Matchwell")
+    st.error("The database schema could not be prepared.")
+    st.caption("Review the Streamlit logs for the migration error type.")
+    st.stop()
+
+try:
     actor = service.sign_in(current_identity())
 except MatchwellError as error:
     st.title("Matchwell")
     st.error(str(error))
     st.stop()
-except (CommandError, RuntimeError, SQLAlchemyError):
+except ProgrammingError:
+    logger.exception("Required database schema is unavailable.")
     st.title("Matchwell")
-    st.error("Application setup is incomplete. Contact the pilot administrator.")
-    st.caption(
-        "If this is the first deployment, enable MATCHWELL_AUTO_MIGRATE and "
-        "configure MATCHWELL_ADMIN_EMAILS in Streamlit secrets."
-    )
+    st.error("The readiness database tables are missing.")
+    st.caption("Set MATCHWELL_AUTO_MIGRATE = true, save secrets, and reboot.")
+    st.stop()
+except OperationalError:
+    logger.exception("Database connection failed during account bootstrap.")
+    st.title("Matchwell")
+    st.error("The database became unavailable while signing in.")
+    st.stop()
+except SQLAlchemyError:
+    logger.exception("Account bootstrap failed.")
+    st.title("Matchwell")
+    st.error("The administrator account could not be prepared.")
+    st.caption("Review the Streamlit logs for the database error type.")
     st.stop()
 
 if actor is None:
