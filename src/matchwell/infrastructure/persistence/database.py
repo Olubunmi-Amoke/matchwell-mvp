@@ -1,7 +1,10 @@
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
@@ -27,6 +30,20 @@ def create_database_engine(database_url: str) -> Engine:
         connect_args=connect_args,
         pool_pre_ping=True,
     )
+
+
+def upgrade_database(database_url: str) -> None:
+    config = Config(str(Path(__file__).parents[4] / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    engine = create_database_engine(database_url)
+    lock_key = 6_409_402_025
+    with engine.begin() as connection:
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": lock_key},
+        )
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
 
 
 class DatabaseSessionFactory:

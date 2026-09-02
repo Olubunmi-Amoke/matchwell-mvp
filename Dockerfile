@@ -19,7 +19,7 @@ RUN uv sync --frozen --no-dev --no-editable
 COPY --chown=user:user app ./app
 COPY --chown=user:user migrations ./migrations
 COPY --chown=user:user alembic.ini ./
-COPY --chown=user:user .streamlit ./.streamlit
+COPY --chown=user:user .streamlit/config.toml ./.streamlit/config.toml
 
 EXPOSE 7860
 

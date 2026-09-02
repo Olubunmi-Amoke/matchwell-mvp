@@ -10,6 +10,7 @@ from matchwell.infrastructure.persistence.database import (
     DatabaseSessionFactory,
     SqlAlchemyDatabaseProbe,
     create_database_engine,
+    upgrade_database,
 )
 from matchwell.infrastructure.persistence.models import (
     AuditEventRecord,
@@ -61,3 +62,22 @@ def test_session_factory_uses_configured_engine() -> None:
 def test_foundation_tables_are_registered() -> None:
     assert AuditEventRecord.__tablename__ == "audit_events"
     assert OutboxMessageRecord.__tablename__ == "outbox_messages"
+
+
+def test_database_upgrade_uses_one_locked_connection(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    engine = MagicMock(spec=Engine)
+    connection = engine.begin.return_value.__enter__.return_value
+    monkeypatch.setattr(database, "create_database_engine", lambda _: engine)
+    upgrade = MagicMock()
+    monkeypatch.setattr(
+        "matchwell.infrastructure.persistence.database.command.upgrade",
+        upgrade,
+    )
+
+    upgrade_database("postgresql+psycopg://configured")
+
+    assert "pg_advisory_xact_lock" in str(connection.execute.call_args.args[0])
+    config = upgrade.call_args.args[0]
+    assert config.attributes["connection"] is connection

@@ -60,6 +60,32 @@ Import the repository into Replit. The `.replit` file starts Streamlit on
 `0.0.0.0:7860` and maps it to the public web port. Configure `DATABASE_URL`
 through Replit Secrets.
 
+## Pilot sign-in and first-run setup
+
+The pilot uses Google OpenID Connect for authentication. Matchwell separately
+enforces invitations, roles, counselor assignments, Center access, holds, and
+eligibility.
+
+1. In Google Cloud Console, create or select a project.
+2. Configure the OAuth consent screen for an external application.
+3. Create an OAuth 2.0 **Web application** client.
+4. Add your deployed app URL as an authorized JavaScript origin.
+5. Add `https://YOUR-APP.streamlit.app/oauth2callback` as an authorized redirect
+   URI.
+6. Copy `.streamlit/secrets.toml.example` into the Streamlit Community Cloud
+   secrets editor and replace every placeholder.
+7. Set `MATCHWELL_ADMIN_EMAILS` to the exact Google email addresses that may
+   bootstrap the pilot administrator workspace.
+8. Reboot the app. With `MATCHWELL_AUTO_MIGRATE = true`, startup applies the
+   versioned PostgreSQL migrations under an advisory lock.
+
+Do not commit `.streamlit/secrets.toml`. It is ignored by both Git and the
+Docker build context.
+
+After the administrator signs in, use **Pilot operations** to invite members
+and counselors. Invitees must sign in with the exact Google email address used
+in their active invitation.
+
 ### Quality checks
 
 ```powershell

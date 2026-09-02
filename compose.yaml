@@ -4,6 +4,8 @@ services:
       context: .
     environment:
       DATABASE_URL: postgresql+psycopg://matchwell:${POSTGRES_PASSWORD:-matchwell_dev}@db:5432/matchwell
+      MATCHWELL_ADMIN_EMAILS: ${MATCHWELL_ADMIN_EMAILS:-admin@example.com}
+      MATCHWELL_AUTO_MIGRATE: "true"
       MATCHWELL_ENVIRONMENT: development
     ports:
       - "7860:7860"
