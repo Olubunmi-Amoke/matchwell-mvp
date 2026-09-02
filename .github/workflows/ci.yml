@@ -12,6 +12,22 @@ permissions:
 jobs:
   python:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: matchwell_test
+          POSTGRES_USER: matchwell
+          POSTGRES_PASSWORD: matchwell_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U matchwell -d matchwell_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://matchwell:matchwell_test@localhost:5432/matchwell_test
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +48,12 @@ jobs:
 
       - name: Type check
         run: uv run --no-sync mypy
+
+      - name: Validate PostgreSQL migrations
+        run: |
+          uv run --no-sync alembic upgrade head
+          uv run --no-sync alembic downgrade base
+          uv run --no-sync alembic upgrade head
 
       - name: Test
         run: uv run --no-sync pytest

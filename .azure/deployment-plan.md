@@ -1,6 +1,83 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Validated
+> **Status:** Milestone complete
+
+## Active Milestone
+
+**Goal:** Implement the first usable readiness journey from invited member
+onboarding through community eligibility.
+
+**Requirements:** MW-PRD-001 through MW-PRD-007 and MW-PRD-013, limited to the
+first engineering milestone.
+
+**Identity decision:** Google OIDC through Streamlit's native authentication.
+Google proves identity; Matchwell remains authoritative for invitations, roles,
+assignments, Center access, and eligibility.
+
+### Member journey
+
+1. Sign in with Google.
+2. Match the verified email to an active, unused invitation.
+3. Complete an adult age gate and Christian faith affirmation.
+4. Accept the active consent version.
+5. Complete readiness-required profile fields.
+6. Complete the assigned, versioned readiness assessment.
+7. See counselor intake and screening status.
+8. Receive an explainable community eligibility result.
+
+### Operations journey
+
+- Bootstrap platform administrators from `MATCHWELL_ADMIN_EMAILS`.
+- Create single-use, expiring member and counselor invitations.
+- Assign counselors to members within the pilot Center.
+- Record structured counselor intake decisions.
+- Record provider-neutral screening status events idempotently.
+- Apply and release safety or administrative holds.
+- Review member progress without exposing assessment answers in queues or audit
+  events.
+
+### Application structure
+
+- Use Streamlit's dynamic `st.navigation` for member and operations workspaces.
+- Keep OIDC, Streamlit widgets, and SQLAlchemy outside the domain model.
+- Add repository ports and transactional SQLAlchemy adapters.
+- Add a deterministic readiness evaluator with hold precedence and
+  human-readable unmet requirements.
+- Append immutable audit events for consent, assignments, decisions, screening,
+  holds, and eligibility changes.
+- Append outbox events only when effective eligibility changes.
+- Extend Alembic with versioned pilot schema and seed configuration.
+- Permit explicitly enabled startup migration for Streamlit Community Cloud,
+  where no release shell is available.
+
+### Data minimization
+
+- Store only normalized screening states, provider references, reason codes, and
+  event identifiers; never screening reports.
+- Store assessment responses only in the assessment boundary and never include
+  them in progress queues, logs, or audit metadata.
+- Keep counselor notes out of the milestone; store structured decisions only.
+- Use opaque OIDC subject identifiers and normalized invited email addresses.
+
+### Test plan
+
+- Unit-test age calculation and deterministic readiness evaluation.
+- Integration-test the complete synthetic member journey against PostgreSQL.
+- Test invitation, role, assignment, and Center authorization boundaries.
+- Test duplicate screening events and eligibility-change outbox idempotency.
+- Test audit payloads for prohibited sensitive values.
+- Exercise member, counselor, and administrator navigation with Streamlit
+  application tests.
+
+**Out of scope:** Matching, introductions, messaging, payments, real screening
+provider connectivity, counselor notes, and automated decisions.
+
+**Implementation status:** Complete.
+
+**Validation status:** Ruff, formatting, strict mypy, 29 automated tests,
+95.20% backend coverage, Alembic offline SQL generation, and Streamlit HTTP
+startup verification passed. PostgreSQL migration round-trip validation is
+configured in CI.
 
 Generated: 2026-09-02T10:03:16-05:00
 

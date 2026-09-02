@@ -9,4 +9,5 @@ __pycache__
 docs
 tests
 .env
+.streamlit/secrets.toml
 *.pyc

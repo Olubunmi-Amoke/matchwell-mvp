@@ -31,3 +31,17 @@ def test_database_url_is_unwrapped_only_explicitly(
     assert settings.reveal_database_url() == (
         "postgresql+psycopg://user:secret@db:5432/matchwell"
     )
+
+
+def test_admin_emails_are_normalized(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "MATCHWELL_ADMIN_EMAILS",
+        " Owner@Example.com,second@example.com ",
+    )
+
+    settings = Settings()
+
+    assert settings.normalized_admin_emails() == {
+        "owner@example.com",
+        "second@example.com",
+    }

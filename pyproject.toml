@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.16,<2",
+    "authlib>=1.6,<2",
     "psycopg[binary]>=3.2,<4",
     "pydantic-settings>=2.10,<3",
     "sqlalchemy>=2.0,<3",
@@ -24,6 +25,10 @@ dev = [
 requires = ["uv_build>=0.11.19,<0.12.0"]
 build-backend = "uv_build"
 
+[[tool.uv.index]]
+url = "https://packagefeedproxy.microsoft.io/pypi/simple/"
+default = true
+
 [tool.ruff]
 line-length = 88
 target-version = "py312"
@@ -39,3 +44,6 @@ files = ["app", "src", "tests"]
 [tool.pytest.ini_options]
 addopts = "--cov=matchwell --cov-report=term-missing --cov-fail-under=90"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = ["src/matchwell/presentation/*"]
