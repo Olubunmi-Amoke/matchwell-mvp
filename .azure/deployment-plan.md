@@ -1,6 +1,6 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 Generated: 2026-09-02T10:03:16-05:00
 
@@ -153,7 +153,7 @@ remain an operator concern and are not provisioned by repository automation.
 - [x] Install declared dependencies
 - [x] Run formatting and static analysis
 - [x] Run automated tests
-- [ ] Build the Docker image - local container engine is unavailable; CI performs this check
+- [x] Build the Docker image in GitHub Actions
 - [x] Start the application and verify the health surface
 - [x] Record validation proof below
 
@@ -179,7 +179,8 @@ remain an operator concern and are not provisioned by repository automation.
 | Tests | `uv run --no-sync pytest` | 10 passed, 100% coverage | 2026-09-02T12:35:31-05:00 |
 | Migration generation | `alembic upgrade head --sql` | Pass | 2026-09-02T12:35:31-05:00 |
 | Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-02T12:35:31-05:00 |
-| Docker image | `docker build .` | Deferred to CI; Docker is not installed locally | 2026-09-02T12:35:31-05:00 |
+| Docker image | GitHub Actions `docker build .` | Pass | 2026-09-02T12:37:20-05:00 |
+| CI workflow | GitHub Actions `python` and `container` jobs | Pass | 2026-09-02T12:37:20-05:00 |
 
 ### Functional verification
 
@@ -188,6 +189,13 @@ remain an operator concern and are not provisioned by repository automation.
 - UI: Streamlit smoke test and local HTTP response tested
 - Notes: The application intentionally reports degraded readiness when
   `DATABASE_URL` is absent.
+
+### Role assignment verification
+
+- Status: Not applicable
+- Identities checked: None; this phase contains no Azure infrastructure
+- Roles confirmed: None required
+- Issues: None
 
 ---
 
@@ -209,4 +217,5 @@ remain an operator concern and are not provisioned by repository automation.
 
 ## 10. Next Step
 
-Run the repository validation workflow. Azure provisioning remains deferred.
+The application foundation is validated. Azure provisioning remains deferred
+until a subscription, region, and hosting architecture are approved.
