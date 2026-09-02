@@ -1,0 +1,212 @@
+# Matchwell Pilot Implementation Plan
+
+> **Status:** Ready for Validation
+
+Generated: 2026-09-02T10:03:16-05:00
+
+---
+
+## 1. Project Overview
+
+**Goal:** Create a portable Streamlit foundation for the Matchwell closed
+pilot. The application must run in Docker on developer machines, Hugging Face
+Spaces, and Replit while preserving clean seams for a later Next.js and ASP.NET
+Core implementation.
+
+**Path:** New Project
+
+**Current phase:** Application foundation only. No Azure deployment is included
+in this phase.
+
+---
+
+## 2. Requirements
+
+| Attribute | Value |
+|-----------|-------|
+| Classification | Production-facing closed pilot foundation |
+| Scale | Small: 30-300 invited users |
+| Budget | Balanced with low-cost pilot services |
+| Data residency | US-hosted services when external persistence is configured |
+| Hosting | Dockerized Streamlit on Hugging Face Spaces or Replit |
+| Persistence | PostgreSQL through `DATABASE_URL`; Docker Compose for local development |
+| Azure subscription | Not applicable; this phase provisions no Azure resources |
+| Azure location | Not applicable; this phase provisions no Azure resources |
+
+### Security baseline
+
+- No production secrets or member data in source, fixtures, logs, or prompts.
+- Configuration is supplied through environment variables.
+- The initial scaffold contains no simulated authentication that could be
+  mistaken for production authorization.
+- Health responses and logs contain no secrets or connection strings.
+- Synthetic fixtures are used for tests.
+
+---
+
+## 3. Components
+
+| Component | Type | Technology | Path |
+|-----------|------|------------|------|
+| Matchwell UI | Web application | Python 3.12, Streamlit | `app/` |
+| Application services | Use-case boundary | Python | `src/matchwell/application/` |
+| Domain | Business model boundary | Python | `src/matchwell/domain/` |
+| Persistence | Infrastructure adapter | SQLAlchemy, PostgreSQL | `src/matchwell/infrastructure/` |
+| Database migrations | Schema management | Alembic | `migrations/` |
+| Tests | Automated verification | pytest | `tests/` |
+| CI | Build and test | GitHub Actions | `.github/workflows/` |
+
+No specialized Copilot SDK, Azure Functions, or existing application framework
+was detected.
+
+---
+
+## 4. Delivery Recipe
+
+**Selected:** Portable Docker application
+
+**Rationale:**
+
+- A single Docker contract works on Hugging Face Docker Spaces, Replit, and
+  developer machines.
+- Streamlit provides the fastest collaborative prototype surface.
+- PostgreSQL preserves a relational model compatible with the target product.
+- Domain and application layers do not import Streamlit or SQLAlchemy, reducing
+  migration cost when Next.js and ASP.NET Core replace the prototype stack.
+- Azure Developer CLI and Bicep are deferred until Azure hosting is requested.
+
+---
+
+## 5. Architecture
+
+```text
+Streamlit UI
+    |
+Application services
+    |
+Domain model and ports
+    |
+SQLAlchemy adapters
+    |
+PostgreSQL
+```
+
+Streamlit owns presentation and session state only. Business rules live in the
+domain layer, orchestration lives in application services, and database details
+live behind repository interfaces. Future Next.js and ASP.NET Core services can
+replace the outer layers without changing the documented requirement IDs or
+domain language.
+
+### Runtime mapping
+
+| Component | Current runtime | Future target |
+|-----------|-----------------|---------------|
+| Web UI | Streamlit container on port 7860 | Next.js responsive PWA |
+| Application API | In-process application services | ASP.NET Core REST API |
+| Worker | Not generated in this foundation | Hosted worker with Service Bus |
+| Database | PostgreSQL via `DATABASE_URL` | Azure Database for PostgreSQL |
+| Secrets | Platform environment variables | Azure Key Vault and managed identity |
+| Monitoring | Structured standard output | Application Insights and Azure Monitor |
+
+---
+
+## 6. Provisioning Limit Checklist
+
+This phase creates no Azure resources, so Azure quota and capacity validation
+are not applicable. Hosting-account quotas for Hugging Face Spaces or Replit
+remain an operator concern and are not provisioned by repository automation.
+
+| Resource Type | Number to Deploy | Quota Validation |
+|---------------|------------------|------------------|
+| Azure resources | 0 | Not applicable |
+
+**Status:** No cloud resources are provisioned by this plan.
+
+---
+
+## 7. Execution Checklist
+
+### Phase 1: Planning
+
+- [x] Analyze workspace
+- [x] Gather classification, scale, budget, compliance, and hosting requirements
+- [x] Scan codebase and specialized technology markers
+- [x] Select portable Docker recipe
+- [x] Plan migration-friendly architecture
+- [x] Confirm PostgreSQL persistence approach
+- [x] User approved this plan
+
+### Phase 2: Application Foundation
+
+- [x] Scaffold Python package and Streamlit application
+- [x] Add typed environment configuration
+- [x] Add PostgreSQL connection and health adapter
+- [x] Add Alembic migration baseline
+- [x] Add Dockerfile and local Docker Compose stack
+- [x] Add Hugging Face Spaces and Replit-compatible runtime configuration
+- [x] Add unit and smoke tests
+- [x] Add GitHub Actions continuous integration
+- [x] Document local and hosted development workflows
+
+### Phase 3: Verification
+
+- [x] Install declared dependencies
+- [x] Run formatting and static analysis
+- [x] Run automated tests
+- [ ] Build the Docker image - local container engine is unavailable; CI performs this check
+- [x] Start the application and verify the health surface
+- [x] Record validation proof below
+
+### Phase 4: Future Azure Preparation
+
+- [ ] Confirm Azure subscription and US region
+- [ ] Select Azure hosting services and SKUs
+- [ ] Validate Azure quotas
+- [ ] Generate Bicep and `azure.yaml`
+- [ ] Invoke `azure-validate`
+- [ ] Invoke `azure-deploy` only after explicit deployment approval
+
+---
+
+## 8. Validation Proof
+
+| Check | Command | Result | Timestamp |
+|-------|---------|--------|-----------|
+| Dependency resolution | `uv sync --frozen --extra dev` | Pass | 2026-09-02T12:35:31-05:00 |
+| Lint | `uv run --no-sync ruff check .` | Pass | 2026-09-02T12:35:31-05:00 |
+| Formatting | `uv run --no-sync ruff format --check .` | Pass | 2026-09-02T12:35:31-05:00 |
+| Type check | `uv run --no-sync mypy` | Pass | 2026-09-02T12:35:31-05:00 |
+| Tests | `uv run --no-sync pytest` | 10 passed, 100% coverage | 2026-09-02T12:35:31-05:00 |
+| Migration generation | `alembic upgrade head --sql` | Pass | 2026-09-02T12:35:31-05:00 |
+| Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-02T12:35:31-05:00 |
+| Docker image | `docker build .` | Deferred to CI; Docker is not installed locally | 2026-09-02T12:35:31-05:00 |
+
+### Functional verification
+
+- Status: Verified
+- Backend: PostgreSQL probe behavior and migration SQL tested
+- UI: Streamlit smoke test and local HTTP response tested
+- Notes: The application intentionally reports degraded readiness when
+  `DATABASE_URL` is absent.
+
+---
+
+## 9. Files to Generate
+
+| File or directory | Purpose | Status |
+|-------------------|---------|--------|
+| `.azure/deployment-plan.md` | Implementation and future deployment plan | Complete |
+| `pyproject.toml` and `uv.lock` | Python dependencies and tool configuration | Complete |
+| `app/` | Streamlit presentation layer | Complete |
+| `src/matchwell/` | Domain, application, and infrastructure layers | Complete |
+| `migrations/` | PostgreSQL schema migrations | Complete |
+| `tests/` | Unit and smoke tests | Complete |
+| `Dockerfile` | Portable production image | Complete |
+| `compose.yaml` | Local application and PostgreSQL stack | Complete |
+| `.github/workflows/ci.yml` | Continuous integration | Complete |
+
+---
+
+## 10. Next Step
+
+Run the repository validation workflow. Azure provisioning remains deferred.
