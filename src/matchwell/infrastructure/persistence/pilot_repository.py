@@ -1,8 +1,9 @@
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -13,6 +14,21 @@ from matchwell.domain.access import (
     normalize_email,
 )
 from matchwell.domain.errors import ConflictError, NotFoundError, ValidationError
+from matchwell.domain.matching import (
+    BlockInput,
+    CandidateEvidence,
+    CandidateReviewItem,
+    CounselorReviewDecision,
+    Gender,
+    IntroductionView,
+    MatchedPairView,
+    MatchPreferencesInput,
+    MatchPreferencesView,
+    MatchScorer,
+    MemberResponseDecision,
+    ProposalStatus,
+    ReportInput,
+)
 from matchwell.domain.pilot import (
     AssessmentAnswers,
     AssessmentQuestion,
@@ -44,7 +60,11 @@ from matchwell.infrastructure.persistence.models import (
     CounselorDecisionRecord,
     HoldRecord,
     InvitationRecord,
+    MatchProposalRecord,
+    MemberBlockRecord,
+    MemberMatchPreferencesRecord,
     MemberProfileRecord,
+    MemberReportRecord,
     OutboxMessageRecord,
     ReadinessDecisionRecord,
     ScreeningCaseRecord,
@@ -54,6 +74,11 @@ from matchwell.infrastructure.persistence.models import (
 
 PILOT_CENTER_SLUG = "matchwell-pilot"
 READINESS_CONFIGURATION_VERSION = "pilot-v1"
+_OPEN_PROPOSAL_STATUSES = (
+    ProposalStatus.PENDING_REVIEW.value,
+    ProposalStatus.INTRODUCED.value,
+    ProposalStatus.ACTIVE.value,
+)
 
 
 class SqlAlchemyPilotRepository:
@@ -61,9 +86,11 @@ class SqlAlchemyPilotRepository:
         self,
         sessions: DatabaseSessionFactory,
         evaluator: ReadinessEvaluator,
+        scorer: MatchScorer | None = None,
     ) -> None:
         self._sessions = sessions
         self._evaluator = evaluator
+        self._scorer = scorer or MatchScorer()
 
     def resolve_identity(
         self,
@@ -663,6 +690,751 @@ class SqlAlchemyPilotRepository:
             session.flush()
             self._reevaluate(session, member_id, actor.id)
 
+    def get_match_preferences(self, member_id: uuid.UUID) -> MatchPreferencesView:
+        with self._sessions.session() as session:
+            record = session.get(MemberMatchPreferencesRecord, member_id)
+            if record is None:
+                return MatchPreferencesView(
+                    gender=None,
+                    min_partner_age=None,
+                    max_partner_age=None,
+                    completed=False,
+                )
+            return MatchPreferencesView(
+                gender=Gender(record.gender),
+                min_partner_age=record.min_partner_age,
+                max_partner_age=record.max_partner_age,
+                completed=True,
+            )
+
+    def save_match_preferences(
+        self,
+        member_id: uuid.UUID,
+        preferences: MatchPreferencesInput,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            self._member(session, member_id)
+            record = session.get(MemberMatchPreferencesRecord, member_id)
+            now = self._now()
+            if record is None:
+                session.add(
+                    MemberMatchPreferencesRecord(
+                        user_id=member_id,
+                        gender=preferences.gender.value,
+                        min_partner_age=preferences.min_partner_age,
+                        max_partner_age=preferences.max_partner_age,
+                        completed_at=now,
+                    )
+                )
+            else:
+                record.gender = preferences.gender.value
+                record.min_partner_age = preferences.min_partner_age
+                record.max_partner_age = preferences.max_partner_age
+                record.completed_at = now
+            self._audit(
+                session,
+                actor_id=member_id,
+                action="matching.preferences_saved",
+                subject_id=member_id,
+                center_id=self._member_center_id(session, member_id),
+                metadata={"gender": preferences.gender.value},
+            )
+            session.flush()
+
+    def generate_candidates(self, actor: AuthenticatedUser) -> int:
+        with self._sessions.session() as session, session.begin():
+            community = self._community(session, actor.center_id)
+            members = session.scalars(
+                select(UserRecord)
+                .where(
+                    UserRecord.center_id == actor.center_id,
+                    UserRecord.role == Role.MEMBER.value,
+                )
+                .with_for_update()
+            ).all()
+            evidences: list[CandidateEvidence] = []
+            for member in members:
+                readiness = self._reevaluate(
+                    session,
+                    member.id,
+                    actor.id,
+                    only_if_changed=True,
+                )
+                if not readiness.eligible:
+                    continue
+                preferences = session.get(MemberMatchPreferencesRecord, member.id)
+                profile = session.get(MemberProfileRecord, member.id)
+                if preferences is None or profile is None:
+                    continue
+                if self._has_open_proposal(session, member.id):
+                    continue
+                evidences.append(
+                    CandidateEvidence(
+                        member_id=member.id,
+                        gender=Gender(preferences.gender),
+                        age=self._age_on(profile.birth_date, self._now().date()),
+                        min_partner_age=preferences.min_partner_age,
+                        max_partner_age=preferences.max_partner_age,
+                        city=profile.city,
+                        state=profile.state,
+                        denomination=profile.denomination,
+                        relationship_intent=profile.relationship_intent,
+                    )
+                )
+            existing_pairs = {
+                (row.member_a_id, row.member_b_id)
+                for row in session.execute(
+                    select(
+                        MatchProposalRecord.member_a_id,
+                        MatchProposalRecord.member_b_id,
+                    )
+                )
+            }
+            restricted_pairs = {
+                self._pair_key(row[0], row[1])
+                for row in session.execute(
+                    select(MemberBlockRecord.blocker_id, MemberBlockRecord.blocked_id)
+                )
+            }
+            restricted_pairs |= {
+                self._pair_key(row[0], row[1])
+                for row in session.execute(
+                    select(
+                        MemberReportRecord.reporter_id,
+                        MemberReportRecord.reported_id,
+                    )
+                )
+            }
+            scored_pairs: list[tuple[float, CandidateEvidence, CandidateEvidence]] = []
+            for index, candidate_a in enumerate(evidences):
+                for candidate_b in evidences[index + 1 :]:
+                    if not self._scorer.is_reciprocally_compatible(
+                        candidate_a, candidate_b
+                    ):
+                        continue
+                    pair = self._pair_key(candidate_a.member_id, candidate_b.member_id)
+                    if pair in existing_pairs or pair in restricted_pairs:
+                        continue
+                    score = self._scorer.score(candidate_a, candidate_b)
+                    scored_pairs.append((score.total, candidate_a, candidate_b))
+
+            created = 0
+            matched_members: set[uuid.UUID] = set()
+            for _, candidate_a, candidate_b in sorted(
+                scored_pairs,
+                key=lambda item: (
+                    -item[0],
+                    str(item[1].member_id),
+                    str(item[2].member_id),
+                ),
+            ):
+                if (
+                    candidate_a.member_id in matched_members
+                    or candidate_b.member_id in matched_members
+                ):
+                    continue
+                pair = self._pair_key(candidate_a.member_id, candidate_b.member_id)
+                score = self._scorer.score(candidate_a, candidate_b)
+                member_a_id, member_b_id = pair
+                counselor_a = self._active_counselor_assignment(session, member_a_id)
+                counselor_b = self._active_counselor_assignment(session, member_b_id)
+                session.add(
+                    MatchProposalRecord(
+                        center_id=actor.center_id,
+                        community_id=community.id,
+                        member_a_id=member_a_id,
+                        member_b_id=member_b_id,
+                        status=ProposalStatus.PENDING_REVIEW.value,
+                        score=score.total,
+                        score_breakdown=[
+                            {
+                                "label": item.label,
+                                "weight": item.weight,
+                                "points": item.points,
+                            }
+                            for item in score.contributions
+                        ],
+                        counselor_a_id=(
+                            counselor_a.counselor_id
+                            if counselor_a is not None
+                            else None
+                        ),
+                        counselor_a_decision=CounselorReviewDecision.PENDING.value,
+                        counselor_b_id=(
+                            counselor_b.counselor_id
+                            if counselor_b is not None
+                            else None
+                        ),
+                        counselor_b_decision=CounselorReviewDecision.PENDING.value,
+                    )
+                )
+                existing_pairs.add(pair)
+                matched_members.update(pair)
+                created += 1
+            if created:
+                session.flush()
+                self._audit(
+                    session,
+                    actor_id=actor.id,
+                    action="matching.candidates_generated",
+                    subject_id=community.id,
+                    center_id=actor.center_id,
+                    metadata={"created_count": created},
+                )
+            return created
+
+    def candidate_queue(
+        self,
+        counselor: AuthenticatedUser,
+    ) -> Sequence[CandidateReviewItem]:
+        with self._sessions.session() as session, session.begin():
+            rows = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.center_id == counselor.center_id,
+                    MatchProposalRecord.status == ProposalStatus.PENDING_REVIEW.value,
+                    or_(
+                        and_(
+                            MatchProposalRecord.counselor_a_id == counselor.id,
+                            MatchProposalRecord.counselor_a_decision
+                            == CounselorReviewDecision.PENDING.value,
+                        ),
+                        and_(
+                            MatchProposalRecord.counselor_b_id == counselor.id,
+                            MatchProposalRecord.counselor_b_decision
+                            == CounselorReviewDecision.PENDING.value,
+                        ),
+                    ),
+                )
+                .order_by(
+                    MatchProposalRecord.score.desc(),
+                    MatchProposalRecord.created_at,
+                )
+            ).all()
+            items = tuple(
+                self._candidate_review_item(session, row, counselor.id) for row in rows
+            )
+            self._audit(
+                session,
+                actor_id=counselor.id,
+                action="matching.queue_accessed",
+                subject_id=counselor.id,
+                center_id=counselor.center_id,
+                metadata={"record_count": len(items)},
+            )
+            return items
+
+    def review_candidate(
+        self,
+        counselor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        decision: CounselorReviewDecision,
+        reason_code: str | None,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            proposal = session.scalar(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.id == proposal_id,
+                    MatchProposalRecord.center_id == counselor.center_id,
+                )
+                .with_for_update()
+            )
+            if proposal is None:
+                raise NotFoundError("Candidate proposal was not found.")
+            if proposal.status != ProposalStatus.PENDING_REVIEW.value:
+                raise ConflictError("This candidate is no longer pending review.")
+            is_counselor_a = proposal.counselor_a_id == counselor.id
+            is_counselor_b = proposal.counselor_b_id == counselor.id
+            if not is_counselor_a and not is_counselor_b:
+                raise NotFoundError(
+                    "You are not the assigned counselor for either member."
+                )
+            now = self._now()
+            if is_counselor_a:
+                if (
+                    proposal.counselor_a_decision
+                    != CounselorReviewDecision.PENDING.value
+                ):
+                    raise ConflictError("You already reviewed this candidate.")
+                proposal.counselor_a_decision = decision.value
+                proposal.counselor_a_decided_at = now
+                proposal.counselor_a_reason_code = reason_code
+            if is_counselor_b:
+                if (
+                    proposal.counselor_b_decision
+                    != CounselorReviewDecision.PENDING.value
+                ):
+                    raise ConflictError("You already reviewed this candidate.")
+                proposal.counselor_b_decision = decision.value
+                proposal.counselor_b_decided_at = now
+                proposal.counselor_b_reason_code = reason_code
+
+            self._audit(
+                session,
+                actor_id=counselor.id,
+                action="matching.candidate_reviewed",
+                subject_id=proposal.id,
+                center_id=counselor.center_id,
+                metadata={"decision": decision.value, "reason_code": reason_code},
+            )
+
+            both_approved = (
+                proposal.counselor_a_decision == CounselorReviewDecision.APPROVED.value
+                and proposal.counselor_b_decision
+                == CounselorReviewDecision.APPROVED.value
+            )
+            if decision is CounselorReviewDecision.DECLINED:
+                proposal.status = ProposalStatus.CLOSED.value
+                proposal.closed_at = now
+                proposal.closed_reason = "counselor_declined"
+                self._close_proposal_audit(
+                    session, counselor.id, proposal, "counselor_declined"
+                )
+            elif both_approved:
+                if self._has_other_open_proposal(
+                    session, proposal.member_a_id, proposal.id
+                ) or self._has_other_open_proposal(
+                    session, proposal.member_b_id, proposal.id
+                ):
+                    raise ConflictError(
+                        "A member in this candidate already has an active match process."
+                    )
+                proposal.status = ProposalStatus.INTRODUCED.value
+                proposal.introduced_at = now
+                self._audit(
+                    session,
+                    actor_id=counselor.id,
+                    action="matching.introduced",
+                    subject_id=proposal.id,
+                    center_id=counselor.center_id,
+                    metadata={},
+                )
+                session.add(
+                    OutboxMessageRecord(
+                        event_type="matching.introduced",
+                        payload={"proposal_id": str(proposal.id)},
+                    )
+                )
+            session.flush()
+
+    def get_introduction(
+        self,
+        member_id: uuid.UUID,
+    ) -> IntroductionView | None:
+        with self._sessions.session() as session:
+            proposal = session.scalar(
+                select(MatchProposalRecord).where(
+                    MatchProposalRecord.status == ProposalStatus.INTRODUCED.value,
+                    or_(
+                        MatchProposalRecord.member_a_id == member_id,
+                        MatchProposalRecord.member_b_id == member_id,
+                    ),
+                )
+            )
+            if proposal is None:
+                return None
+            return self._introduction_view(session, proposal, member_id)
+
+    def respond_to_introduction(
+        self,
+        member_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+        decision: MemberResponseDecision,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            proposal = session.scalar(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.id == proposal_id,
+                    or_(
+                        MatchProposalRecord.member_a_id == member_id,
+                        MatchProposalRecord.member_b_id == member_id,
+                    ),
+                )
+                .with_for_update()
+            )
+            if proposal is None:
+                raise NotFoundError("Introduction was not found.")
+            if proposal.status != ProposalStatus.INTRODUCED.value:
+                raise ConflictError(
+                    "This introduction is no longer awaiting a response."
+                )
+            now = self._now()
+            if proposal.member_a_id == member_id:
+                if proposal.member_a_response is not None:
+                    raise ConflictError("You already responded to this introduction.")
+                proposal.member_a_response = decision.value
+                proposal.member_a_responded_at = now
+                other_response = proposal.member_b_response
+            else:
+                if proposal.member_b_response is not None:
+                    raise ConflictError("You already responded to this introduction.")
+                proposal.member_b_response = decision.value
+                proposal.member_b_responded_at = now
+                other_response = proposal.member_a_response
+
+            self._audit(
+                session,
+                actor_id=member_id,
+                action="matching.member_responded",
+                subject_id=proposal.id,
+                center_id=proposal.center_id,
+                metadata={"decision": decision.value},
+            )
+
+            if (
+                decision is MemberResponseDecision.DECLINED
+                or other_response == MemberResponseDecision.DECLINED.value
+            ):
+                proposal.status = ProposalStatus.CLOSED.value
+                proposal.closed_at = now
+                proposal.closed_reason = "member_declined"
+                self._close_proposal_audit(
+                    session, member_id, proposal, "member_declined"
+                )
+            elif other_response == MemberResponseDecision.ACCEPTED.value:
+                if self._has_other_open_proposal(
+                    session, proposal.member_a_id, proposal.id
+                ) or self._has_other_open_proposal(
+                    session, proposal.member_b_id, proposal.id
+                ):
+                    raise ConflictError(
+                        "A member in this introduction already has an active match."
+                    )
+                proposal.status = ProposalStatus.ACTIVE.value
+                proposal.activated_at = now
+                self._audit(
+                    session,
+                    actor_id=member_id,
+                    action="matching.activated",
+                    subject_id=proposal.id,
+                    center_id=proposal.center_id,
+                    metadata={},
+                )
+                session.add(
+                    OutboxMessageRecord(
+                        event_type="matching.activated",
+                        payload={"proposal_id": str(proposal.id)},
+                    )
+                )
+            session.flush()
+
+    def get_matched_pair(
+        self,
+        member_id: uuid.UUID,
+    ) -> MatchedPairView | None:
+        with self._sessions.session() as session:
+            proposal = session.scalar(
+                select(MatchProposalRecord).where(
+                    MatchProposalRecord.status == ProposalStatus.ACTIVE.value,
+                    or_(
+                        MatchProposalRecord.member_a_id == member_id,
+                        MatchProposalRecord.member_b_id == member_id,
+                    ),
+                )
+            )
+            if proposal is None or proposal.activated_at is None:
+                return None
+            partner_id = (
+                proposal.member_b_id
+                if proposal.member_a_id == member_id
+                else proposal.member_a_id
+            )
+            return MatchedPairView(
+                proposal_id=proposal.id,
+                partner_id=partner_id,
+                partner_display_name=self._display_name(session, partner_id),
+                activated_at=proposal.activated_at,
+            )
+
+    def get_recent_match(
+        self,
+        member_id: uuid.UUID,
+    ) -> IntroductionView | None:
+        with self._sessions.session() as session:
+            proposal = session.scalar(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.introduced_at.is_not(None),
+                    or_(
+                        MatchProposalRecord.member_a_id == member_id,
+                        MatchProposalRecord.member_b_id == member_id,
+                    ),
+                )
+                .order_by(MatchProposalRecord.created_at.desc())
+            )
+            if proposal is None:
+                return None
+            return self._introduction_view(session, proposal, member_id)
+
+    def block_member(
+        self,
+        actor: AuthenticatedUser,
+        block: BlockInput,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            blocked_member = self._member(
+                session, block.blocked_member_id, actor.center_id
+            )
+            proposal = self._existing_proposal(session, actor.id, blocked_member.id)
+            if proposal is None:
+                raise NotFoundError(
+                    "You can only block a member you were introduced to."
+                )
+            existing = session.scalar(
+                select(MemberBlockRecord.id).where(
+                    MemberBlockRecord.blocker_id == actor.id,
+                    MemberBlockRecord.blocked_id == blocked_member.id,
+                )
+            )
+            if existing is None:
+                session.add(
+                    MemberBlockRecord(
+                        center_id=actor.center_id,
+                        blocker_id=actor.id,
+                        blocked_id=blocked_member.id,
+                        category=block.category.value,
+                        context=block.context,
+                    )
+                )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="safety.block_created",
+                subject_id=blocked_member.id,
+                center_id=actor.center_id,
+                metadata={
+                    "category": block.category.value,
+                    "context_provided": bool(block.context),
+                },
+            )
+            if proposal.status in _OPEN_PROPOSAL_STATUSES:
+                proposal.status = ProposalStatus.CLOSED.value
+                proposal.closed_at = self._now()
+                proposal.closed_reason = "member_block"
+                self._close_proposal_audit(session, actor.id, proposal, "member_block")
+            session.flush()
+
+    def report_member(
+        self,
+        actor: AuthenticatedUser,
+        report: ReportInput,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            reported_member = self._member(
+                session, report.reported_member_id, actor.center_id
+            )
+            proposal = self._existing_proposal(session, actor.id, reported_member.id)
+            if proposal is None:
+                raise NotFoundError(
+                    "You can only report a member you were introduced to."
+                )
+            session.add(
+                MemberReportRecord(
+                    center_id=actor.center_id,
+                    reporter_id=actor.id,
+                    reported_id=reported_member.id,
+                    category=report.category.value,
+                    context=report.context,
+                )
+            )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="safety.report_created",
+                subject_id=reported_member.id,
+                center_id=actor.center_id,
+                metadata={
+                    "category": report.category.value,
+                    "context_length": len(report.context),
+                },
+            )
+            if proposal.status in _OPEN_PROPOSAL_STATUSES:
+                proposal.status = ProposalStatus.CLOSED.value
+                proposal.closed_at = self._now()
+                proposal.closed_reason = "member_report"
+                self._close_proposal_audit(session, actor.id, proposal, "member_report")
+            session.flush()
+
+    def _candidate_review_item(
+        self,
+        session: Session,
+        proposal: MatchProposalRecord,
+        counselor_id: uuid.UUID,
+    ) -> CandidateReviewItem:
+        if proposal.counselor_a_id == counselor_id:
+            member_id, partner_id = proposal.member_a_id, proposal.member_b_id
+            my_decision = CounselorReviewDecision(proposal.counselor_a_decision)
+            partner_decision = CounselorReviewDecision(proposal.counselor_b_decision)
+        else:
+            member_id, partner_id = proposal.member_b_id, proposal.member_a_id
+            my_decision = CounselorReviewDecision(proposal.counselor_b_decision)
+            partner_decision = CounselorReviewDecision(proposal.counselor_a_decision)
+        return CandidateReviewItem(
+            proposal_id=proposal.id,
+            member_id=member_id,
+            member_display_name=self._display_name(session, member_id),
+            partner_id=partner_id,
+            partner_display_name=self._display_name(session, partner_id),
+            score=proposal.score,
+            explanations=self._explanations(proposal.score_breakdown),
+            my_decision=my_decision,
+            partner_counselor_decision=partner_decision,
+            created_at=proposal.created_at,
+        )
+
+    def _introduction_view(
+        self,
+        session: Session,
+        proposal: MatchProposalRecord,
+        member_id: uuid.UUID,
+    ) -> IntroductionView:
+        if proposal.member_a_id == member_id:
+            partner_id = proposal.member_b_id
+            my_response = proposal.member_a_response
+        else:
+            partner_id = proposal.member_a_id
+            my_response = proposal.member_b_response
+        partner_profile = session.get(MemberProfileRecord, partner_id)
+        return IntroductionView(
+            proposal_id=proposal.id,
+            partner_id=partner_id,
+            partner_display_name=self._display_name(session, partner_id),
+            partner_city=partner_profile.city if partner_profile is not None else "",
+            partner_state=partner_profile.state if partner_profile is not None else "",
+            partner_denomination=(
+                partner_profile.denomination if partner_profile is not None else ""
+            ),
+            partner_relationship_intent=(
+                partner_profile.relationship_intent
+                if partner_profile is not None
+                else ""
+            ),
+            explanations=self._explanations(proposal.score_breakdown),
+            my_response=(
+                MemberResponseDecision(my_response) if my_response is not None else None
+            ),
+            status=ProposalStatus(proposal.status),
+        )
+
+    def _existing_proposal(
+        self,
+        session: Session,
+        member_id: uuid.UUID,
+        other_member_id: uuid.UUID,
+    ) -> MatchProposalRecord | None:
+        member_a_id, member_b_id = self._pair_key(member_id, other_member_id)
+        return session.scalar(
+            select(MatchProposalRecord).where(
+                MatchProposalRecord.member_a_id == member_a_id,
+                MatchProposalRecord.member_b_id == member_b_id,
+                MatchProposalRecord.introduced_at.is_not(None),
+            )
+        )
+
+    def _has_open_proposal(self, session: Session, member_id: uuid.UUID) -> bool:
+        return (
+            session.scalar(
+                select(MatchProposalRecord.id).where(
+                    MatchProposalRecord.status.in_(_OPEN_PROPOSAL_STATUSES),
+                    or_(
+                        MatchProposalRecord.member_a_id == member_id,
+                        MatchProposalRecord.member_b_id == member_id,
+                    ),
+                )
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _has_other_open_proposal(
+        session: Session,
+        member_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+    ) -> bool:
+        return (
+            session.scalar(
+                select(MatchProposalRecord.id).where(
+                    MatchProposalRecord.id != proposal_id,
+                    MatchProposalRecord.status.in_(_OPEN_PROPOSAL_STATUSES),
+                    or_(
+                        MatchProposalRecord.member_a_id == member_id,
+                        MatchProposalRecord.member_b_id == member_id,
+                    ),
+                )
+            )
+            is not None
+        )
+
+    def _close_open_proposals_for_member(
+        self,
+        session: Session,
+        member_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        reason: str,
+    ) -> None:
+        proposals = session.scalars(
+            select(MatchProposalRecord).where(
+                MatchProposalRecord.status.in_(_OPEN_PROPOSAL_STATUSES),
+                or_(
+                    MatchProposalRecord.member_a_id == member_id,
+                    MatchProposalRecord.member_b_id == member_id,
+                ),
+            )
+        ).all()
+        now = self._now()
+        for proposal in proposals:
+            proposal.status = ProposalStatus.CLOSED.value
+            proposal.closed_at = now
+            proposal.closed_reason = reason
+            self._close_proposal_audit(session, actor_id, proposal, reason)
+
+    def _close_proposal_audit(
+        self,
+        session: Session,
+        actor_id: uuid.UUID,
+        proposal: MatchProposalRecord,
+        reason: str,
+    ) -> None:
+        self._audit(
+            session,
+            actor_id=actor_id,
+            action="matching.closed",
+            subject_id=proposal.id,
+            center_id=proposal.center_id,
+            metadata={"reason": reason},
+        )
+        session.add(
+            OutboxMessageRecord(
+                event_type="matching.closed",
+                payload={"proposal_id": str(proposal.id), "reason": reason},
+            )
+        )
+
+    @staticmethod
+    def _pair_key(
+        a: uuid.UUID,
+        b: uuid.UUID,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        return (a, b) if str(a) < str(b) else (b, a)
+
+    @staticmethod
+    def _display_name(session: Session, member_id: uuid.UUID) -> str:
+        profile = session.get(MemberProfileRecord, member_id)
+        if profile is not None:
+            return profile.display_name
+        member = session.get(UserRecord, member_id)
+        return member.name if member is not None else "Member"
+
+    @staticmethod
+    def _explanations(score_breakdown: list[dict[str, Any]]) -> tuple[str, ...]:
+        return tuple(
+            f"{item['label']}: {round(item['points'])} of {round(item['weight'])} "
+            "points"
+            for item in score_breakdown
+        )
+
     def _reevaluate(
         self,
         session: Session,
@@ -675,6 +1447,13 @@ class SqlAlchemyPilotRepository:
         community = self._community(session, member.center_id)
         evidence = self._evidence(session, member_id)
         result = self._evaluator.evaluate(evidence)
+        if not result.eligible:
+            self._close_open_proposals_for_member(
+                session,
+                member_id,
+                actor_id,
+                "hold_applied" if evidence.active_hold else "readiness_lost",
+            )
         previous = session.scalar(
             select(ReadinessDecisionRecord)
             .where(ReadinessDecisionRecord.member_id == member_id)
@@ -874,7 +1653,7 @@ class SqlAlchemyPilotRepository:
             counselor_status=self._counselor_status(session, member.id),
             screening_status=self._screening_status(session, member.id),
             hold_active=hold_active,
-            eligible=readiness.eligible,
+            readiness=readiness,
         )
 
     def _counselor_status(

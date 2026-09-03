@@ -1,4 +1,4 @@
-"""Counselor and administrator operations pages."""
+"""Counselor and administrator operations pages, redesigned around queues."""
 
 import uuid
 from collections.abc import Sequence
@@ -9,39 +9,77 @@ import streamlit as st
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser, Role
 from matchwell.domain.errors import MatchwellError
+from matchwell.domain.matching import CounselorReviewDecision
 from matchwell.domain.pilot import (
     CounselorDecisionStatus,
     InvitationInput,
     OperationsMember,
     ScreeningStatus,
 )
+from matchwell.presentation.theme import (
+    humanize,
+    render_badges,
+    render_empty_state,
+    render_eyebrow,
+    render_success_state,
+)
 
 
 def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Pilot operations")
-    invitation_tab, members_tab = st.tabs(["Invitations", "Member readiness"])
+    st.caption("Task-oriented queues for the pilot Center.")
+    invitation_tab, members_tab, matching_tab = st.tabs(
+        ["Invitations", "Member readiness", "Matching"]
+    )
     with invitation_tab:
         _render_invitations(service, actor)
     with members_tab:
         _render_member_operations(service, actor)
+    with matching_tab:
+        _render_admin_matching(service, actor)
 
 
 def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Counselor workspace")
+    intake_tab, matching_tab = st.tabs(["Assigned members", "Matching review"])
+    with intake_tab:
+        _render_counselor_intake(service, actor)
+    with matching_tab:
+        _render_counselor_matching(service, actor)
+
+
+def _render_counselor_intake(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
     try:
         members = service.assigned_members(actor)
     except MatchwellError as error:
         st.error(str(error))
         return
     if not members:
-        st.info("No members are currently assigned to you.")
+        render_empty_state("No members are currently assigned to you.")
         return
 
     selected = _member_selector(members, "counselor-member")
-    st.write(f"**Screening:** {selected.screening_status.value.title()}")
-    st.write(f"**Current decision:** {selected.counselor_status.value.title()}")
-    st.write(f"**Community eligible:** {'Yes' if selected.eligible else 'No'}")
-    st.caption("Assessment answers are intentionally excluded from this queue.")
+    with st.container(border=True):
+        render_eyebrow(f"Stage: {humanize(selected.readiness.stage.value)}")
+        st.write(f"**Readiness:** {selected.readiness_completed_count}/7")
+        render_badges(
+            [
+                (humanize(selected.screening_status.value), "info"),
+                (humanize(selected.counselor_status.value), "neutral"),
+                (
+                    "Community eligible" if selected.eligible else "Not yet eligible",
+                    "success" if selected.eligible else "warning",
+                ),
+            ]
+        )
+        if not selected.eligible:
+            st.caption("Missing requirements and next actions")
+            for explanation in selected.readiness.explanations:
+                st.write(f"- {explanation}")
+        st.caption("Assessment answers are intentionally excluded from this queue.")
 
     with st.form("counselor-decision"):
         status = st.selectbox(
@@ -51,7 +89,7 @@ def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
                 CounselorDecisionStatus.DECLINED,
                 CounselorDecisionStatus.PENDING,
             ],
-            format_func=lambda item: item.value.title(),
+            format_func=lambda item: humanize(item.value),
         )
         reason_code = st.text_input(
             "Reason code (optional)",
@@ -69,8 +107,99 @@ def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
         except MatchwellError as error:
             st.error(str(error))
         else:
-            st.success("Counselor decision recorded.")
+            render_success_state("Counselor decision recorded.")
             st.rerun()
+
+
+def _render_counselor_matching(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
+    try:
+        queue = service.candidate_queue(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not queue:
+        render_empty_state("No candidates are waiting for your review.")
+        return
+
+    st.write(
+        "Prioritized by compatibility score, highest first. Both assigned "
+        "counselors must approve before either member sees the "
+        "introduction."
+    )
+    for item in queue:
+        with st.container(border=True):
+            st.subheader(f"{item.member_display_name} + {item.partner_display_name}")
+            render_badges(
+                [
+                    (f"Score {round(item.score)}", "info"),
+                    (
+                        "Partner counselor: "
+                        f"{humanize(item.partner_counselor_decision.value)}",
+                        "neutral",
+                    ),
+                ]
+            )
+            st.caption("Why this candidate")
+            for explanation in item.explanations:
+                st.write(f"- {explanation}")
+            with st.form(f"review-{item.proposal_id}"):
+                reason_code = st.text_input(
+                    "Reason code (optional)",
+                    key=f"reason-{item.proposal_id}",
+                )
+                approve_col, decline_col = st.columns(2)
+                with approve_col:
+                    approve_clicked = st.form_submit_button(
+                        "Approve",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with decline_col:
+                    decline_clicked = st.form_submit_button(
+                        "Decline",
+                        use_container_width=True,
+                    )
+            if approve_clicked or decline_clicked:
+                decision = (
+                    CounselorReviewDecision.APPROVED
+                    if approve_clicked
+                    else CounselorReviewDecision.DECLINED
+                )
+                try:
+                    service.review_candidate(
+                        actor,
+                        item.proposal_id,
+                        decision,
+                        reason_code or None,
+                    )
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state("Candidate review recorded.")
+                    st.rerun()
+
+
+def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.subheader("Candidate generation")
+    st.write(
+        "Generate deterministic, explainable candidate proposals for every "
+        "7/7 community-eligible member who has completed matching "
+        "preferences and has no open proposal. Assessment answers, "
+        "screening details, and counselor notes are never used."
+    )
+    if st.button("Generate candidates", type="primary"):
+        try:
+            created = service.generate_candidates(actor)
+        except MatchwellError as error:
+            st.error(str(error))
+        else:
+            if created:
+                render_success_state(f"Created {created} candidate proposal(s).")
+            else:
+                render_empty_state("No new eligible candidate pairs were found.")
 
 
 def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None:
@@ -79,7 +208,7 @@ def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None
         role = st.selectbox(
             "Role",
             options=[Role.MEMBER, Role.COUNSELOR],
-            format_func=lambda item: item.value.title(),
+            format_func=lambda item: humanize(item.value),
         )
         expiry_days = st.number_input(
             "Expires in days",
@@ -101,7 +230,9 @@ def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None
         except (MatchwellError, ValueError) as error:
             st.error(str(error))
         else:
-            st.success("Invitation created. Ask the member to sign in with that email.")
+            render_success_state(
+                "Invitation created. Ask the member to sign in with that email."
+            )
 
     try:
         invitations = service.invitations(actor)
@@ -113,7 +244,7 @@ def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None
             [
                 {
                     "Email": item.email,
-                    "Role": item.role.value.title(),
+                    "Role": humanize(item.role.value),
                     "Expires": item.expires_at,
                     "Accepted": item.accepted_at,
                 }
@@ -135,16 +266,28 @@ def _render_member_operations(
         st.error(str(error))
         return
     if not members:
-        st.info("Invite a member to begin the pilot journey.")
+        render_empty_state("Invite a member to begin the pilot journey.")
         return
+
+    eligible_count = sum(1 for item in members if item.eligible)
+    held_count = sum(1 for item in members if item.hold_active)
+    summary = st.columns(3)
+    with summary[0]:
+        st.metric("Members", len(members))
+    with summary[1]:
+        st.metric("Community eligible", eligible_count)
+    with summary[2]:
+        st.metric("Active holds", held_count)
 
     st.dataframe(
         [
             {
                 "Member": item.display_name,
                 "Email": item.email,
-                "Counselor": item.counselor_status.value.title(),
-                "Screening": item.screening_status.value.title(),
+                "Readiness": f"{item.readiness_completed_count}/7",
+                "Stage": humanize(item.readiness.stage.value),
+                "Counselor": humanize(item.counselor_status.value),
+                "Screening": humanize(item.screening_status.value),
                 "Hold": "Active" if item.hold_active else "None",
                 "Eligible": "Yes" if item.eligible else "No",
             }
@@ -155,9 +298,15 @@ def _render_member_operations(
     )
     selected = _member_selector(members, "operations-member")
 
+    if not selected.eligible:
+        with st.container(border=True):
+            render_eyebrow("Missing requirements and next actions")
+            for explanation in selected.readiness.explanations:
+                st.write(f"- {explanation}")
+
     st.subheader("Counselor assignment")
     if not counselors:
-        st.info("Invite a counselor before assigning this member.")
+        render_empty_state("Invite a counselor before assigning this member.")
     else:
         counselor = st.selectbox(
             "Counselor",
@@ -170,7 +319,7 @@ def _render_member_operations(
             except MatchwellError as error:
                 st.error(str(error))
             else:
-                st.success("Counselor assigned.")
+                render_success_state("Counselor assigned.")
                 st.rerun()
 
     st.subheader("Screening status")
@@ -178,7 +327,7 @@ def _render_member_operations(
         screening_status = st.selectbox(
             "Normalized status",
             options=list(ScreeningStatus),
-            format_func=lambda item: item.value.replace("_", " ").title(),
+            format_func=lambda item: humanize(item.value),
         )
         provider_reference = st.text_input("Provider reference")
         provider_event_id = st.text_input(
@@ -201,9 +350,9 @@ def _render_member_operations(
             st.error(str(error))
         else:
             if created:
-                st.success("Screening status recorded.")
+                render_success_state("Screening status recorded.")
             else:
-                st.info("That provider event was already processed.")
+                render_empty_state("That provider event was already processed.")
             st.rerun()
 
     st.subheader("Safety and administrative hold")
@@ -214,7 +363,7 @@ def _render_member_operations(
             except MatchwellError as error:
                 st.error(str(error))
             else:
-                st.success("Hold released.")
+                render_success_state("Hold released.")
                 st.rerun()
     else:
         with st.form("apply-hold"):
@@ -226,7 +375,7 @@ def _render_member_operations(
             except MatchwellError as error:
                 st.error(str(error))
             else:
-                st.success("Hold applied. Eligibility is blocked.")
+                render_success_state("Hold applied. Eligibility is blocked.")
                 st.rerun()
 
 

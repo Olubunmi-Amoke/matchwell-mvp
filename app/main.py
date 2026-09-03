@@ -8,6 +8,7 @@ from streamlit.errors import StreamlitSecretNotFoundError
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
 from matchwell.domain.errors import MatchwellError
+from matchwell.domain.matching import MatchScorer
 from matchwell.domain.readiness import ReadinessEvaluator
 from matchwell.infrastructure.persistence.database import (
     DatabaseSessionFactory,
@@ -23,15 +24,19 @@ from matchwell.presentation.member import (
     render_assessment,
     render_consent,
     render_dashboard,
+    render_introduction,
+    render_matching,
     render_profile,
 )
 from matchwell.presentation.operations import render_admin, render_counselor
+from matchwell.presentation.theme import inject_theme
 
 st.set_page_config(
     page_title="Matchwell",
     page_icon=":handshake:",
     layout="wide",
 )
+inject_theme()
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,7 @@ def build_service(_settings: Settings) -> PilotService:
     repository = SqlAlchemyPilotRepository(
         DatabaseSessionFactory(engine),
         ReadinessEvaluator(),
+        MatchScorer(),
     )
     return PilotService(repository, _settings.normalized_admin_emails())
 
@@ -78,7 +84,7 @@ def member_pages(
         "My journey": [
             st.Page(
                 lambda: render_dashboard(service, actor),
-                title="Readiness",
+                title="Community",
                 icon=":material/checklist:",
                 url_path="readiness",
                 default=True,
@@ -101,7 +107,21 @@ def member_pages(
                 icon=":material/assignment:",
                 url_path="assessment",
             ),
-        ]
+        ],
+        "Matching": [
+            st.Page(
+                lambda: render_matching(service, actor),
+                title="Matching",
+                icon=":material/favorite:",
+                url_path="matching",
+            ),
+            st.Page(
+                lambda: render_introduction(service, actor),
+                title="Introduction",
+                icon=":material/handshake:",
+                url_path="introduction",
+            ),
+        ],
     }
 
 

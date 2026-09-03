@@ -9,6 +9,20 @@ from matchwell.domain.errors import (
     AuthorizationError,
     ValidationError,
 )
+from matchwell.domain.matching import (
+    MAX_PARTNER_AGE,
+    MIN_PARTNER_AGE,
+    BlockInput,
+    CandidateReviewItem,
+    CounselorReviewDecision,
+    IntroductionView,
+    MatchedPairView,
+    MatchPreferencesInput,
+    MatchPreferencesView,
+    MemberResponseDecision,
+    ReportInput,
+    SafetyCategory,
+)
 from matchwell.domain.pilot import (
     AssessmentAnswers,
     AssessmentView,
@@ -115,6 +129,63 @@ class PilotRepository(Protocol):
         self,
         actor: AuthenticatedUser,
         member_id: uuid.UUID,
+    ) -> None: ...
+
+    def get_match_preferences(self, member_id: uuid.UUID) -> MatchPreferencesView: ...
+
+    def save_match_preferences(
+        self,
+        member_id: uuid.UUID,
+        preferences: MatchPreferencesInput,
+    ) -> None: ...
+
+    def generate_candidates(self, actor: AuthenticatedUser) -> int: ...
+
+    def candidate_queue(
+        self,
+        counselor: AuthenticatedUser,
+    ) -> Sequence[CandidateReviewItem]: ...
+
+    def review_candidate(
+        self,
+        counselor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        decision: CounselorReviewDecision,
+        reason_code: str | None,
+    ) -> None: ...
+
+    def get_introduction(
+        self,
+        member_id: uuid.UUID,
+    ) -> IntroductionView | None: ...
+
+    def respond_to_introduction(
+        self,
+        member_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+        decision: MemberResponseDecision,
+    ) -> None: ...
+
+    def get_matched_pair(
+        self,
+        member_id: uuid.UUID,
+    ) -> MatchedPairView | None: ...
+
+    def get_recent_match(
+        self,
+        member_id: uuid.UUID,
+    ) -> IntroductionView | None: ...
+
+    def block_member(
+        self,
+        actor: AuthenticatedUser,
+        block: BlockInput,
+    ) -> None: ...
+
+    def report_member(
+        self,
+        actor: AuthenticatedUser,
+        report: ReportInput,
     ) -> None: ...
 
 
@@ -290,6 +361,127 @@ class PilotService:
     ) -> None:
         self._require_role(actor, Role.ADMIN)
         self._repository.release_hold(actor, member_id)
+
+    def match_preferences(self, actor: AuthenticatedUser) -> MatchPreferencesView:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.get_match_preferences(actor.id)
+
+    def save_match_preferences(
+        self,
+        actor: AuthenticatedUser,
+        preferences: MatchPreferencesInput,
+    ) -> None:
+        self._require_role(actor, Role.MEMBER)
+        if preferences.min_partner_age < MIN_PARTNER_AGE:
+            raise ValidationError(
+                f"The minimum partner age must be at least {MIN_PARTNER_AGE}."
+            )
+        if preferences.max_partner_age > MAX_PARTNER_AGE:
+            raise ValidationError(
+                f"The maximum partner age must be at most {MAX_PARTNER_AGE}."
+            )
+        if preferences.min_partner_age > preferences.max_partner_age:
+            raise ValidationError(
+                "The minimum partner age cannot exceed the maximum partner age."
+            )
+        self._repository.save_match_preferences(actor.id, preferences)
+
+    def generate_candidates(self, actor: AuthenticatedUser) -> int:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.generate_candidates(actor)
+
+    def candidate_queue(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[CandidateReviewItem]:
+        self._require_role(actor, Role.COUNSELOR)
+        return self._repository.candidate_queue(actor)
+
+    def review_candidate(
+        self,
+        actor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        decision: CounselorReviewDecision,
+        reason_code: str | None = None,
+    ) -> None:
+        self._require_role(actor, Role.COUNSELOR)
+        if decision is CounselorReviewDecision.PENDING:
+            raise ValidationError("Record an approved or declined review decision.")
+        self._repository.review_candidate(
+            actor,
+            proposal_id,
+            decision,
+            reason_code.strip() if reason_code else None,
+        )
+
+    def introduction(self, actor: AuthenticatedUser) -> IntroductionView | None:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.get_introduction(actor.id)
+
+    def respond_to_introduction(
+        self,
+        actor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        decision: MemberResponseDecision,
+    ) -> None:
+        self._require_role(actor, Role.MEMBER)
+        self._repository.respond_to_introduction(actor.id, proposal_id, decision)
+
+    def matched_pair(self, actor: AuthenticatedUser) -> MatchedPairView | None:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.get_matched_pair(actor.id)
+
+    def recent_match(self, actor: AuthenticatedUser) -> IntroductionView | None:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.get_recent_match(actor.id)
+
+    def block_member(
+        self,
+        actor: AuthenticatedUser,
+        blocked_member_id: uuid.UUID,
+        category: SafetyCategory,
+        context: str | None = None,
+    ) -> None:
+        self._require_role(actor, Role.MEMBER)
+        if blocked_member_id == actor.id:
+            raise ValidationError("You cannot block yourself.")
+        safe_context = context.strip() if context else None
+        if safe_context and len(safe_context) > 500:
+            raise ValidationError("Keep the block context under 500 characters.")
+        self._repository.block_member(
+            actor,
+            BlockInput(
+                blocked_member_id=blocked_member_id,
+                category=category,
+                context=safe_context or None,
+            ),
+        )
+
+    def report_member(
+        self,
+        actor: AuthenticatedUser,
+        reported_member_id: uuid.UUID,
+        category: SafetyCategory,
+        context: str,
+    ) -> None:
+        self._require_role(actor, Role.MEMBER)
+        if reported_member_id == actor.id:
+            raise ValidationError("You cannot report yourself.")
+        safe_context = context.strip()
+        if len(safe_context) < 10:
+            raise ValidationError(
+                "Describe the concern with at least 10 characters of context."
+            )
+        if len(safe_context) > 500:
+            raise ValidationError("Keep the report context under 500 characters.")
+        self._repository.report_member(
+            actor,
+            ReportInput(
+                reported_member_id=reported_member_id,
+                category=category,
+                context=safe_context,
+            ),
+        )
 
     @staticmethod
     def _require_role(actor: AuthenticatedUser, role: Role) -> None:

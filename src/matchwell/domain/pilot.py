@@ -77,7 +77,15 @@ class OperationsMember:
     counselor_status: CounselorDecisionStatus
     screening_status: ScreeningStatus
     hold_active: bool
-    eligible: bool
+    readiness: ReadinessResult
+
+    @property
+    def eligible(self) -> bool:
+        return self.readiness.eligible
+
+    @property
+    def readiness_completed_count(self) -> int:
+        return 7 - len(self.readiness.unmet_requirements)
 
 
 @dataclass(frozen=True, slots=True)

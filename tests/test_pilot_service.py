@@ -11,6 +11,12 @@ from matchwell.domain.errors import (
     AuthorizationError,
     ValidationError,
 )
+from matchwell.domain.matching import (
+    CounselorReviewDecision,
+    Gender,
+    MatchPreferencesInput,
+    SafetyCategory,
+)
 from matchwell.domain.pilot import ProfileInput
 
 
@@ -91,4 +97,119 @@ def test_faith_affirmation_is_required() -> None:
                 city="Nashville",
                 state="Tennessee",
             ),
+        )
+
+
+def test_admin_workspace_rejects_member() -> None:
+    with pytest.raises(AuthorizationError):
+        service().generate_candidates(actor(Role.MEMBER))
+
+
+def test_counselor_workspace_rejects_admin() -> None:
+    with pytest.raises(AuthorizationError):
+        service().candidate_queue(actor(Role.ADMIN))
+
+
+def test_member_workspace_rejects_counselor_for_matching_preferences() -> None:
+    with pytest.raises(AuthorizationError):
+        service().save_match_preferences(
+            actor(Role.COUNSELOR),
+            MatchPreferencesInput(
+                gender=Gender.MAN,
+                min_partner_age=25,
+                max_partner_age=35,
+            ),
+        )
+
+
+def test_partner_age_below_minimum_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        service().save_match_preferences(
+            actor(Role.MEMBER),
+            MatchPreferencesInput(
+                gender=Gender.MAN,
+                min_partner_age=10,
+                max_partner_age=35,
+            ),
+        )
+
+
+def test_partner_age_above_maximum_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        service().save_match_preferences(
+            actor(Role.MEMBER),
+            MatchPreferencesInput(
+                gender=Gender.MAN,
+                min_partner_age=25,
+                max_partner_age=150,
+            ),
+        )
+
+
+def test_min_partner_age_over_max_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        service().save_match_preferences(
+            actor(Role.MEMBER),
+            MatchPreferencesInput(
+                gender=Gender.MAN,
+                min_partner_age=40,
+                max_partner_age=30,
+            ),
+        )
+
+
+def test_pending_counselor_review_decision_is_rejected() -> None:
+    import uuid
+
+    with pytest.raises(ValidationError):
+        service().review_candidate(
+            actor(Role.COUNSELOR),
+            uuid.uuid4(),
+            CounselorReviewDecision.PENDING,
+        )
+
+
+def test_member_cannot_block_self() -> None:
+    with pytest.raises(ValidationError):
+        member = actor(Role.MEMBER)
+        service().block_member(
+            member,
+            member.id,
+            SafetyCategory.HARASSMENT,
+            None,
+        )
+
+
+def test_member_cannot_report_self() -> None:
+    with pytest.raises(ValidationError):
+        member = actor(Role.MEMBER)
+        service().report_member(
+            member,
+            member.id,
+            SafetyCategory.HARASSMENT,
+            "Concerning behavior during our conversation.",
+        )
+
+
+def test_report_requires_minimum_context() -> None:
+    import uuid
+
+    with pytest.raises(ValidationError):
+        service().report_member(
+            actor(Role.MEMBER),
+            uuid.uuid4(),
+            SafetyCategory.HARASSMENT,
+            "too short",
+        )
+
+
+def test_report_context_over_limit_is_rejected() -> None:
+    import uuid
+
+    with pytest.raises(ValidationError):
+        service().report_member(
+            actor(Role.MEMBER),
+            uuid.uuid4(),
+            SafetyCategory.HARASSMENT,
+            "x" * 501,
         )
