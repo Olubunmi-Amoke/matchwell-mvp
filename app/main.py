@@ -80,22 +80,26 @@ def member_pages(
                 lambda: render_dashboard(service, actor),
                 title="Readiness",
                 icon=":material/checklist:",
+                url_path="readiness",
                 default=True,
             ),
             st.Page(
                 lambda: render_profile(service, actor),
                 title="Profile",
                 icon=":material/person:",
+                url_path="profile",
             ),
             st.Page(
                 lambda: render_consent(service, actor),
                 title="Consent",
                 icon=":material/contract:",
+                url_path="consent",
             ),
             st.Page(
                 lambda: render_assessment(service, actor),
                 title="Assessment",
                 icon=":material/assignment:",
+                url_path="assessment",
             ),
         ]
     }
@@ -110,6 +114,7 @@ def operations_pages(
             lambda: render_admin(service, actor),
             title="Pilot operations",
             icon=":material/admin_panel_settings:",
+            url_path="operations",
             default=True,
         )
     else:
@@ -117,6 +122,7 @@ def operations_pages(
             lambda: render_counselor(service, actor),
             title="Counselor workspace",
             icon=":material/clinical_notes:",
+            url_path="counselor",
             default=True,
         )
     return {"Operations": [page]}
