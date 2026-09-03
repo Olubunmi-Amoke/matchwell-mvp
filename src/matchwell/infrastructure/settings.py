@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Literal
 
@@ -47,3 +48,26 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_runtime_settings(secrets: Mapping[str, object]) -> Settings:
+    base = get_settings()
+    values: dict[str, object] = {
+        "MATCHWELL_ENVIRONMENT": base.environment,
+        "MATCHWELL_ADMIN_EMAILS": base.admin_emails,
+        "MATCHWELL_AUTO_MIGRATE": base.auto_migrate,
+    }
+    database_url = base.reveal_database_url()
+    if database_url is not None:
+        values["DATABASE_URL"] = database_url
+
+    for key in (
+        "DATABASE_URL",
+        "MATCHWELL_ENVIRONMENT",
+        "MATCHWELL_ADMIN_EMAILS",
+        "MATCHWELL_AUTO_MIGRATE",
+    ):
+        if key in secrets:
+            values[key] = secrets[key]
+
+    return Settings.model_validate(values)
