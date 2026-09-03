@@ -7,6 +7,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -414,4 +415,157 @@ class ReadinessDecisionRecord(Base):
     configuration_version: Mapped[str] = mapped_column(String(50), nullable=False)
     evaluated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+
+
+class MemberMatchPreferencesRecord(Base):
+    """Explicit member-completed matching preferences.
+
+    This is a new, opt-in table rather than an extension of ``member_profiles``.
+    Existing hosted members have no row here until they complete this step, so
+    they never silently become matching-eligible after this migration.
+    """
+
+    __tablename__ = "member_match_preferences"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        primary_key=True,
+    )
+    gender: Mapped[str] = mapped_column(String(10), nullable=False)
+    min_partner_age: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_partner_age: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class MatchProposalRecord(Base):
+    __tablename__ = "match_proposals"
+    __table_args__ = (
+        UniqueConstraint("member_a_id", "member_b_id"),
+        Index("ix_match_proposals_community_status", "community_id", "status"),
+        Index("ix_match_proposals_counselor_a", "counselor_a_id", "status"),
+        Index("ix_match_proposals_counselor_b", "counselor_b_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    community_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("communities.id"),
+        nullable=False,
+    )
+    member_a_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    member_b_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    score_breakdown: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON_DOCUMENT,
+        nullable=False,
+    )
+    counselor_a_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+    counselor_a_decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    counselor_a_decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    counselor_a_reason_code: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
+    counselor_b_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+    counselor_b_decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    counselor_b_decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    counselor_b_reason_code: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
+    introduced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    member_a_response: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    member_a_responded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    member_b_response: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    member_b_responded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class MemberBlockRecord(Base):
+    __tablename__ = "member_blocks"
+    __table_args__ = (UniqueConstraint("blocker_id", "blocked_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    blocker_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    blocked_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    context: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class MemberReportRecord(Base):
+    __tablename__ = "member_reports"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    reporter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    reported_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    context: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
     )

@@ -2,6 +2,109 @@
 
 > **Status:** Milestone complete
 
+## Active Milestone: Community Matching and Introductions
+
+**Goal:** Carry community-eligible members from 7/7 readiness through an
+explainable, counselor-reviewed candidate match and mutually accepted
+introduction, while making every role workspace intuitive and visually aligned
+with Matchwell.
+
+**Requirements:** MW-PRD-002, MW-PRD-008, MW-PRD-009, MW-PRD-012, and
+MW-PRD-013.
+
+**Compatibility decision:** Pilot profiles identify members as `Man` or `Woman`.
+Candidate generation permits only Man/Woman pairs. This is an explicit pilot
+product rule and remains separate from identity-provider attributes.
+
+### Member journey
+
+1. Complete matching preferences, including acceptable age range.
+2. Enter the candidate pool only after 7/7 readiness and without an active hold.
+3. Receive a counselor-approved introduction with a safe profile summary and
+   plain-language compatibility explanation.
+4. Privately accept or decline without seeing the other member's response.
+5. Enter an active matched-pair workspace only after mutual acceptance.
+6. Block or report the introduced member at any point; either action immediately
+   closes access and applies the appropriate safety restriction.
+
+### Matching and operations
+
+- Generate candidates only inside the same Center and community.
+- Require reciprocal Man/Woman and age-range compatibility.
+- Use deterministic weighted rules for age preference, location, denomination,
+  and relationship-intent alignment.
+- Persist rule contributions and safe explanations, never assessment answers,
+  counselor notes, or screening details.
+- Give counselors a prioritized review queue for their assigned members.
+- Require counselor approval before either member sees an introduction.
+- Prevent duplicate active proposals and introductions for the same pair.
+- Reconcile open proposals and introductions when readiness, holds, blocks, or
+  reports change.
+- Audit candidate review, approval, member response, mutual activation, block,
+  report, and closure transitions.
+
+### Experience redesign
+
+- Add a warm, calm Matchwell theme with consistent typography, color, cards,
+  status badges, spacing, and responsive behavior.
+- Replace raw enum labels and database-style values with human-readable copy.
+- Show `x/7`, current stage, missing requirements, and next action in member,
+  counselor, and administrator workspaces.
+- Give administrators a summary dashboard and task-oriented member queue.
+- Give counselors clear intake and matching-review sections with action status.
+- Add empty states, success guidance, and progressive disclosure so controls
+  appear in the order operators need them.
+
+### Privacy and safety
+
+- Do not disclose email, exact birth date, screening data, assessment answers,
+  counselor notes, or direct contact information in introductions.
+- Do not disclose one member's response until both have responded.
+- Holds and blocks override candidate, introduction, and matched-pair access.
+- Reports store structured categories and minimum operational context only.
+- All mutations remain authorized in the application service and scoped by
+  Center, counselor assignment, or participating member.
+
+### Delivery
+
+- Extend domain types, application ports, SQLAlchemy records, and Alembic
+  migrations without coupling matching logic to Streamlit.
+- Add deterministic matching and introduction services with immutable audit and
+  transactional outbox transitions.
+- Redesign Streamlit member and operations pages around the new journeys.
+- Add unit, integration, authorization, idempotency, privacy, migration, and
+  Streamlit smoke tests.
+
+**Out of scope:** Free-form messaging, automated matching decisions, machine
+learning, cross-Center matching, photos/media, contact-detail exchange,
+subscriptions, payments, and guided curriculum.
+
+**Implementation status:** Implemented. Match preferences (gender identity plus
+acceptable partner age range) are stored in a new, opt-in
+`member_match_preferences` table so existing hosted members never silently
+become matching-eligible. Deterministic weighted candidate scoring, a
+counselor-prioritized review queue requiring both assigned counselors'
+approval, privacy-safe introductions with independent accept/decline, mutual
+activation of a matched-pair workspace, duplicate-proposal prevention, and
+member block/report with structured category and minimum context are all in
+place. Holds, blocks, reports, and lost readiness reconcile and close open
+proposals and introductions. Admin and counselor workspaces were redesigned
+into task-oriented queues showing x/7 readiness, stage, and missing
+requirements. A central Streamlit theme module provides warm, calm styling,
+status badges, and empty/success states, with all user-derived content
+rendered through native widgets or explicitly escaped HTML.
+
+**Validation status:** Ruff, formatting, strict mypy, and 70 automated tests
+(95.39% backend coverage) passed, including a full synthetic two-member
+matching-to-activation journey, ineligible/missing-preference exclusion,
+counselor authorization and Center isolation, mutual-response privacy,
+single-active-proposal enforcement, pre-approval disclosure prevention,
+duplicate-proposal idempotency, hold/block precedence, post-closure safety
+access, and audit-payload redaction. Alembic offline `--sql` upgrade and
+downgrade generation for migration `20260902_0003` passed against a PostgreSQL
+dialect URL; a live PostgreSQL round trip is configured in CI. The Streamlit
+runtime health and page endpoints were also verified locally.
+
 ## Active Milestone
 
 **Goal:** Implement the first usable readiness journey from invited member

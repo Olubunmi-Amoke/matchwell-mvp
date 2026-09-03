@@ -86,6 +86,28 @@ After the administrator signs in, use **Pilot operations** to invite members
 and counselors. Invitees must sign in with the exact Google email address used
 in their active invitation.
 
+### Community matching and introductions
+
+Once a member reaches 7/7 readiness, they can complete matching preferences
+(gender identity and acceptable partner age range) on the **Matching** page.
+Existing hosted members are never silently matching-eligible: preferences live
+in a separate, opt-in table, so nothing changes for a member until they submit
+this step themselves.
+
+An administrator generates deterministic, explainable candidate proposals from
+**Pilot operations → Matching**. Candidates require reciprocal Man/Woman and
+age-range compatibility, and score on location, denomination, age preference,
+and relationship-intent alignment only -- never assessment answers, screening
+details, counselor notes, exact birth dates, or contact details. Both
+members' assigned counselors must approve a candidate from their **Matching
+review** queue before either member sees an introduction. Members privately
+accept or decline on the **Introduction** page without ever seeing the other
+member's response; a matched-pair workspace activates only once both accept.
+Members can block or report the introduced member at any time with a
+structured category and minimum context, which immediately closes access.
+Holds, blocks, reports, and lost readiness all reconcile and close any open
+proposal or introduction.
+
 ### Quality checks
 
 ```powershell
