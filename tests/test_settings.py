@@ -1,7 +1,11 @@
 from pydantic import SecretStr
 from pytest import MonkeyPatch
 
-from matchwell.infrastructure.settings import Settings
+from matchwell.infrastructure.settings import (
+    Settings,
+    get_runtime_settings,
+    get_settings,
+)
 
 
 def test_settings_do_not_require_database_for_static_startup(
@@ -45,3 +49,19 @@ def test_admin_emails_are_normalized(monkeypatch: MonkeyPatch) -> None:
         "owner@example.com",
         "second@example.com",
     }
+
+
+def test_streamlit_secrets_override_environment(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("MATCHWELL_AUTO_MIGRATE", "false")
+    monkeypatch.setenv("MATCHWELL_ADMIN_EMAILS", "old@example.com")
+    get_settings.cache_clear()
+
+    settings = get_runtime_settings(
+        {
+            "MATCHWELL_AUTO_MIGRATE": True,
+            "MATCHWELL_ADMIN_EMAILS": "admin@example.com",
+        }
+    )
+
+    assert settings.auto_migrate
+    assert settings.normalized_admin_emails() == {"admin@example.com"}

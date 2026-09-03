@@ -3,6 +3,7 @@ import logging
 import streamlit as st
 from alembic.util.exc import CommandError
 from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
@@ -17,7 +18,7 @@ from matchwell.infrastructure.persistence.database import (
 from matchwell.infrastructure.persistence.pilot_repository import (
     SqlAlchemyPilotRepository,
 )
-from matchwell.infrastructure.settings import Settings, get_settings
+from matchwell.infrastructure.settings import Settings, get_runtime_settings
 from matchwell.presentation.member import (
     render_assessment,
     render_consent,
@@ -121,7 +122,10 @@ def operations_pages(
     return {"Operations": [page]}
 
 
-settings = get_settings()
+try:
+    settings = get_runtime_settings(st.secrets)
+except StreamlitSecretNotFoundError:
+    settings = get_runtime_settings({})
 database_url = settings.reveal_database_url()
 health = SqlAlchemyDatabaseProbe(database_url).check()
 
