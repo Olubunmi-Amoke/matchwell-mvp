@@ -14,6 +14,20 @@ from matchwell.domain.access import (
     normalize_email,
 )
 from matchwell.domain.errors import ConflictError, NotFoundError, ValidationError
+from matchwell.domain.journey import (
+    PILOT_CURRICULUM_KEY,
+    CheckInMilestone,
+    CounselorCheckInView,
+    CounselorJourneyMemberView,
+    CounselorJourneyView,
+    JourneyTaskView,
+    MemberCheckInView,
+    MemberJourneyView,
+    RelationshipStatus,
+    ReminderState,
+    TaskScope,
+    reminder_state,
+)
 from matchwell.domain.matching import (
     BlockInput,
     CandidateEvidence,
@@ -65,6 +79,10 @@ from matchwell.infrastructure.persistence.models import (
     CounselorDecisionRecord,
     HoldRecord,
     InvitationRecord,
+    JourneyCheckInRecord,
+    JourneyTaskCompletionRecord,
+    JourneyTemplateRecord,
+    JourneyTemplateTaskRecord,
     MatchedPairMessageRecord,
     MatchProposalRecord,
     MemberBlockRecord,
@@ -72,6 +90,7 @@ from matchwell.infrastructure.persistence.models import (
     MemberProfileRecord,
     MemberReportRecord,
     OutboxMessageRecord,
+    PairJourneyRecord,
     ReadinessDecisionRecord,
     ScreeningCaseRecord,
     ScreeningEventReceiptRecord,
@@ -1663,6 +1682,276 @@ class SqlAlchemyPilotRepository:
                 )
             return statuses
 
+    def get_member_journey(
+        self,
+        member: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+    ) -> MemberJourneyView | None:
+        with self._sessions.session() as session, session.begin():
+            proposal = self._active_participant_proposal(
+                session, member, proposal_id, lock=True
+            )
+            journey = session.scalar(
+                select(PairJourneyRecord).where(
+                    PairJourneyRecord.proposal_id == proposal.id,
+                    PairJourneyRecord.center_id == member.center_id,
+                )
+            )
+            if journey is None:
+                return None
+            return self._member_journey_view(session, proposal, journey, member.id)
+
+    def assign_guided_journey(
+        self,
+        counselor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+    ) -> uuid.UUID:
+        with self._sessions.session() as session, session.begin():
+            proposal = self._active_counselor_proposal(
+                session, counselor, proposal_id, lock=True
+            )
+            existing = session.scalar(
+                select(PairJourneyRecord).where(
+                    PairJourneyRecord.proposal_id == proposal.id
+                )
+            )
+            if existing is not None:
+                return existing.id
+            template = session.scalar(
+                select(JourneyTemplateRecord)
+                .where(
+                    JourneyTemplateRecord.key == PILOT_CURRICULUM_KEY,
+                    JourneyTemplateRecord.is_active.is_(True),
+                )
+                .order_by(JourneyTemplateRecord.version.desc())
+            )
+            if template is None:
+                raise NotFoundError("The pilot curriculum is not configured.")
+            journey = PairJourneyRecord(
+                center_id=counselor.center_id,
+                proposal_id=proposal.id,
+                template_id=template.id,
+                assigned_by_id=counselor.id,
+                started_at=self._now(),
+            )
+            session.add(journey)
+            session.flush()
+            self._audit(
+                session,
+                actor_id=counselor.id,
+                action="journey.assigned",
+                subject_id=journey.id,
+                center_id=counselor.center_id,
+                metadata={
+                    "proposal_id": str(proposal.id),
+                    "template_id": str(template.id),
+                    "template_version": template.version,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="journey.assigned",
+                    payload={
+                        "journey_id": str(journey.id),
+                        "proposal_id": str(proposal.id),
+                        "template_id": str(template.id),
+                    },
+                )
+            )
+            return journey.id
+
+    def set_journey_task_completion(
+        self,
+        member: AuthenticatedUser,
+        journey_id: uuid.UUID,
+        task_id: uuid.UUID,
+        completed: bool,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            journey = self._member_active_journey(
+                session, member, journey_id, lock=True
+            )
+            task = session.scalar(
+                select(JourneyTemplateTaskRecord).where(
+                    JourneyTemplateTaskRecord.id == task_id,
+                    JourneyTemplateTaskRecord.template_id == journey.template_id,
+                )
+            )
+            if task is None:
+                raise NotFoundError("Journey activity was not found.")
+            completion = session.scalar(
+                select(JourneyTaskCompletionRecord)
+                .where(
+                    JourneyTaskCompletionRecord.journey_id == journey.id,
+                    JourneyTaskCompletionRecord.task_id == task.id,
+                    JourneyTaskCompletionRecord.member_id == member.id,
+                )
+                .with_for_update()
+            )
+            was_completed = (
+                completion is not None and completion.completed_at is not None
+            )
+            if was_completed == completed:
+                return
+            now = self._now()
+            if completion is None:
+                completion = JourneyTaskCompletionRecord(
+                    center_id=member.center_id,
+                    journey_id=journey.id,
+                    task_id=task.id,
+                    member_id=member.id,
+                    completed_at=now if completed else None,
+                    updated_at=now,
+                )
+                session.add(completion)
+            else:
+                completion.completed_at = now if completed else None
+                completion.updated_at = now
+            session.flush()
+            event_type = (
+                "journey.task_completed" if completed else "journey.task_reopened"
+            )
+            metadata: dict[str, object] = {
+                "journey_id": str(journey.id),
+                "task_id": str(task.id),
+                "member_id": str(member.id),
+            }
+            self._audit(
+                session,
+                actor_id=member.id,
+                action=event_type,
+                subject_id=completion.id,
+                center_id=member.center_id,
+                metadata=metadata,
+            )
+            session.add(OutboxMessageRecord(event_type=event_type, payload=metadata))
+
+    def submit_journey_check_in(
+        self,
+        member: AuthenticatedUser,
+        journey_id: uuid.UUID,
+        milestone: CheckInMilestone,
+        relationship_status: RelationshipStatus,
+        support_requested: bool,
+        concern_flag: bool,
+        private_reflection: str,
+        share_with_counselor: bool,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            journey = self._member_active_journey(
+                session, member, journey_id, lock=True
+            )
+            now = self._now()
+            due_at = self._as_utc(journey.started_at) + timedelta(days=milestone.days)
+            existing = session.scalar(
+                select(JourneyCheckInRecord)
+                .where(
+                    JourneyCheckInRecord.journey_id == journey.id,
+                    JourneyCheckInRecord.member_id == member.id,
+                    JourneyCheckInRecord.milestone == milestone.value,
+                )
+                .with_for_update()
+            )
+            if (
+                existing is None
+                and reminder_state(due_at, None, now) is ReminderState.SCHEDULED
+            ):
+                raise ConflictError(
+                    f"This check-in opens on "
+                    f"{(due_at - timedelta(days=7)).strftime('%B %d, %Y')}."
+                )
+            if existing is None:
+                existing = JourneyCheckInRecord(
+                    center_id=member.center_id,
+                    journey_id=journey.id,
+                    member_id=member.id,
+                    milestone=milestone.value,
+                    relationship_status=relationship_status.value,
+                    support_requested=support_requested,
+                    concern_flag=concern_flag,
+                    private_reflection=private_reflection,
+                    share_with_counselor=share_with_counselor,
+                    submitted_at=now,
+                    updated_at=now,
+                )
+                session.add(existing)
+            else:
+                existing.relationship_status = relationship_status.value
+                existing.support_requested = support_requested
+                existing.concern_flag = concern_flag
+                existing.private_reflection = private_reflection
+                existing.share_with_counselor = share_with_counselor
+                existing.updated_at = now
+            session.flush()
+            safe_metadata: dict[str, object] = {
+                "journey_id": str(journey.id),
+                "member_id": str(member.id),
+                "milestone": milestone.value,
+                "support_requested": support_requested,
+                "concern_flag": concern_flag,
+                "reflection_shared": share_with_counselor,
+            }
+            self._audit(
+                session,
+                actor_id=member.id,
+                action="journey.check_in_submitted",
+                subject_id=existing.id,
+                center_id=member.center_id,
+                metadata=safe_metadata,
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="journey.check_in_submitted",
+                    payload={
+                        "check_in_id": str(existing.id),
+                        **safe_metadata,
+                    },
+                )
+            )
+
+    def list_counselor_journeys(
+        self,
+        counselor: AuthenticatedUser,
+    ) -> Sequence[CounselorJourneyView]:
+        with self._sessions.session() as session, session.begin():
+            member_ids = list(
+                session.scalars(
+                    select(CounselorAssignmentRecord.member_id).where(
+                        CounselorAssignmentRecord.center_id == counselor.center_id,
+                        CounselorAssignmentRecord.counselor_id == counselor.id,
+                        CounselorAssignmentRecord.ended_at.is_(None),
+                    )
+                )
+            )
+            if not member_ids:
+                return []
+            proposals = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.center_id == counselor.center_id,
+                    MatchProposalRecord.status == ProposalStatus.ACTIVE.value,
+                    or_(
+                        MatchProposalRecord.member_a_id.in_(member_ids),
+                        MatchProposalRecord.member_b_id.in_(member_ids),
+                    ),
+                )
+                .order_by(MatchProposalRecord.activated_at.desc())
+                .with_for_update()
+            ).all()
+            return [
+                self._counselor_journey_view(
+                    session,
+                    proposal,
+                    session.scalar(
+                        select(PairJourneyRecord).where(
+                            PairJourneyRecord.proposal_id == proposal.id
+                        )
+                    ),
+                    counselor,
+                )
+                for proposal in proposals
+            ]
+
     def block_member(
         self,
         actor: AuthenticatedUser,
@@ -2264,6 +2553,321 @@ class SqlAlchemyPilotRepository:
         if proposal.status != ProposalStatus.ACTIVE.value:
             raise ConflictError("This matched-pair conversation is no longer active.")
         return proposal
+
+    def _member_active_journey(
+        self,
+        session: Session,
+        member: AuthenticatedUser,
+        journey_id: uuid.UUID,
+        *,
+        lock: bool = False,
+    ) -> PairJourneyRecord:
+        statement = select(PairJourneyRecord).where(
+            PairJourneyRecord.id == journey_id,
+            PairJourneyRecord.center_id == member.center_id,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        journey = session.scalar(statement)
+        if journey is None:
+            raise NotFoundError("Guided journey was not found.")
+        self._active_participant_proposal(
+            session,
+            member,
+            journey.proposal_id,
+            lock=lock,
+        )
+        return journey
+
+    def _active_counselor_proposal(
+        self,
+        session: Session,
+        counselor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        *,
+        lock: bool = False,
+    ) -> MatchProposalRecord:
+        statement = select(MatchProposalRecord).where(
+            MatchProposalRecord.id == proposal_id,
+            MatchProposalRecord.center_id == counselor.center_id,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        proposal = session.scalar(statement)
+        if proposal is None:
+            raise NotFoundError("Matched pair was not found.")
+        assigned_member_id = session.scalar(
+            select(CounselorAssignmentRecord.member_id).where(
+                CounselorAssignmentRecord.center_id == counselor.center_id,
+                CounselorAssignmentRecord.counselor_id == counselor.id,
+                CounselorAssignmentRecord.member_id.in_(
+                    (proposal.member_a_id, proposal.member_b_id)
+                ),
+                CounselorAssignmentRecord.ended_at.is_(None),
+            )
+        )
+        if assigned_member_id is None:
+            raise NotFoundError("Matched pair was not found.")
+        if proposal.status != ProposalStatus.ACTIVE.value:
+            raise ConflictError("This matched pair is no longer active.")
+        return proposal
+
+    def _member_journey_view(
+        self,
+        session: Session,
+        proposal: MatchProposalRecord,
+        journey: PairJourneyRecord,
+        member_id: uuid.UUID,
+    ) -> MemberJourneyView:
+        template = session.get(JourneyTemplateRecord, journey.template_id)
+        if template is None:
+            raise NotFoundError("Journey curriculum was not found.")
+        tasks = session.scalars(
+            select(JourneyTemplateTaskRecord)
+            .where(JourneyTemplateTaskRecord.template_id == template.id)
+            .order_by(JourneyTemplateTaskRecord.sequence)
+        ).all()
+        completions = session.scalars(
+            select(JourneyTaskCompletionRecord).where(
+                JourneyTaskCompletionRecord.journey_id == journey.id,
+                JourneyTaskCompletionRecord.center_id == journey.center_id,
+            )
+        ).all()
+        completion_map = {
+            (item.task_id, item.member_id): item.completed_at for item in completions
+        }
+        partner_id = (
+            proposal.member_b_id
+            if proposal.member_a_id == member_id
+            else proposal.member_a_id
+        )
+        task_views = tuple(
+            JourneyTaskView(
+                id=task.id,
+                sequence=task.sequence,
+                title=task.title,
+                description=task.description,
+                scope=TaskScope(task.scope),
+                due_day=task.due_day,
+                completed_at=completion_map.get((task.id, member_id)),
+                partner_completed_at=(
+                    completion_map.get((task.id, partner_id))
+                    if TaskScope(task.scope) is TaskScope.SHARED
+                    else None
+                ),
+            )
+            for task in tasks
+        )
+        check_ins = {
+            CheckInMilestone(item.milestone): item
+            for item in session.scalars(
+                select(JourneyCheckInRecord).where(
+                    JourneyCheckInRecord.journey_id == journey.id,
+                    JourneyCheckInRecord.member_id == member_id,
+                    JourneyCheckInRecord.center_id == journey.center_id,
+                )
+            )
+        }
+        now = self._now()
+        started_at = self._as_utc(journey.started_at)
+        check_in_views = tuple(
+            self._member_check_in_view(
+                milestone,
+                started_at,
+                check_ins.get(milestone),
+                now,
+            )
+            for milestone in CheckInMilestone
+        )
+        return MemberJourneyView(
+            id=journey.id,
+            proposal_id=journey.proposal_id,
+            template_name=template.name,
+            template_version=template.version,
+            started_at=started_at,
+            tasks=task_views,
+            check_ins=check_in_views,
+        )
+
+    @staticmethod
+    def _member_check_in_view(
+        milestone: CheckInMilestone,
+        started_at: datetime,
+        record: JourneyCheckInRecord | None,
+        now: datetime,
+    ) -> MemberCheckInView:
+        due_at = started_at + timedelta(days=milestone.days)
+        submitted_at = record.submitted_at if record is not None else None
+        return MemberCheckInView(
+            milestone=milestone,
+            due_at=due_at,
+            reminder_state=reminder_state(due_at, submitted_at, now),
+            relationship_status=(
+                RelationshipStatus(record.relationship_status)
+                if record is not None
+                else None
+            ),
+            support_requested=(
+                record.support_requested if record is not None else False
+            ),
+            concern_flag=record.concern_flag if record is not None else False,
+            private_reflection=(
+                record.private_reflection if record is not None else ""
+            ),
+            share_with_counselor=(
+                record.share_with_counselor if record is not None else False
+            ),
+            submitted_at=submitted_at,
+        )
+
+    def _counselor_journey_view(
+        self,
+        session: Session,
+        proposal: MatchProposalRecord,
+        journey: PairJourneyRecord | None,
+        counselor: AuthenticatedUser,
+    ) -> CounselorJourneyView:
+        member_ids = (proposal.member_a_id, proposal.member_b_id)
+        names = {
+            member_id: self._display_name(session, member_id)
+            for member_id in member_ids
+        }
+        if journey is None:
+            return CounselorJourneyView(
+                proposal_id=proposal.id,
+                member_a_display_name=names[proposal.member_a_id],
+                member_b_display_name=names[proposal.member_b_id],
+                journey_id=None,
+                template_name=None,
+                template_version=None,
+                started_at=None,
+                members=(),
+            )
+        template = session.get(JourneyTemplateRecord, journey.template_id)
+        if template is None:
+            raise NotFoundError("Journey curriculum was not found.")
+        task_ids = list(
+            session.scalars(
+                select(JourneyTemplateTaskRecord.id).where(
+                    JourneyTemplateTaskRecord.template_id == template.id
+                )
+            )
+        )
+        completions = session.scalars(
+            select(JourneyTaskCompletionRecord).where(
+                JourneyTaskCompletionRecord.journey_id == journey.id,
+                JourneyTaskCompletionRecord.center_id == counselor.center_id,
+                JourneyTaskCompletionRecord.completed_at.is_not(None),
+            )
+        ).all()
+        completed_counts = {
+            member_id: sum(item.member_id == member_id for item in completions)
+            for member_id in member_ids
+        }
+        check_ins = session.scalars(
+            select(JourneyCheckInRecord).where(
+                JourneyCheckInRecord.journey_id == journey.id,
+                JourneyCheckInRecord.center_id == counselor.center_id,
+            )
+        ).all()
+        check_in_map = {
+            (item.member_id, CheckInMilestone(item.milestone)): item
+            for item in check_ins
+        }
+        assignments = {
+            member_id: self._active_counselor_assignment(session, member_id)
+            for member_id in member_ids
+        }
+        my_member_ids = {
+            member_id
+            for member_id, assignment in assignments.items()
+            if assignment is not None and assignment.counselor_id == counselor.id
+        }
+        now = self._now()
+        started_at = self._as_utc(journey.started_at)
+        members = tuple(
+            self._counselor_journey_member_view(
+                member_id,
+                names[member_id],
+                len(task_ids),
+                completed_counts[member_id],
+                member_id in my_member_ids,
+                started_at,
+                check_in_map,
+                now,
+            )
+            for member_id in member_ids
+        )
+        return CounselorJourneyView(
+            proposal_id=proposal.id,
+            member_a_display_name=names[proposal.member_a_id],
+            member_b_display_name=names[proposal.member_b_id],
+            journey_id=journey.id,
+            template_name=template.name,
+            template_version=template.version,
+            started_at=started_at,
+            members=members,
+        )
+
+    @staticmethod
+    def _counselor_journey_member_view(
+        member_id: uuid.UUID,
+        display_name: str,
+        total_task_count: int,
+        completed_task_count: int,
+        is_my_member: bool,
+        started_at: datetime,
+        records: dict[
+            tuple[uuid.UUID, CheckInMilestone],
+            JourneyCheckInRecord,
+        ],
+        now: datetime,
+    ) -> CounselorJourneyMemberView:
+        check_ins: list[CounselorCheckInView] = []
+        for milestone in CheckInMilestone:
+            record = records.get((member_id, milestone))
+            submitted_at = record.submitted_at if record is not None else None
+            check_ins.append(
+                CounselorCheckInView(
+                    milestone=milestone,
+                    due_at=started_at + timedelta(days=milestone.days),
+                    reminder_state=reminder_state(
+                        started_at + timedelta(days=milestone.days),
+                        submitted_at,
+                        now,
+                    ),
+                    submitted_at=submitted_at,
+                    support_requested=(
+                        record.support_requested
+                        if record is not None and is_my_member
+                        else None
+                    ),
+                    concern_flag=(
+                        record.concern_flag
+                        if record is not None and is_my_member
+                        else None
+                    ),
+                    shared_reflection=(
+                        record.private_reflection
+                        if record is not None
+                        and is_my_member
+                        and record.share_with_counselor
+                        else None
+                    ),
+                )
+            )
+        return CounselorJourneyMemberView(
+            member_id=member_id,
+            display_name=display_name,
+            completed_task_count=completed_task_count,
+            total_task_count=total_task_count,
+            is_my_member=is_my_member,
+            check_ins=tuple(check_ins),
+        )
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
     @staticmethod
     def _user(record: UserRecord) -> AuthenticatedUser:

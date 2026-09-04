@@ -2,12 +2,20 @@
 
 import uuid
 from datetime import date, timedelta
+from typing import cast
 
 import streamlit as st
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser
 from matchwell.domain.errors import MatchwellError
+from matchwell.domain.journey import (
+    MemberCheckInView,
+    MemberJourneyView,
+    RelationshipStatus,
+    ReminderState,
+    TaskScope,
+)
 from matchwell.domain.matching import (
     MAX_PARTNER_AGE,
     MIN_PARTNER_AGE,
@@ -18,6 +26,7 @@ from matchwell.domain.matching import (
 )
 from matchwell.domain.pilot import ProfileInput
 from matchwell.presentation.theme import (
+    Tone,
     humanize,
     render_badges,
     render_empty_state,
@@ -272,13 +281,20 @@ def render_introduction(service: PilotService, actor: AuthenticatedUser) -> None
                 "Your private conversation is visible only to you and your "
                 "match. Counselors can see activity timing, never message text."
             )
-        _render_matched_pair_messages(service, actor, matched_pair.proposal_id)
-        _render_safety_actions(
-            service,
-            actor,
-            matched_pair.partner_id,
-            matched_pair.partner_display_name,
+        journey_tab, conversation_tab, safety_tab = st.tabs(
+            ["Journey", "Conversation", "Safety"]
         )
+        with journey_tab:
+            _render_guided_journey(service, actor, matched_pair.proposal_id)
+        with conversation_tab:
+            _render_matched_pair_messages(service, actor, matched_pair.proposal_id)
+        with safety_tab:
+            _render_safety_actions(
+                service,
+                actor,
+                matched_pair.partner_id,
+                matched_pair.partner_display_name,
+            )
         return
 
     if introduction is None:
@@ -349,6 +365,173 @@ def render_introduction(service: PilotService, actor: AuthenticatedUser) -> None
         introduction.partner_id,
         introduction.partner_display_name,
     )
+
+
+def _render_guided_journey(
+    service: PilotService,
+    actor: AuthenticatedUser,
+    proposal_id: uuid.UUID,
+) -> None:
+    try:
+        journey = service.guided_journey(actor, proposal_id)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if journey is None:
+        render_empty_state(
+            "Your counselor has not started the guided journey yet. "
+            "You can continue using your private conversation."
+        )
+        return
+
+    st.subheader(journey.template_name)
+    st.caption(
+        f"Version {journey.template_version} · Started "
+        f"{journey.started_at.strftime('%B %d, %Y')}"
+    )
+    st.progress(
+        journey.completed_task_count / len(journey.tasks),
+        text=f"Your activities: {journey.completed_task_count}/{len(journey.tasks)}",
+    )
+    st.caption(
+        "Shared activities show each person's completion. Individual activity "
+        "status stays private from your match."
+    )
+    for task in journey.tasks:
+        with st.container(border=True):
+            scope_label = (
+                "Shared activity"
+                if task.scope is TaskScope.SHARED
+                else "Individual activity"
+            )
+            render_badges(
+                [
+                    (scope_label, "info"),
+                    (f"Suggested by day {task.due_day}", "neutral"),
+                    (
+                        "Complete" if task.completed_at is not None else "To do",
+                        "success" if task.completed_at is not None else "warning",
+                    ),
+                ]
+            )
+            st.write(f"**{task.sequence}. {task.title}**")
+            st.write(task.description)
+            if task.scope is TaskScope.SHARED:
+                st.caption(
+                    "Your match: "
+                    + (
+                        "complete"
+                        if task.partner_completed_at is not None
+                        else "not complete yet"
+                    )
+                )
+            completed = task.completed_at is not None
+            if st.button(
+                "Mark incomplete" if completed else "Mark complete",
+                key=f"journey-task-{task.id}-{completed}",
+                type="secondary" if completed else "primary",
+            ):
+                try:
+                    service.set_journey_task_completion(
+                        actor,
+                        journey.id,
+                        task.id,
+                        completed=not completed,
+                    )
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    st.rerun()
+
+    st.subheader("30 / 60 / 90-day check-ins")
+    st.caption(
+        "Your answers remain private. Only support and concern signals are "
+        "shown to your counselor unless you explicitly share your reflection."
+    )
+    for check_in in journey.check_ins:
+        _render_member_check_in(service, actor, journey, check_in)
+
+
+def _render_member_check_in(
+    service: PilotService,
+    actor: AuthenticatedUser,
+    journey: MemberJourneyView,
+    check_in: MemberCheckInView,
+) -> None:
+    milestone = check_in.milestone
+    label = f"{milestone.days}-day check-in"
+    tone = cast(
+        Tone,
+        {
+            ReminderState.COMPLETED: "success",
+            ReminderState.OVERDUE: "danger",
+            ReminderState.DUE: "warning",
+            ReminderState.UPCOMING: "info",
+            ReminderState.SCHEDULED: "neutral",
+        }[check_in.reminder_state],
+    )
+    with st.expander(
+        f"{label} · {humanize(check_in.reminder_state.value)}",
+        expanded=check_in.reminder_state in {ReminderState.DUE, ReminderState.OVERDUE},
+    ):
+        render_badges([(humanize(check_in.reminder_state.value), tone)])
+        st.caption(f"Due {check_in.due_at.strftime('%B %d, %Y')}")
+        if check_in.reminder_state is ReminderState.SCHEDULED:
+            st.write(
+                "This check-in opens "
+                f"{(check_in.due_at - timedelta(days=7)).strftime('%B %d, %Y')}."
+            )
+            return
+        statuses = list(RelationshipStatus)
+        current_status = check_in.relationship_status or RelationshipStatus.STEADY
+        with st.form(f"journey-check-in-{milestone.value}"):
+            status = st.selectbox(
+                "How does the relationship feel right now?",
+                options=statuses,
+                index=statuses.index(current_status),
+                format_func=lambda item: humanize(item.value),
+            )
+            support_requested = st.checkbox(
+                "I would like counselor support",
+                value=check_in.support_requested,
+            )
+            concern_flag = st.checkbox(
+                "I have a concern I want my counselor to know about",
+                value=check_in.concern_flag,
+            )
+            reflection = st.text_area(
+                "Private reflection (optional)",
+                value=check_in.private_reflection,
+                max_chars=2000,
+            )
+            share_with_counselor = st.checkbox(
+                "Share this reflection with my counselor",
+                value=check_in.share_with_counselor,
+                disabled=not reflection.strip(),
+            )
+            submitted = st.form_submit_button(
+                "Update check-in"
+                if check_in.submitted_at is not None
+                else "Submit check-in",
+                type="primary",
+            )
+        if submitted:
+            try:
+                service.submit_journey_check_in(
+                    actor,
+                    journey.id,
+                    milestone,
+                    status,
+                    support_requested=support_requested,
+                    concern_flag=concern_flag,
+                    private_reflection=reflection,
+                    share_with_counselor=share_with_counselor,
+                )
+            except MatchwellError as error:
+                st.error(str(error))
+            else:
+                render_success_state("Check-in saved.")
+                st.rerun()
 
 
 def _render_matched_pair_messages(

@@ -138,6 +138,15 @@ count, but never message content. Administrators also have no message-content
 view. A block, report, safety hold, readiness loss, or role change closes
 conversation access immediately.
 
+Either member's currently assigned counselor can start the versioned **Pilot
+Foundations** journey from **Guided journeys**. Members then complete shared and
+private activities in the matched-pair **Journey** tab and receive in-app
+30/60/90-day check-in reminders. Check-in answers remain private: each
+counselor sees support and concern signals only for their assigned member, and
+reflection text is visible only when that member explicitly shares it.
+Individual activity completion is never exposed to the partner. Closing the
+match immediately closes journey access while retaining its audit history.
+
 ### Quality checks
 
 ```powershell

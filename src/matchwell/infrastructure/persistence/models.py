@@ -551,6 +551,142 @@ class MatchedPairMessageRecord(Base):
     )
 
 
+class JourneyTemplateRecord(Base):
+    __tablename__ = "journey_templates"
+    __table_args__ = (UniqueConstraint("key", "version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    key: Mapped[str] = mapped_column(String(100), nullable=False)
+    version: Mapped[str] = mapped_column(String(30), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(String(1000), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class JourneyTemplateTaskRecord(Base):
+    __tablename__ = "journey_template_tasks"
+    __table_args__ = (UniqueConstraint("template_id", "sequence"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("journey_templates.id"),
+        nullable=False,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(String(1000), nullable=False)
+    scope: Mapped[str] = mapped_column(String(20), nullable=False)
+    due_day: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class PairJourneyRecord(Base):
+    __tablename__ = "pair_journeys"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    proposal_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("match_proposals.id"),
+        nullable=False,
+        unique=True,
+    )
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("journey_templates.id"),
+        nullable=False,
+    )
+    assigned_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class JourneyTaskCompletionRecord(Base):
+    __tablename__ = "journey_task_completions"
+    __table_args__ = (
+        UniqueConstraint("journey_id", "task_id", "member_id"),
+        Index(
+            "ix_journey_task_completions_member",
+            "journey_id",
+            "member_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    journey_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("pair_journeys.id"),
+        nullable=False,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("journey_template_tasks.id"),
+        nullable=False,
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class JourneyCheckInRecord(Base):
+    __tablename__ = "journey_check_ins"
+    __table_args__ = (
+        UniqueConstraint("journey_id", "member_id", "milestone"),
+        Index("ix_journey_check_ins_member", "journey_id", "member_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    journey_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("pair_journeys.id"),
+        nullable=False,
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    milestone: Mapped[str] = mapped_column(String(20), nullable=False)
+    relationship_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    support_requested: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    concern_flag: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    private_reflection: Mapped[str] = mapped_column(String(2000), nullable=False)
+    share_with_counselor: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+
 class MemberBlockRecord(Base):
     __tablename__ = "member_blocks"
     __table_args__ = (UniqueConstraint("blocker_id", "blocked_id"),)

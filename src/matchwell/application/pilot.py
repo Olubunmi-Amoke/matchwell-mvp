@@ -14,6 +14,12 @@ from matchwell.domain.errors import (
     AuthorizationError,
     ValidationError,
 )
+from matchwell.domain.journey import (
+    CheckInMilestone,
+    CounselorJourneyView,
+    MemberJourneyView,
+    RelationshipStatus,
+)
 from matchwell.domain.matching import (
     MAX_PARTNER_AGE,
     MIN_PARTNER_AGE,
@@ -234,6 +240,43 @@ class PilotRepository(Protocol):
         self,
         counselor: AuthenticatedUser,
     ) -> Sequence[CounselorConversationStatus]: ...
+
+    def get_member_journey(
+        self,
+        member: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+    ) -> MemberJourneyView | None: ...
+
+    def assign_guided_journey(
+        self,
+        counselor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+    ) -> uuid.UUID: ...
+
+    def set_journey_task_completion(
+        self,
+        member: AuthenticatedUser,
+        journey_id: uuid.UUID,
+        task_id: uuid.UUID,
+        completed: bool,
+    ) -> None: ...
+
+    def submit_journey_check_in(
+        self,
+        member: AuthenticatedUser,
+        journey_id: uuid.UUID,
+        milestone: CheckInMilestone,
+        relationship_status: RelationshipStatus,
+        support_requested: bool,
+        concern_flag: bool,
+        private_reflection: str,
+        share_with_counselor: bool,
+    ) -> None: ...
+
+    def list_counselor_journeys(
+        self,
+        counselor: AuthenticatedUser,
+    ) -> Sequence[CounselorJourneyView]: ...
 
     def block_member(
         self,
@@ -584,6 +627,74 @@ class PilotService:
     ) -> Sequence[CounselorConversationStatus]:
         self._require_role(actor, Role.COUNSELOR)
         return self._repository.list_conversation_statuses(actor)
+
+    def guided_journey(
+        self,
+        actor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+    ) -> MemberJourneyView | None:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.get_member_journey(actor, proposal_id)
+
+    def assign_guided_journey(
+        self,
+        actor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+    ) -> uuid.UUID:
+        self._require_role(actor, Role.COUNSELOR)
+        return self._repository.assign_guided_journey(actor, proposal_id)
+
+    def set_journey_task_completion(
+        self,
+        actor: AuthenticatedUser,
+        journey_id: uuid.UUID,
+        task_id: uuid.UUID,
+        *,
+        completed: bool,
+    ) -> None:
+        self._require_role(actor, Role.MEMBER)
+        self._repository.set_journey_task_completion(
+            actor,
+            journey_id,
+            task_id,
+            completed,
+        )
+
+    def submit_journey_check_in(
+        self,
+        actor: AuthenticatedUser,
+        journey_id: uuid.UUID,
+        milestone: CheckInMilestone,
+        relationship_status: RelationshipStatus,
+        *,
+        support_requested: bool,
+        concern_flag: bool,
+        private_reflection: str,
+        share_with_counselor: bool,
+    ) -> None:
+        self._require_role(actor, Role.MEMBER)
+        reflection = private_reflection.strip()
+        if len(reflection) > 2000:
+            raise ValidationError("Keep check-in reflections under 2,000 characters.")
+        if share_with_counselor and not reflection:
+            raise ValidationError("Enter a reflection before sharing it.")
+        self._repository.submit_journey_check_in(
+            actor,
+            journey_id,
+            milestone,
+            relationship_status,
+            support_requested,
+            concern_flag,
+            reflection,
+            share_with_counselor,
+        )
+
+    def counselor_journeys(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[CounselorJourneyView]:
+        self._require_role(actor, Role.COUNSELOR)
+        return self._repository.list_counselor_journeys(actor)
 
     def block_member(
         self,
