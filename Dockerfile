@@ -21,6 +21,7 @@ COPY --chown=user:user assets ./assets
 COPY --chown=user:user migrations ./migrations
 COPY --chown=user:user alembic.ini ./
 COPY --chown=user:user .streamlit/config.toml ./.streamlit/config.toml
+RUN python -c "from matchwell.presentation.branding import install_static_app_metadata; install_static_app_metadata()"
 
 EXPOSE 7860
 

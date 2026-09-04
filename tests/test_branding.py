@@ -3,6 +3,8 @@ from pathlib import Path
 
 from PIL import Image
 
+from matchwell.presentation.branding import install_static_app_metadata
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -27,3 +29,17 @@ def test_web_manifest_references_existing_icons() -> None:
     assert manifest["display"] == "standalone"
     for icon in manifest["icons"]:
         assert (manifest_path.parent / icon["src"]).is_file()
+
+
+def test_static_metadata_is_installed_idempotently(tmp_path: Path) -> None:
+    index_path = tmp_path / "index.html"
+    index_path.write_text("<html><head><title>App</title></head></html>")
+
+    install_static_app_metadata(index_path)
+    install_static_app_metadata(index_path)
+
+    document = index_path.read_text(encoding="utf-8")
+    assert document.count("<!-- Matchwell mobile branding -->") == 1
+    assert 'rel="apple-touch-icon"' in document
+    assert 'href="/app/static/matchwell-icon-180.png"' in document
+    assert 'rel="manifest"' in document
