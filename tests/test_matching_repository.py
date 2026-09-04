@@ -32,13 +32,16 @@ from matchwell.infrastructure.persistence.database import (
     create_database_engine,
 )
 from matchwell.infrastructure.persistence.models import (
+    AssessmentAssignmentRecord,
     AssessmentDefinitionRecord,
     AuditEventRecord,
     CenterRecord,
     CommunityRecord,
     ConsentVersionRecord,
+    CounselorAssignmentRecord,
     HoldRecord,
     MatchProposalRecord,
+    MemberProfileRecord,
     OutboxMessageRecord,
     UserRecord,
 )
@@ -303,6 +306,109 @@ def test_full_two_member_matching_journey_activates_workspace(pilot: Pilot) -> N
             )
         )
         assert activated_audit is not None
+
+
+def test_admin_reassigns_member_to_counselor_and_closes_active_workflows(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    service.generate_candidates(admin)
+    proposal_id = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(counselor_a, proposal_id, CounselorReviewDecision.APPROVED)
+    service.review_candidate(counselor_b, proposal_id, CounselorReviewDecision.APPROVED)
+    service.respond_to_introduction(
+        member_a, proposal_id, MemberResponseDecision.ACCEPTED
+    )
+    service.respond_to_introduction(
+        member_b, proposal_id, MemberResponseDecision.ACCEPTED
+    )
+
+    with pytest.raises(ValidationError):
+        service.reassign_member_to_counselor(
+            admin,
+            member_a.id,
+            "different-member@example.com",
+            "counselor-onboarding",
+        )
+    assert member_a.id in {item.id for item in service.members(admin)}
+
+    service.reassign_member_to_counselor(
+        admin,
+        member_a.id,
+        member_a.email,
+        "counselor-onboarding",
+    )
+
+    assert {item.id for item in service.members(admin)} == {member_b.id}
+    assert member_a.id in {item.id for item in service.counselors(admin)}
+    assert service.assigned_members(counselor_a) == ()
+    assert service.matched_pair(member_a) is None
+    assert service.matched_pair(member_b) is None
+
+    with sessions.session() as session:
+        reassigned = session.get(UserRecord, member_a.id)
+        assert reassigned is not None
+        assert reassigned.role == Role.COUNSELOR.value
+
+        assignment = session.scalar(
+            select(CounselorAssignmentRecord).where(
+                CounselorAssignmentRecord.member_id == member_a.id
+            )
+        )
+        assert assignment is not None
+        assert assignment.ended_at is not None
+
+        proposal = session.get(MatchProposalRecord, proposal_id)
+        assert proposal is not None
+        assert proposal.closed_reason == "member_role_changed"
+        assert proposal.closed_at is not None
+
+        assert session.get(MemberProfileRecord, member_a.id) is not None
+        assessment = session.scalar(
+            select(AssessmentAssignmentRecord).where(
+                AssessmentAssignmentRecord.member_id == member_a.id
+            )
+        )
+        assert assessment is not None
+
+        audit = session.scalar(
+            select(AuditEventRecord).where(
+                AuditEventRecord.action == "identity.role_reassigned",
+                AuditEventRecord.subject_id == str(member_a.id),
+            )
+        )
+        assert audit is not None
+        assert audit.safe_metadata == {
+            "previous_role": Role.MEMBER.value,
+            "new_role": Role.COUNSELOR.value,
+            "reason_code": "counselor-onboarding",
+        }
+
+        outbox = session.scalar(
+            select(OutboxMessageRecord).where(
+                OutboxMessageRecord.event_type == "identity.role_reassigned"
+            )
+        )
+        assert outbox is not None
+        assert outbox.payload == {
+            "user_id": str(member_a.id),
+            "center_id": str(admin.center_id),
+            "previous_role": Role.MEMBER.value,
+            "new_role": Role.COUNSELOR.value,
+            "reason_code": "counselor-onboarding",
+        }
+
+    with pytest.raises(ConflictError):
+        service.reassign_member_to_counselor(
+            admin,
+            member_a.id,
+            member_a.email,
+            "counselor-onboarding",
+        )
+    with pytest.raises(NotFoundError):
+        service.assign_counselor(admin, member_a.id, counselor_b.id)
 
 
 def test_ineligible_member_excluded_from_candidate_generation(pilot: Pilot) -> None:

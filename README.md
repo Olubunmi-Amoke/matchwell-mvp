@@ -86,6 +86,13 @@ After the administrator signs in, use **Pilot operations** to invite members
 and counselors. Invitees must sign in with the exact Google email address used
 in their active invitation.
 
+Administrators can convert an existing member account to a counselor from
+**Pilot operations → Member readiness → Role management**. The action requires
+the member's exact email and an operational reason. It preserves historical
+readiness and safety records, ends the member's active counselor assignment,
+and closes any open introduction or matched-pair access. The reassigned user
+must sign out and back in to load the counselor workspace.
+
 ### Community matching and introductions
 
 Once a member reaches 7/7 readiness, they can complete matching preferences

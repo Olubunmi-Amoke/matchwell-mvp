@@ -304,3 +304,10 @@ def test_cross_center_member_is_not_visible_or_assignable(
     assert all(item.id != other_member_id for item in service.members(admin))
     with pytest.raises(NotFoundError):
         service.assign_counselor(admin, other_member_id, uuid.uuid4())
+    with pytest.raises(NotFoundError):
+        service.reassign_member_to_counselor(
+            admin,
+            other_member_id,
+            "other@example.com",
+            "account-role-correction",
+        )

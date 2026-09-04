@@ -6,7 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 import streamlit as st
 
-from matchwell.application.pilot import PilotService
+from matchwell.application.pilot import (
+    ROLE_REASSIGNMENT_REASON_CODES,
+    PilotService,
+)
 from matchwell.domain.access import AuthenticatedUser, Role
 from matchwell.domain.errors import MatchwellError
 from matchwell.domain.matching import CounselorReviewDecision
@@ -377,6 +380,48 @@ def _render_member_operations(
             else:
                 render_success_state("Hold applied. Eligibility is blocked.")
                 st.rerun()
+
+    st.divider()
+    st.subheader("Role management")
+    with st.container(border=True):
+        st.warning(
+            "Changing this member to a counselor is permanent in the pilot. "
+            "Their history is retained, but their active counselor assignment "
+            "and any open introduction or matched-pair access will close."
+        )
+        with st.form(f"role-reassignment-{selected.id}"):
+            role_reason = st.selectbox(
+                "Reason",
+                options=ROLE_REASSIGNMENT_REASON_CODES,
+                format_func=humanize,
+            )
+            confirmation_email = st.text_input(
+                f"Type {selected.email} to confirm",
+                autocomplete="off",
+            )
+            impact_confirmed = st.checkbox(
+                "I understand this account will become a counselor."
+            )
+            reassign_submitted = st.form_submit_button("Change member to counselor")
+        if reassign_submitted:
+            if not impact_confirmed:
+                st.error("Confirm that you understand the role change.")
+            else:
+                try:
+                    service.reassign_member_to_counselor(
+                        actor,
+                        selected.id,
+                        confirmation_email,
+                        role_reason,
+                    )
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state(
+                        "Role changed to counselor. Ask the user to sign out "
+                        "and back in to open the counselor workspace."
+                    )
+                    st.rerun()
 
 
 def _member_selector(

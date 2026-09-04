@@ -3,7 +3,12 @@ from collections.abc import Sequence
 from datetime import date
 from typing import Protocol
 
-from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
+from matchwell.domain.access import (
+    AuthenticatedUser,
+    OidcIdentity,
+    Role,
+    normalize_email,
+)
 from matchwell.domain.errors import (
     AuthenticationError,
     AuthorizationError,
@@ -34,6 +39,12 @@ from matchwell.domain.pilot import (
     OperationsMember,
     ProfileInput,
     ScreeningStatus,
+)
+
+ROLE_REASSIGNMENT_REASON_CODES = (
+    "counselor-onboarding",
+    "account-role-correction",
+    "pilot-staffing-change",
 )
 
 
@@ -93,6 +104,14 @@ class PilotRepository(Protocol):
         actor: AuthenticatedUser,
         member_id: uuid.UUID,
         counselor_id: uuid.UUID,
+    ) -> None: ...
+
+    def reassign_member_to_counselor(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        confirmation_email: str,
+        reason_code: str,
     ) -> None: ...
 
     def list_assigned_members(
@@ -299,6 +318,32 @@ class PilotService:
     ) -> None:
         self._require_role(actor, Role.ADMIN)
         self._repository.assign_counselor(actor, member_id, counselor_id)
+
+    def reassign_member_to_counselor(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        confirmation_email: str,
+        reason_code: str,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        if member_id == actor.id:
+            raise ValidationError("You cannot reassign your own administrator account.")
+        if not confirmation_email.strip():
+            raise ValidationError("Type the member's exact email to confirm.")
+        try:
+            confirmed_email = normalize_email(confirmation_email)
+        except ValueError as error:
+            raise ValidationError(str(error)) from error
+        safe_reason = reason_code.strip()
+        if safe_reason not in ROLE_REASSIGNMENT_REASON_CODES:
+            raise ValidationError("Select a valid role reassignment reason.")
+        self._repository.reassign_member_to_counselor(
+            actor,
+            member_id,
+            confirmed_email,
+            safe_reason,
+        )
 
     def assigned_members(
         self,
