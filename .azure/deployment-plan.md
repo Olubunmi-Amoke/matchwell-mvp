@@ -1,6 +1,71 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Milestone complete
+> **Status:** Validated
+
+## Active Milestone: Audited Member-to-Counselor Reassignment
+
+**Goal:** Let a platform administrator convert an existing member account into a
+counselor account without deleting identity or historical records.
+
+### Supported transition
+
+- Support `Member -> Counselor` only.
+- Do not permit administrator reassignment, counselor demotion, self-service
+  role changes, or multi-role accounts in this milestone.
+- Require an explicit administrator confirmation and a short operational reason
+  code.
+
+### Transactional behavior
+
+1. Verify the actor is an administrator and the target is a member in the same
+   Center.
+2. Lock the target account and related active workflow records.
+3. End the target's active counselor assignment as a member.
+4. Close pending, introduced, or active match proposals involving the target
+   with reason `member_role_changed`.
+5. Change the account role to counselor.
+6. Preserve profile, consent, assessment, readiness, screening, hold, safety,
+   matching, and prior assignment records as historical evidence.
+7. Append an immutable `identity.role_reassigned` audit event containing only
+   the old role, new role, and safe reason code.
+8. Append a transactional `identity.role_reassigned` outbox event.
+
+### User experience
+
+- Add a clearly labeled **Role management** section to the administrator's
+  member-readiness workspace.
+- Explain that historical data is retained and active member workflows will
+  close.
+- Require the administrator to type the member's exact email and provide a
+  reason code before completing reassignment.
+- After success, remove the account from member queues and make it available in
+  counselor assignment controls.
+- Tell the reassigned user to sign out and back in to load the counselor
+  workspace.
+
+### Safety and authorization
+
+- Never delete or rewrite historical audit, screening, readiness, counseling,
+  safety, or matching records.
+- Do not expose assessment answers, screening details, counseling notes, or
+  report context in audit/outbox payloads.
+- Reject stale, repeated, cross-Center, non-member, and non-administrator
+  requests.
+- Perform the entire transition atomically.
+
+### Validation
+
+- Add application authorization and input-validation tests.
+- Add repository tests for successful transition, history preservation,
+  assignment ending, proposal closure, audit/outbox creation, cross-Center
+  isolation, and repeated-request rejection.
+- Run Ruff, formatting, strict mypy, the complete pytest suite, migration checks,
+  and Streamlit startup smoke verification.
+
+**Implementation status:** Complete.
+
+**Validation status:** Ruff, formatting, strict mypy, 76 tests, PostgreSQL
+migration SQL generation, and Streamlit startup smoke verification passed.
 
 ## Active Milestone: Community Matching and Introductions
 
@@ -337,6 +402,16 @@ remain an operator concern and are not provisioned by repository automation.
 - [x] Start the application and verify the health surface
 - [x] Record validation proof below
 
+### Audited role reassignment validation
+
+- [x] All validation checks pass
+  - [x] Ruff lint and formatting
+  - [x] Strict mypy type checking
+  - [x] Complete pytest suite with coverage threshold
+  - [x] PostgreSQL upgrade and downgrade SQL generation
+  - [x] Streamlit health endpoint smoke verification
+  - [x] GitHub Actions Docker image build
+
 ### Phase 4: Future Azure Preparation
 
 - [ ] Confirm Azure subscription and US region
@@ -361,6 +436,13 @@ remain an operator concern and are not provisioned by repository automation.
 | Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-02T12:35:31-05:00 |
 | Docker image | GitHub Actions `docker build .` | Pass | 2026-09-02T12:37:20-05:00 |
 | CI workflow | GitHub Actions `python` and `container` jobs | Pass | 2026-09-02T12:37:20-05:00 |
+| Role reassignment lint | `uv run ruff check .` | Pass | 2026-09-03 |
+| Role reassignment formatting | `uv run ruff format --check .` | Pass | 2026-09-03 |
+| Role reassignment types | `uv run mypy` | Pass | 2026-09-03 |
+| Role reassignment tests | `uv run pytest -q` | 76 passed, 95.29% coverage | 2026-09-03 |
+| PostgreSQL migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-03 |
+| Role reassignment Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-03 |
+| Role reassignment Docker image | GitHub Actions `docker build .` | Pass | 2026-09-03 |
 
 ### Functional verification
 

@@ -444,7 +444,12 @@ class SqlAlchemyPilotRepository:
     ) -> None:
         try:
             with self._sessions.session() as session, session.begin():
-                member = self._member(session, member_id, actor.center_id)
+                member = self._member(
+                    session,
+                    member_id,
+                    actor.center_id,
+                    for_update=True,
+                )
                 counselor = self._role_user(
                     session,
                     counselor_id,
@@ -484,6 +489,67 @@ class SqlAlchemyPilotRepository:
             raise ConflictError(
                 "The member's counselor assignment changed. Please retry."
             ) from error
+
+    def reassign_member_to_counselor(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        confirmation_email: str,
+        reason_code: str,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            member = session.scalar(
+                select(UserRecord)
+                .where(
+                    UserRecord.id == member_id,
+                    UserRecord.center_id == actor.center_id,
+                )
+                .with_for_update()
+            )
+            if member is None:
+                raise NotFoundError("The member was not found in this Center.")
+            if member.role != Role.MEMBER.value:
+                raise ConflictError("Only an existing member can become a counselor.")
+            if normalize_email(confirmation_email) != member.email:
+                raise ValidationError(
+                    "The confirmation email does not match the member."
+                )
+
+            now = self._now()
+            active_assignment = self._active_counselor_assignment(session, member.id)
+            if active_assignment is not None:
+                active_assignment.ended_at = now
+            self._close_open_proposals_for_member(
+                session,
+                member.id,
+                actor.id,
+                "member_role_changed",
+            )
+            member.role = Role.COUNSELOR.value
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="identity.role_reassigned",
+                subject_id=member.id,
+                center_id=actor.center_id,
+                metadata={
+                    "previous_role": Role.MEMBER.value,
+                    "new_role": Role.COUNSELOR.value,
+                    "reason_code": reason_code,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="identity.role_reassigned",
+                    payload={
+                        "user_id": str(member.id),
+                        "center_id": str(actor.center_id),
+                        "previous_role": Role.MEMBER.value,
+                        "new_role": Role.COUNSELOR.value,
+                        "reason_code": reason_code,
+                    },
+                )
+            )
 
     def list_assigned_members(
         self,
@@ -1864,6 +1930,8 @@ class SqlAlchemyPilotRepository:
         session: Session,
         member_id: uuid.UUID,
         center_id: uuid.UUID | None = None,
+        *,
+        for_update: bool = False,
     ) -> UserRecord:
         conditions = [
             UserRecord.id == member_id,
@@ -1871,7 +1939,10 @@ class SqlAlchemyPilotRepository:
         ]
         if center_id is not None:
             conditions.append(UserRecord.center_id == center_id)
-        member = session.scalar(select(UserRecord).where(*conditions))
+        statement = select(UserRecord).where(*conditions)
+        if for_update:
+            statement = statement.with_for_update()
+        member = session.scalar(statement)
         if member is None:
             raise NotFoundError("Member was not found in the authorized Center.")
         return member
