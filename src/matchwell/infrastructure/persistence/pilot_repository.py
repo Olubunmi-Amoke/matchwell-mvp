@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,7 @@ from matchwell.domain.matching import (
     CandidateMemberDiagnostic,
     CandidatePairDiagnostic,
     CandidateReviewItem,
+    CounselorConversationStatus,
     CounselorReviewDecision,
     Gender,
     IntroductionView,
@@ -29,6 +30,7 @@ from matchwell.domain.matching import (
     MatchPreferencesView,
     MatchScorer,
     MemberResponseDecision,
+    MessageView,
     ProposalStatus,
     ReportInput,
 )
@@ -63,6 +65,7 @@ from matchwell.infrastructure.persistence.models import (
     CounselorDecisionRecord,
     HoldRecord,
     InvitationRecord,
+    MatchedPairMessageRecord,
     MatchProposalRecord,
     MemberBlockRecord,
     MemberMatchPreferencesRecord,
@@ -1513,6 +1516,142 @@ class SqlAlchemyPilotRepository:
                 return None
             return self._introduction_view(session, proposal, member_id)
 
+    def list_recent_messages(
+        self,
+        member: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        limit: int,
+    ) -> Sequence[MessageView]:
+        with self._sessions.session() as session, session.begin():
+            proposal = self._active_participant_proposal(
+                session, member, proposal_id, lock=True
+            )
+            records = list(
+                session.scalars(
+                    select(MatchedPairMessageRecord)
+                    .where(
+                        MatchedPairMessageRecord.proposal_id == proposal.id,
+                        MatchedPairMessageRecord.center_id == member.center_id,
+                    )
+                    .order_by(
+                        MatchedPairMessageRecord.sent_at.desc(),
+                        MatchedPairMessageRecord.id.desc(),
+                    )
+                    .limit(limit)
+                )
+            )
+            records.reverse()
+            names = {
+                proposal.member_a_id: self._display_name(session, proposal.member_a_id),
+                proposal.member_b_id: self._display_name(session, proposal.member_b_id),
+            }
+            return [
+                MessageView(
+                    id=record.id,
+                    proposal_id=record.proposal_id,
+                    sender_id=record.sender_id,
+                    sender_display_name=names[record.sender_id],
+                    body=record.body,
+                    sent_at=record.sent_at,
+                    is_mine=record.sender_id == member.id,
+                )
+                for record in records
+            ]
+
+    def send_message(
+        self,
+        member: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        body: str,
+    ) -> MessageView:
+        with self._sessions.session() as session, session.begin():
+            proposal = self._active_participant_proposal(
+                session, member, proposal_id, lock=True
+            )
+            record = MatchedPairMessageRecord(
+                center_id=member.center_id,
+                proposal_id=proposal.id,
+                sender_id=member.id,
+                body=body,
+                sent_at=self._now(),
+            )
+            session.add(record)
+            session.flush()
+            self._audit(
+                session,
+                actor_id=member.id,
+                action="messaging.sent",
+                subject_id=record.id,
+                center_id=member.center_id,
+                metadata={
+                    "proposal_id": str(proposal.id),
+                    "sender_id": str(member.id),
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="messaging.sent",
+                    payload={
+                        "message_id": str(record.id),
+                        "proposal_id": str(proposal.id),
+                        "sender_id": str(member.id),
+                    },
+                )
+            )
+            return MessageView(
+                id=record.id,
+                proposal_id=proposal.id,
+                sender_id=member.id,
+                sender_display_name=self._display_name(session, member.id),
+                body=record.body,
+                sent_at=record.sent_at,
+                is_mine=True,
+            )
+
+    def list_conversation_statuses(
+        self,
+        counselor: AuthenticatedUser,
+    ) -> Sequence[CounselorConversationStatus]:
+        with self._sessions.session() as session, session.begin():
+            proposals = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.center_id == counselor.center_id,
+                    MatchProposalRecord.status == ProposalStatus.ACTIVE.value,
+                    or_(
+                        MatchProposalRecord.counselor_a_id == counselor.id,
+                        MatchProposalRecord.counselor_b_id == counselor.id,
+                    ),
+                )
+                .order_by(MatchProposalRecord.activated_at.desc())
+                .with_for_update()
+            ).all()
+            statuses: list[CounselorConversationStatus] = []
+            for proposal in proposals:
+                message_count, latest_activity_at = session.execute(
+                    select(
+                        func.count(MatchedPairMessageRecord.id),
+                        func.max(MatchedPairMessageRecord.sent_at),
+                    ).where(
+                        MatchedPairMessageRecord.proposal_id == proposal.id,
+                        MatchedPairMessageRecord.center_id == counselor.center_id,
+                    )
+                ).one()
+                statuses.append(
+                    CounselorConversationStatus(
+                        proposal_id=proposal.id,
+                        member_a_display_name=self._display_name(
+                            session, proposal.member_a_id
+                        ),
+                        member_b_display_name=self._display_name(
+                            session, proposal.member_b_id
+                        ),
+                        message_count=message_count,
+                        latest_activity_at=latest_activity_at,
+                    )
+                )
+            return statuses
+
     def block_member(
         self,
         actor: AuthenticatedUser,
@@ -2089,6 +2228,31 @@ class SqlAlchemyPilotRepository:
                 safe_metadata=metadata,
             )
         )
+
+    @staticmethod
+    def _active_participant_proposal(
+        session: Session,
+        member: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        *,
+        lock: bool = False,
+    ) -> MatchProposalRecord:
+        statement = select(MatchProposalRecord).where(
+            MatchProposalRecord.id == proposal_id,
+            MatchProposalRecord.center_id == member.center_id,
+            or_(
+                MatchProposalRecord.member_a_id == member.id,
+                MatchProposalRecord.member_b_id == member.id,
+            ),
+        )
+        if lock:
+            statement = statement.with_for_update()
+        proposal = session.scalar(statement)
+        if proposal is None:
+            raise NotFoundError("Matched-pair conversation was not found.")
+        if proposal.status != ProposalStatus.ACTIVE.value:
+            raise ConflictError("This matched-pair conversation is no longer active.")
+        return proposal
 
     @staticmethod
     def _user(record: UserRecord) -> AuthenticatedUser:

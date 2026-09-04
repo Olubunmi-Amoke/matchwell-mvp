@@ -269,10 +269,10 @@ def render_introduction(service: PilotService, actor: AuthenticatedUser) -> None
             render_badges([("Mutually accepted", "success")])
             st.caption(f"Activated {matched_pair.activated_at.strftime('%B %d, %Y')}")
             st.write(
-                "Guided curriculum, check-ins, and messaging arrive in a "
-                "later milestone. For now, this page confirms your match is "
-                "active."
+                "Your private conversation is visible only to you and your "
+                "match. Counselors can see activity timing, never message text."
             )
+        _render_matched_pair_messages(service, actor, matched_pair.proposal_id)
         _render_safety_actions(
             service,
             actor,
@@ -349,6 +349,43 @@ def render_introduction(service: PilotService, actor: AuthenticatedUser) -> None
         introduction.partner_id,
         introduction.partner_display_name,
     )
+
+
+def _render_matched_pair_messages(
+    service: PilotService,
+    actor: AuthenticatedUser,
+    proposal_id: uuid.UUID,
+) -> None:
+    st.subheader("Private conversation")
+    try:
+        messages = service.recent_messages(actor, proposal_id)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+
+    with st.container(height=420, border=True):
+        if not messages:
+            render_empty_state("No messages yet. Start with a thoughtful hello.")
+        for message in messages:
+            with st.chat_message("user" if message.is_mine else "assistant"):
+                st.caption(
+                    f"{'You' if message.is_mine else message.sender_display_name}"
+                    f" · {message.sent_at.strftime('%b %d, %Y at %I:%M %p')}"
+                )
+                st.text(message.body)
+
+    body = st.chat_input(
+        "Write a message (1,000 characters maximum)",
+        key=f"matched-pair-message-{proposal_id}",
+        max_chars=1000,
+    )
+    if body is not None:
+        try:
+            service.send_message(actor, proposal_id, body)
+        except MatchwellError as error:
+            st.error(str(error))
+        else:
+            st.rerun()
 
 
 def _respond(

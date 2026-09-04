@@ -41,6 +41,7 @@ from matchwell.infrastructure.persistence.models import (
     ConsentVersionRecord,
     CounselorAssignmentRecord,
     HoldRecord,
+    MatchedPairMessageRecord,
     MatchProposalRecord,
     MemberBlockRecord,
     MemberMatchPreferencesRecord,
@@ -250,6 +251,27 @@ def _make_reciprocal_pair(
     return member_a, member_b
 
 
+def _activate_pair(
+    service: PilotService,
+    admin: AuthenticatedUser,
+    counselor_a: AuthenticatedUser,
+    counselor_b: AuthenticatedUser,
+    member_a: AuthenticatedUser,
+    member_b: AuthenticatedUser,
+) -> uuid.UUID:
+    assert service.generate_candidates(admin) == 1
+    proposal_id = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(counselor_a, proposal_id, CounselorReviewDecision.APPROVED)
+    service.review_candidate(counselor_b, proposal_id, CounselorReviewDecision.APPROVED)
+    service.respond_to_introduction(
+        member_a, proposal_id, MemberResponseDecision.ACCEPTED
+    )
+    service.respond_to_introduction(
+        member_b, proposal_id, MemberResponseDecision.ACCEPTED
+    )
+    return proposal_id
+
+
 def test_full_two_member_matching_journey_activates_workspace(pilot: Pilot) -> None:
     service, sessions = pilot
     admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
@@ -310,6 +332,122 @@ def test_full_two_member_matching_journey_activates_workspace(pilot: Pilot) -> N
             )
         )
         assert activated_audit is not None
+
+
+def test_active_pair_can_exchange_private_messages_with_different_counselors(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service,
+        admin,
+        counselor_a,
+        counselor_b,
+        member_a,
+        member_b,
+    )
+
+    sent_a = service.send_message(member_a, proposal_id, "  Hello Brooke!  ")
+    sent_b = service.send_message(member_b, proposal_id, "Hello Alex!")
+    messages_a = service.recent_messages(member_a, proposal_id)
+    messages_b = service.recent_messages(member_b, proposal_id)
+
+    assert sent_a.body == "Hello Brooke!"
+    assert sent_b.body == "Hello Alex!"
+    assert [message.body for message in messages_a] == [
+        "Hello Brooke!",
+        "Hello Alex!",
+    ]
+    assert [message.is_mine for message in messages_a] == [True, False]
+    assert [message.is_mine for message in messages_b] == [False, True]
+
+    for counselor in (counselor_a, counselor_b):
+        statuses = service.conversation_statuses(counselor)
+        assert len(statuses) == 1
+        assert statuses[0].started
+        assert statuses[0].message_count == 2
+        assert statuses[0].latest_activity_at is not None
+        assert not hasattr(statuses[0], "body")
+
+    with sessions.session() as session:
+        assert session.scalar(select(func.count(MatchedPairMessageRecord.id))) == 2
+        audit = session.scalar(
+            select(AuditEventRecord).where(AuditEventRecord.action == "messaging.sent")
+        )
+        outbox = session.scalar(
+            select(OutboxMessageRecord).where(
+                OutboxMessageRecord.event_type == "messaging.sent"
+            )
+        )
+        assert audit is not None
+        assert outbox is not None
+        assert "Hello Brooke!" not in str(audit.safe_metadata)
+        assert "Hello Brooke!" not in str(outbox.payload)
+
+
+def test_message_access_is_bounded_to_active_pair_participants(pilot: Pilot) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    outsider = _invite_and_sign_in(
+        service,
+        admin,
+        Role.MEMBER,
+        "outsider@example.com",
+        "outsider-sub",
+    )
+    proposal_id = _activate_pair(
+        service,
+        admin,
+        counselor_a,
+        counselor_b,
+        member_a,
+        member_b,
+    )
+
+    with pytest.raises(NotFoundError):
+        service.recent_messages(outsider, proposal_id)
+    with pytest.raises(NotFoundError):
+        service.send_message(outsider, proposal_id, "Private?")
+    wrong_center_member = AuthenticatedUser(
+        id=member_a.id,
+        email=member_a.email,
+        name=member_a.name,
+        role=Role.MEMBER,
+        center_id=uuid.uuid4(),
+    )
+    with pytest.raises(NotFoundError):
+        service.recent_messages(wrong_center_member, proposal_id)
+
+    service.send_message(member_a, proposal_id, "Before closure")
+    service.block_member(member_a, member_b.id, SafetyCategory.OTHER)
+    with pytest.raises(ConflictError):
+        service.recent_messages(member_b, proposal_id)
+    with pytest.raises(ConflictError):
+        service.send_message(member_a, proposal_id, "After closure")
+
+
+def test_recent_messages_are_chronological_and_limited(pilot: Pilot) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service,
+        admin,
+        counselor_a,
+        counselor_b,
+        member_a,
+        member_b,
+    )
+    for body in ("First", "Second", "Third"):
+        service.send_message(member_a, proposal_id, body)
+
+    messages = service.recent_messages(member_b, proposal_id, limit=2)
+
+    assert [message.body for message in messages] == ["Second", "Third"]
+    assert messages[0].sent_at <= messages[1].sent_at
 
 
 def test_candidate_diagnostics_explain_ready_pair_and_open_proposal(

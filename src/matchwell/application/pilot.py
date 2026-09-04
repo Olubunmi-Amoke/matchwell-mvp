@@ -20,12 +20,14 @@ from matchwell.domain.matching import (
     BlockInput,
     CandidateGenerationDiagnostics,
     CandidateReviewItem,
+    CounselorConversationStatus,
     CounselorReviewDecision,
     IntroductionView,
     MatchedPairView,
     MatchPreferencesInput,
     MatchPreferencesView,
     MemberResponseDecision,
+    MessageView,
     ReportInput,
     SafetyCategory,
 )
@@ -213,6 +215,25 @@ class PilotRepository(Protocol):
         self,
         member_id: uuid.UUID,
     ) -> IntroductionView | None: ...
+
+    def list_recent_messages(
+        self,
+        member: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        limit: int,
+    ) -> Sequence[MessageView]: ...
+
+    def send_message(
+        self,
+        member: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        body: str,
+    ) -> MessageView: ...
+
+    def list_conversation_statuses(
+        self,
+        counselor: AuthenticatedUser,
+    ) -> Sequence[CounselorConversationStatus]: ...
 
     def block_member(
         self,
@@ -531,6 +552,38 @@ class PilotService:
     def recent_match(self, actor: AuthenticatedUser) -> IntroductionView | None:
         self._require_role(actor, Role.MEMBER)
         return self._repository.get_recent_match(actor.id)
+
+    def recent_messages(
+        self,
+        actor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        limit: int = 50,
+    ) -> Sequence[MessageView]:
+        self._require_role(actor, Role.MEMBER)
+        if not 1 <= limit <= 100:
+            raise ValidationError("Message history limit must be between 1 and 100.")
+        return self._repository.list_recent_messages(actor, proposal_id, limit)
+
+    def send_message(
+        self,
+        actor: AuthenticatedUser,
+        proposal_id: uuid.UUID,
+        body: str,
+    ) -> MessageView:
+        self._require_role(actor, Role.MEMBER)
+        safe_body = body.strip()
+        if not safe_body:
+            raise ValidationError("Enter a message before sending.")
+        if len(safe_body) > 1000:
+            raise ValidationError("Keep messages under 1,000 characters.")
+        return self._repository.send_message(actor, proposal_id, safe_body)
+
+    def conversation_statuses(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[CounselorConversationStatus]:
+        self._require_role(actor, Role.COUNSELOR)
+        return self._repository.list_conversation_statuses(actor)
 
     def block_member(
         self,

@@ -1,6 +1,68 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Validated
+> **Status:** Implementation complete; Azure deployment deferred
+
+## Active Milestone: Secure Matched-Pair Messaging
+
+**Goal:** Let mutually accepted matched members communicate safely inside their
+active matched-pair workspace.
+
+### Counselor model
+
+- Matched members may have different counselors.
+- Each member keeps their existing counselor assignment.
+- Both assigned counselors must approve the candidate before introduction.
+- Counselors can see messaging participation metadata, such as whether the
+  conversation has started and the latest activity time, but cannot read
+  private message content.
+
+### Messaging behavior
+
+- Enable messaging only while the proposal status is `active`.
+- Permit only the two members in that matched pair to read or send messages.
+- Store plain text only, with a 1,000-character maximum.
+- Preserve chronological message history; MVP messages cannot be edited or
+  deleted.
+- Reject empty messages and normalize surrounding whitespace.
+- Close message access immediately when a block, report, hold, readiness loss,
+  role change, or other existing safety transition closes the matched pair.
+- Do not allow messaging across Centers or between unrelated members.
+
+### Safety and privacy
+
+- Store message content only in the messaging boundary.
+- Never include message content in audit events, outbox payloads, counselor
+  queues, administrator queues, logs, or notifications.
+- Audit message sends using message ID, pair ID, and sender ID only.
+- Expose reporting through the existing structured safety workflow; no
+  automated content interpretation or counseling decisions.
+- Add pagination-ready retrieval with a bounded recent-message limit.
+
+### User experience
+
+- Add a conversation section to the active matched-pair member page.
+- Show messages in chronological order with clear sender labels and timestamps.
+- Add a compact send form with character guidance and safety reminder.
+- Show a clear unavailable state when the pair is no longer active.
+- Add counselor-visible conversation status without message bodies.
+
+### Validation
+
+- Test participant-only access, Center isolation, active-pair enforcement,
+  ordering, limits, empty/oversized content, and message-content redaction from
+  audit/outbox records.
+- Test that blocks, reports, holds, readiness loss, and role changes prevent
+  further reads and sends.
+- Test different-counselor pairs end to end.
+- Run Ruff, formatting, strict mypy, the complete pytest suite, PostgreSQL
+  migration round-trip checks, Streamlit smoke verification, and CI container
+  build.
+
+**Implementation status:** Complete.
+
+**Validation status:** Locally validated. Azure validation and deployment are not
+applicable because this milestone adds no Azure infrastructure and the selected
+delivery recipe remains the portable Docker application.
 
 ## Active Milestone: Candidate Generation Diagnostics
 
@@ -592,6 +654,12 @@ remain an operator concern and are not provisioned by repository automation.
 | Candidate diagnostics migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-04 |
 | Candidate diagnostics Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04 |
 | Candidate diagnostics Docker image | GitHub Actions `docker build .` | Pass | 2026-09-04 |
+| Secure messaging lint | `uv run --no-sync ruff check .` | Pass | 2026-09-04T14:23:58-05:00 |
+| Secure messaging formatting | `uv run --no-sync ruff format --check .` | Pass | 2026-09-04T14:23:58-05:00 |
+| Secure messaging types | `uv run --no-sync mypy` | Pass | 2026-09-04T14:23:58-05:00 |
+| Secure messaging tests | `uv run --no-sync pytest -q` | 100 passed, 95.92% coverage | 2026-09-04T14:23:58-05:00 |
+| Secure messaging migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-04T14:23:58-05:00 |
+| Secure messaging Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04T14:23:58-05:00 |
 
 ### Functional verification
 

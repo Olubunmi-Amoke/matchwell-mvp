@@ -519,6 +519,38 @@ class MatchProposalRecord(Base):
     )
 
 
+class MatchedPairMessageRecord(Base):
+    __tablename__ = "matched_pair_messages"
+    __table_args__ = (
+        Index(
+            "ix_matched_pair_messages_proposal_sent",
+            "proposal_id",
+            "sent_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    proposal_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("match_proposals.id"),
+        nullable=False,
+    )
+    sender_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    body: Mapped[str] = mapped_column(String(1000), nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class MemberBlockRecord(Base):
     __tablename__ = "member_blocks"
     __table_args__ = (UniqueConstraint("blocker_id", "blocked_id"),)
