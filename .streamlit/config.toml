@@ -1,5 +1,6 @@
 [server]
 headless = true
+enableStaticServing = true
 
 [theme]
 primaryColor = "#6C4A3A"
