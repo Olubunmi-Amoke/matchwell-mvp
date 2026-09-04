@@ -3,10 +3,26 @@
 from pathlib import Path
 
 import streamlit as st
+from streamlit import __file__ as streamlit_package_file
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 LOGO_PATH = PROJECT_ROOT / "assets" / "matchwell-logo.jpg"
 APP_ICON_PATH = PROJECT_ROOT / "app" / "static" / "matchwell-icon-512.png"
+
+_HEAD_METADATA = """
+    <!-- Matchwell mobile branding -->
+    <link
+      rel="apple-touch-icon"
+      sizes="180x180"
+      href="/app/static/matchwell-icon-180.png"
+    />
+    <link rel="manifest" href="/app/static/manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Matchwell" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#fffdf8" />
+"""
 
 _PWA_METADATA = """
 <script>
@@ -45,6 +61,23 @@ upsertMeta("mobile-web-app-capable", "yes");
 upsertMeta("theme-color", "#fffdf8");
 </script>
 """
+
+
+def install_static_app_metadata(index_path: Path | None = None) -> None:
+    """Install mobile metadata in Streamlit's initial HTML response."""
+    target = index_path or (
+        Path(streamlit_package_file).resolve().parent / "static" / "index.html"
+    )
+    document = target.read_text(encoding="utf-8")
+    if "<!-- Matchwell mobile branding -->" in document:
+        return
+    closing_head = "</head>"
+    if closing_head not in document:
+        raise RuntimeError("Streamlit HTML shell does not contain a closing head tag.")
+    target.write_text(
+        document.replace(closing_head, f"{_HEAD_METADATA}  {closing_head}", 1),
+        encoding="utf-8",
+    )
 
 
 def render_app_branding() -> None:
