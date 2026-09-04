@@ -1,6 +1,6 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 ## Active Milestone: Guided Matched-Pair Journey
 
@@ -101,10 +101,10 @@ private member reflections and existing safety controls.
 
 **Implementation status:** Complete.
 
-**Validation status:** Local validation complete: Ruff lint and formatting,
-strict mypy, 110 tests with 95.93% coverage, PostgreSQL offline upgrade and
-downgrade generation, Streamlit health smoke test, and focused code review all
-passed. Azure validation is the next gate.
+**Validation status:** Validated: Ruff lint and formatting, strict mypy, 110
+tests with 95.93% coverage, PostgreSQL offline upgrade and downgrade generation,
+package build, Streamlit health smoke test, focused code review, and GitHub
+Actions Python and container jobs all passed.
 
 ## Active Milestone: Secure Matched-Pair Messaging
 
@@ -715,7 +715,7 @@ remain an operator concern and are not provisioned by repository automation.
 
 ### Guided matched-pair journey validation
 
-- [ ] All validation checks pass
+- [x] All validation checks pass
   - [x] Ruff lint and formatting
   - [x] Strict mypy type checking
   - [x] Complete pytest suite with coverage threshold
@@ -723,7 +723,7 @@ remain an operator concern and are not provisioned by repository automation.
   - [x] Python source distribution and wheel build
   - [x] Streamlit health endpoint smoke verification
   - [x] Focused privacy, authorization, and concurrency review
-  - [ ] GitHub Actions Docker image build
+  - [x] GitHub Actions Docker image build
 
 ### Phase 4: Future Azure Preparation
 
@@ -785,6 +785,7 @@ remain an operator concern and are not provisioned by repository automation.
 | Guided journey package build | `uv build --out-dir <session-artifacts>` | Source distribution and wheel built | 2026-09-04 |
 | Guided journey Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04 |
 | Guided journey review | Focused diff review | No significant issues found | 2026-09-04 |
+| Guided journey CI | GitHub Actions `python` and `container` jobs | Pass | 2026-09-04 |
 
 ### Functional verification
 
