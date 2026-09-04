@@ -1,6 +1,6 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 ## Active Milestone: Candidate Generation Diagnostics
 
@@ -52,8 +52,8 @@ administrators clear corrective actions.
 **Implementation status:** Complete.
 
 **Validation status:** Ruff, formatting, strict mypy, 90 tests with 95.72%
-coverage, PostgreSQL migration SQL generation, and read-path safety review
-passed. Streamlit smoke and CI container validation remain.
+coverage, PostgreSQL migration SQL generation, Streamlit smoke, read-path
+safety review, and CI container validation passed.
 
 ## Active Milestone: Audited Counselor-to-Member Reassignment
 
@@ -539,13 +539,13 @@ remain an operator concern and are not provisioned by repository automation.
 
 ### Candidate diagnostics validation
 
-- [ ] All validation checks pass
+- [x] All validation checks pass
   - [x] Ruff lint and formatting
   - [x] Strict mypy type checking
   - [x] Complete pytest suite with coverage threshold
   - [x] PostgreSQL upgrade and downgrade SQL generation
   - [x] Streamlit health endpoint smoke verification
-  - [ ] GitHub Actions Docker image build
+  - [x] GitHub Actions Docker image build
 
 ### Phase 4: Future Azure Preparation
 
@@ -591,7 +591,7 @@ remain an operator concern and are not provisioned by repository automation.
 | Candidate diagnostics tests | `uv run pytest -q` | 90 passed, 95.72% coverage | 2026-09-04 |
 | Candidate diagnostics migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-04 |
 | Candidate diagnostics Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04 |
-| Candidate diagnostics Docker image | GitHub Actions `docker build .` | Pending | 2026-09-04 |
+| Candidate diagnostics Docker image | GitHub Actions `docker build .` | Pass | 2026-09-04 |
 
 ### Functional verification
 
