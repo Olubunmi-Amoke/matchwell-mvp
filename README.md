@@ -36,12 +36,7 @@ uv run streamlit run app\main.py --server.port 7860
 
 Open `http://localhost:7860`.
 
-The supplied Matchwell artwork is used as the in-app logo, browser icon, and
-mobile home-screen artwork. On iPhone, open the deployed app in Safari and
-select **Install on iPhone** in the sidebar. From the installation page, choose
-**Share → Add to Home Screen**. The dedicated page supplies the icon in its
-initial HTML response with versioned Apple icon and favicon references, which
-avoids Safari reusing Streamlit's cached icon.
+The supplied Matchwell artwork is used as the in-app logo and browser icon.
 
 ### Local development with Docker
 
