@@ -12,6 +12,12 @@ from matchwell.domain.errors import (
     NotFoundError,
     ValidationError,
 )
+from matchwell.domain.journey import (
+    CheckInMilestone,
+    RelationshipStatus,
+    ReminderState,
+    TaskScope,
+)
 from matchwell.domain.matching import (
     CounselorReviewDecision,
     Gender,
@@ -41,12 +47,15 @@ from matchwell.infrastructure.persistence.models import (
     ConsentVersionRecord,
     CounselorAssignmentRecord,
     HoldRecord,
+    JourneyTemplateRecord,
+    JourneyTemplateTaskRecord,
     MatchedPairMessageRecord,
     MatchProposalRecord,
     MemberBlockRecord,
     MemberMatchPreferencesRecord,
     MemberProfileRecord,
     OutboxMessageRecord,
+    PairJourneyRecord,
     ScreeningCaseRecord,
     UserRecord,
 )
@@ -100,6 +109,39 @@ def pilot() -> Pilot:
                 is_active=True,
             )
         )
+        template_id = uuid.uuid4()
+        session.add(
+            JourneyTemplateRecord(
+                id=template_id,
+                key="pilot-foundations",
+                version="1.0",
+                name="Pilot Foundations",
+                description="A guided pilot curriculum.",
+                is_active=True,
+            )
+        )
+        for sequence, (scope, due_day) in enumerate(
+            (
+                (TaskScope.SHARED, 7),
+                (TaskScope.SHARED, 14),
+                (TaskScope.INDIVIDUAL, 21),
+                (TaskScope.SHARED, 30),
+                (TaskScope.SHARED, 45),
+                (TaskScope.INDIVIDUAL, 60),
+            ),
+            start=1,
+        ):
+            session.add(
+                JourneyTemplateTaskRecord(
+                    id=uuid.uuid4(),
+                    template_id=template_id,
+                    sequence=sequence,
+                    title=f"Activity {sequence}",
+                    description=f"Complete activity {sequence}.",
+                    scope=scope.value,
+                    due_day=due_day,
+                )
+            )
     repository = SqlAlchemyPilotRepository(sessions, ReadinessEvaluator())
     return PilotService(repository, frozenset({"admin@example.com"})), sessions
 
@@ -448,6 +490,229 @@ def test_recent_messages_are_chronological_and_limited(pilot: Pilot) -> None:
 
     assert [message.body for message in messages] == ["Second", "Third"]
     assert messages[0].sent_at <= messages[1].sent_at
+
+
+def test_counselor_assigns_journey_and_members_track_private_tasks(
+    pilot: Pilot,
+) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service, admin, counselor_a, counselor_b, member_a, member_b
+    )
+    outsider = _invite_and_sign_in(
+        service,
+        admin,
+        Role.COUNSELOR,
+        "journey-outsider@example.com",
+        "journey-outside",
+    )
+
+    assert service.guided_journey(member_a, proposal_id) is None
+    with pytest.raises(NotFoundError):
+        service.assign_guided_journey(outsider, proposal_id)
+    journey_id = service.assign_guided_journey(counselor_a, proposal_id)
+    assert service.assign_guided_journey(counselor_b, proposal_id) == journey_id
+
+    journey_a = service.guided_journey(member_a, proposal_id)
+    journey_b = service.guided_journey(member_b, proposal_id)
+    assert journey_a is not None
+    assert journey_b is not None
+    assert len(journey_a.tasks) == 6
+    shared_task = next(
+        item for item in journey_a.tasks if item.scope is TaskScope.SHARED
+    )
+    individual_task = next(
+        item for item in journey_a.tasks if item.scope is TaskScope.INDIVIDUAL
+    )
+
+    service.set_journey_task_completion(
+        member_a, journey_id, shared_task.id, completed=True
+    )
+    service.set_journey_task_completion(
+        member_a, journey_id, individual_task.id, completed=True
+    )
+    journey_b = service.guided_journey(member_b, proposal_id)
+    assert journey_b is not None
+    shared_for_b = next(item for item in journey_b.tasks if item.id == shared_task.id)
+    individual_for_b = next(
+        item for item in journey_b.tasks if item.id == individual_task.id
+    )
+    assert shared_for_b.partner_completed_at is not None
+    assert individual_for_b.partner_completed_at is None
+    assert individual_for_b.completed_at is None
+
+    service.set_journey_task_completion(
+        member_a, journey_id, shared_task.id, completed=False
+    )
+    journey_a = service.guided_journey(member_a, proposal_id)
+    assert journey_a is not None
+    assert (
+        next(item for item in journey_a.tasks if item.id == shared_task.id).completed_at
+        is None
+    )
+
+
+def test_check_in_reflection_is_private_except_to_members_own_counselor(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service, admin, counselor_a, counselor_b, member_a, member_b
+    )
+    journey_id = service.assign_guided_journey(counselor_a, proposal_id)
+    secret = "I would like help discussing our pace."
+    with sessions.session() as session, session.begin():
+        journey = session.get(PairJourneyRecord, journey_id)
+        assert journey is not None
+        journey.started_at = datetime.now(UTC) - timedelta(days=31)
+
+    service.submit_journey_check_in(
+        member_a,
+        journey_id,
+        CheckInMilestone.DAY_30,
+        RelationshipStatus.UNCERTAIN,
+        support_requested=True,
+        concern_flag=True,
+        private_reflection=secret,
+        share_with_counselor=False,
+    )
+
+    own_view = service.counselor_journeys(counselor_a)[0]
+    own_member = next(
+        item for item in own_view.members if item.member_id == member_a.id
+    )
+    assert own_member.check_ins[0].support_requested is True
+    assert own_member.check_ins[0].concern_flag is True
+    assert own_member.check_ins[0].shared_reflection is None
+
+    service.submit_journey_check_in(
+        member_a,
+        journey_id,
+        CheckInMilestone.DAY_30,
+        RelationshipStatus.UNCERTAIN,
+        support_requested=True,
+        concern_flag=True,
+        private_reflection=secret,
+        share_with_counselor=True,
+    )
+
+    own_view = service.counselor_journeys(counselor_a)[0]
+    other_view = service.counselor_journeys(counselor_b)[0]
+    own_member = next(
+        item for item in own_view.members if item.member_id == member_a.id
+    )
+    other_member = next(
+        item for item in other_view.members if item.member_id == member_a.id
+    )
+    assert own_member.check_ins[0].support_requested is True
+    assert own_member.check_ins[0].concern_flag is True
+    assert own_member.check_ins[0].shared_reflection == secret
+    assert other_member.check_ins[0].support_requested is None
+    assert other_member.check_ins[0].concern_flag is None
+    assert other_member.check_ins[0].shared_reflection is None
+
+    with sessions.session() as session:
+        audits = session.scalars(
+            select(AuditEventRecord).where(
+                AuditEventRecord.action == "journey.check_in_submitted"
+            )
+        ).all()
+        outbox_messages = session.scalars(
+            select(OutboxMessageRecord).where(
+                OutboxMessageRecord.event_type == "journey.check_in_submitted"
+            )
+        ).all()
+        assert len(audits) == 2
+        assert len(outbox_messages) == 2
+        assert all(secret not in str(audit.safe_metadata) for audit in audits)
+        assert all(secret not in str(message.payload) for message in outbox_messages)
+
+
+def test_counselor_reassignment_closes_journey_until_readiness_is_restored(
+    pilot: Pilot,
+) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service, admin, counselor_a, counselor_b, member_a, member_b
+    )
+    service.assign_guided_journey(counselor_a, proposal_id)
+    replacement = _invite_and_sign_in(
+        service,
+        admin,
+        Role.COUNSELOR,
+        "replacement@example.com",
+        "replacement-sub",
+    )
+
+    service.assign_counselor(admin, member_a.id, replacement.id)
+
+    assert service.counselor_journeys(counselor_a) == []
+    assert service.counselor_journeys(replacement) == []
+    with pytest.raises(ConflictError):
+        service.guided_journey(member_a, proposal_id)
+
+
+def test_journey_check_in_due_states_and_early_submission(pilot: Pilot) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service, admin, counselor_a, counselor_b, member_a, member_b
+    )
+    journey_id = service.assign_guided_journey(counselor_a, proposal_id)
+
+    journey = service.guided_journey(member_a, proposal_id)
+    assert journey is not None
+    assert journey.check_ins[0].reminder_state is ReminderState.SCHEDULED
+    with pytest.raises(ConflictError):
+        service.submit_journey_check_in(
+            member_a,
+            journey_id,
+            CheckInMilestone.DAY_30,
+            RelationshipStatus.STEADY,
+            support_requested=False,
+            concern_flag=False,
+            private_reflection="",
+            share_with_counselor=False,
+        )
+
+    with sessions.session() as session, session.begin():
+        record = session.get(PairJourneyRecord, journey_id)
+        assert record is not None
+        record.started_at = datetime.now(UTC) - timedelta(days=29)
+    journey = service.guided_journey(member_a, proposal_id)
+    assert journey is not None
+    assert journey.check_ins[0].reminder_state is ReminderState.UPCOMING
+
+
+def test_closed_match_blocks_guided_journey_access(pilot: Pilot) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service, admin, counselor_a, counselor_b, member_a, member_b
+    )
+    journey_id = service.assign_guided_journey(counselor_a, proposal_id)
+    journey = service.guided_journey(member_a, proposal_id)
+    assert journey is not None
+    service.block_member(member_a, member_b.id, SafetyCategory.OTHER)
+
+    with pytest.raises(ConflictError):
+        service.guided_journey(member_b, proposal_id)
+    with pytest.raises(ConflictError):
+        service.set_journey_task_completion(
+            member_a,
+            journey_id,
+            journey.tasks[0].id,
+            completed=True,
+        )
+    assert service.counselor_journeys(counselor_a) == []
 
 
 def test_candidate_diagnostics_explain_ready_pair_and_open_proposal(

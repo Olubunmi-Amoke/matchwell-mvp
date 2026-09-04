@@ -12,6 +12,7 @@ from matchwell.domain.errors import (
     AuthorizationError,
     ValidationError,
 )
+from matchwell.domain.journey import CheckInMilestone, RelationshipStatus
 from matchwell.domain.matching import (
     CounselorReviewDecision,
     Gender,
@@ -296,6 +297,49 @@ def test_only_members_can_use_private_messages() -> None:
 def test_only_counselors_can_view_conversation_statuses() -> None:
     with pytest.raises(AuthorizationError):
         service().conversation_statuses(actor(Role.ADMIN))
+
+
+def test_only_counselors_can_assign_guided_journeys() -> None:
+    with pytest.raises(AuthorizationError):
+        service().assign_guided_journey(actor(Role.MEMBER), uuid.uuid4())
+
+
+def test_only_members_can_update_journey_tasks() -> None:
+    with pytest.raises(AuthorizationError):
+        service().set_journey_task_completion(
+            actor(Role.COUNSELOR),
+            uuid.uuid4(),
+            uuid.uuid4(),
+            completed=True,
+        )
+
+
+def test_shared_check_in_requires_reflection() -> None:
+    with pytest.raises(ValidationError):
+        service().submit_journey_check_in(
+            actor(Role.MEMBER),
+            uuid.uuid4(),
+            CheckInMilestone.DAY_30,
+            RelationshipStatus.STEADY,
+            support_requested=False,
+            concern_flag=False,
+            private_reflection="   ",
+            share_with_counselor=True,
+        )
+
+
+def test_check_in_reflection_length_is_limited() -> None:
+    with pytest.raises(ValidationError):
+        service().submit_journey_check_in(
+            actor(Role.MEMBER),
+            uuid.uuid4(),
+            CheckInMilestone.DAY_30,
+            RelationshipStatus.STEADY,
+            support_requested=False,
+            concern_flag=False,
+            private_reflection="x" * 2001,
+            share_with_counselor=False,
+        )
 
 
 def test_member_cannot_block_self() -> None:

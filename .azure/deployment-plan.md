@@ -1,6 +1,110 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Implementation complete; Azure deployment deferred
+> **Status:** Ready for Validation
+
+## Active Milestone: Guided Matched-Pair Journey
+
+**Goal:** Give mutually accepted matched pairs a structured, counselor-guided
+journey with curriculum tasks and 30/60/90-day check-ins while preserving
+private member reflections and existing safety controls.
+
+### Scope
+
+- Either currently assigned counselor may assign one active version of the
+  `Pilot Foundations` curriculum to an active matched pair. Assignment is
+  recorded once per pair and becomes visible to both members and both currently
+  assigned counselors.
+- Seed a versioned pilot curriculum with six non-clinical activities:
+  communication expectations, faith and values, healthy boundaries, conflict
+  repair, family/community support, and relationship goals.
+- Shared activities are visible to both members and complete only after each
+  member records their own completion. Individual activities are visible only
+  to the assigned member. Completion may be reversed by that same member, and
+  counselors see only the latest completion state.
+- Schedule private check-ins for each member at 30, 60, and 90 days from the
+  counselor-assigned journey start date.
+- Check-ins capture a structured relationship status, whether counselor support
+  is requested, whether a concern exists, and an optional private reflection.
+  The member may explicitly share that reflection with their own counselor.
+- A counselor sees pair-level task progress plus due/overdue check-in status for
+  both members. For the counselor's own assigned member, they also see support
+  requests, concern status, and explicitly shared reflection text. A counselor
+  never sees the other counselor's member's private reflection.
+- Members see in-app `upcoming`, `due`, and `overdue` badges. External email,
+  SMS, and push reminders remain deferred.
+- Automatic access closure when the underlying match is no longer active.
+- Safe audit and outbox events without private response content.
+
+### Confirmed product decisions
+
+- A counselor manually starts the journey; it is not assigned automatically.
+- Check-in answers are private unless the member explicitly shares a reflection.
+- Members may reverse their own task completion.
+- This milestone provides in-app reminders only.
+
+### Data and authorization design
+
+- Add a dedicated guided-journey domain module; do not fold curriculum or
+  check-in behavior into messaging.
+- Add versioned curriculum template/task tables, one pair-journey assignment
+  table, per-member task completion records, and per-member 30/60/90-day
+  check-in records.
+- Put `center_id` on pair-owned journey records and preserve the active proposal
+  as the authorization root.
+- Require `Role.MEMBER` for member task/check-in operations and
+  `Role.COUNSELOR` for assignment and progress operations.
+- Verify active proposal status and current counselor assignment on every read
+  and mutation. Pair closure blocks further journey access while retaining
+  historical records for audit and future controlled retention.
+- Never return one member's private individual-task state to their partner.
+- Never include private reflections in audit metadata, outbox payloads, logs,
+  administrator views, or counselor results unless the member explicitly
+  selected sharing with their own counselor.
+- Emit metadata-only events for journey assignment, task-state changes,
+  check-in submission, and support/concern signals.
+
+### User experience
+
+- Upgrade the active matched-pair workspace into clear `Journey`,
+  `Conversation`, and `Safety` sections.
+- Show curriculum progress, task ownership, completion controls, and the next
+  check-in/reminder state in the member journey section.
+- Add check-in forms with explicit privacy copy and a separate
+  `Share reflection with my counselor` control.
+- Expand counselor `Match activity` cards with an assignment action, pair
+  progress, check-in due/overdue status, and privacy-safe attention flags.
+- Keep administrators out of member reflection content.
+
+### Delivery boundaries
+
+- Continue using the existing Streamlit modular-monolith and PostgreSQL recipe.
+- Add migration `20260904_0005` after matched-pair messaging migration
+  `20260904_0004`.
+- No Azure resources, external notification provider, billing change, or
+  infrastructure generation is included.
+
+### Planned validation
+
+- Participant, counselor, role, and Center isolation.
+- Active-match enforcement across every read and mutation.
+- Different-counselor assignment and visibility end to end.
+- Shared versus individual task visibility, per-member completion, reversal,
+  and aggregate progress.
+- Check-in scheduling, 30/60/90-day due-state calculation, submission
+  validation, and in-app reminders.
+- Partner privacy, cross-counselor privacy, explicit reflection sharing, and
+  audit/outbox redaction.
+- Block, report, hold, readiness-loss, counselor-reassignment, and
+  role-reassignment access closure.
+- Duplicate assignment and concurrent update safeguards.
+- Migration upgrade/downgrade, Streamlit UI, lint, types, tests, and CI.
+
+**Implementation status:** Complete.
+
+**Validation status:** Local validation complete: Ruff lint and formatting,
+strict mypy, 110 tests with 95.93% coverage, PostgreSQL offline upgrade and
+downgrade generation, Streamlit health smoke test, and focused code review all
+passed. Azure validation is the next gate.
 
 ## Active Milestone: Secure Matched-Pair Messaging
 
@@ -609,6 +713,18 @@ remain an operator concern and are not provisioned by repository automation.
   - [x] Streamlit health endpoint smoke verification
   - [x] GitHub Actions Docker image build
 
+### Guided matched-pair journey validation
+
+- [ ] All validation checks pass
+  - [x] Ruff lint and formatting
+  - [x] Strict mypy type checking
+  - [x] Complete pytest suite with coverage threshold
+  - [x] PostgreSQL upgrade and downgrade SQL generation
+  - [x] Python source distribution and wheel build
+  - [x] Streamlit health endpoint smoke verification
+  - [x] Focused privacy, authorization, and concurrency review
+  - [ ] GitHub Actions Docker image build
+
 ### Phase 4: Future Azure Preparation
 
 - [ ] Confirm Azure subscription and US region
@@ -661,6 +777,14 @@ remain an operator concern and are not provisioned by repository automation.
 | Secure messaging migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-04T14:23:58-05:00 |
 | Secure messaging Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04T14:23:58-05:00 |
 | Secure messaging CI | GitHub Actions `python` and `container` jobs | Pass | 2026-09-04 |
+| Guided journey lint | `uv run --no-sync ruff check .` | Pass | 2026-09-04 |
+| Guided journey formatting | `uv run --no-sync ruff format --check .` | Pass | 2026-09-04 |
+| Guided journey types | `uv run --no-sync mypy` | Pass | 2026-09-04 |
+| Guided journey tests | `uv run --no-sync pytest` | 110 passed, 95.93% coverage | 2026-09-04 |
+| Guided journey migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-04 |
+| Guided journey package build | `uv build --out-dir <session-artifacts>` | Source distribution and wheel built | 2026-09-04 |
+| Guided journey Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04 |
+| Guided journey review | Focused diff review | No significant issues found | 2026-09-04 |
 
 ### Functional verification
 

@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import streamlit as st
 
@@ -13,6 +14,7 @@ from matchwell.application.pilot import (
 )
 from matchwell.domain.access import AuthenticatedUser, Role
 from matchwell.domain.errors import MatchwellError
+from matchwell.domain.journey import ReminderState
 from matchwell.domain.matching import CounselorReviewDecision
 from matchwell.domain.pilot import (
     CounselorDecisionStatus,
@@ -21,6 +23,7 @@ from matchwell.domain.pilot import (
     ScreeningStatus,
 )
 from matchwell.presentation.theme import (
+    Tone,
     humanize,
     render_badges,
     render_empty_state,
@@ -47,8 +50,13 @@ def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
 
 def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Counselor workspace")
-    intake_tab, matching_tab, activity_tab = st.tabs(
-        ["Assigned members", "Matching review", "Match activity"]
+    intake_tab, matching_tab, activity_tab, journey_tab = st.tabs(
+        [
+            "Assigned members",
+            "Matching review",
+            "Match activity",
+            "Guided journeys",
+        ]
     )
     with intake_tab:
         _render_counselor_intake(service, actor)
@@ -56,6 +64,8 @@ def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
         _render_counselor_matching(service, actor)
     with activity_tab:
         _render_counselor_conversation_activity(service, actor)
+    with journey_tab:
+        _render_counselor_journeys(service, actor)
 
 
 def _render_counselor_intake(
@@ -225,6 +235,94 @@ def _render_counselor_conversation_activity(
             else:
                 render_badges([("Not started", "neutral")])
                 st.caption("No conversation activity yet.")
+
+
+def _render_counselor_journeys(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
+    st.subheader("Guided matched-pair journeys")
+    st.caption(
+        "Start the pilot curriculum and monitor progress. Check-in reflections "
+        "stay private unless your assigned member explicitly shares them."
+    )
+    try:
+        journeys = service.counselor_journeys(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not journeys:
+        render_empty_state("No active matched pairs involve your members.")
+        return
+    for journey in journeys:
+        with st.container(border=True):
+            st.write(
+                f"**{journey.member_a_display_name} + {journey.member_b_display_name}**"
+            )
+            if journey.journey_id is None:
+                render_badges([("Curriculum not started", "warning")])
+                if st.button(
+                    "Assign Pilot Foundations",
+                    key=f"assign-journey-{journey.proposal_id}",
+                    type="primary",
+                ):
+                    try:
+                        service.assign_guided_journey(actor, journey.proposal_id)
+                    except MatchwellError as error:
+                        st.error(str(error))
+                    else:
+                        render_success_state("Guided journey started.")
+                        st.rerun()
+                continue
+            render_badges(
+                [
+                    (journey.template_name or "Guided journey", "success"),
+                    (f"Version {journey.template_version}", "neutral"),
+                ]
+            )
+            if journey.started_at is not None:
+                st.caption(f"Started {journey.started_at.strftime('%B %d, %Y')}")
+            for member in journey.members:
+                st.write(f"**{member.display_name}**")
+                st.progress(
+                    member.completed_task_count / member.total_task_count,
+                    text=(
+                        f"Activities: {member.completed_task_count}/"
+                        f"{member.total_task_count}"
+                    ),
+                )
+                if not member.is_my_member:
+                    st.caption(
+                        "Assigned to the other counselor; only schedule and "
+                        "completion status are shown."
+                    )
+                for check_in in member.check_ins:
+                    tone = cast(
+                        Tone,
+                        {
+                            ReminderState.COMPLETED: "success",
+                            ReminderState.OVERDUE: "danger",
+                            ReminderState.DUE: "warning",
+                            ReminderState.UPCOMING: "info",
+                            ReminderState.SCHEDULED: "neutral",
+                        }[check_in.reminder_state],
+                    )
+                    render_badges(
+                        [
+                            (
+                                f"{check_in.milestone.days}-day: "
+                                f"{humanize(check_in.reminder_state.value)}",
+                                tone,
+                            )
+                        ]
+                    )
+                    if check_in.support_requested:
+                        st.warning("Counselor support requested.")
+                    if check_in.concern_flag:
+                        st.error("Member reported a concern.")
+                    if check_in.shared_reflection:
+                        st.caption("Shared reflection")
+                        st.text(check_in.shared_reflection)
 
 
 def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> None:
