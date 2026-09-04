@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Install Matchwell</title>
+    <link
+      rel="apple-touch-icon"
+      sizes="180x180"
+      href="matchwell-icon-180.png"
+    />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Matchwell" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#fffdf8" />
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #fffdf8;
+        color: #2d2420;
+      }
+      body {
+        align-items: center;
+        display: flex;
+        justify-content: center;
+        margin: 0;
+        min-height: 100vh;
+        padding: 1.5rem;
+        text-align: center;
+      }
+      main {
+        max-width: 28rem;
+      }
+      img {
+        border-radius: 22%;
+        height: 9rem;
+        width: 9rem;
+      }
+      h1 {
+        margin-bottom: 0.5rem;
+      }
+      p {
+        color: #6c5f55;
+        line-height: 1.5;
+      }
+      a {
+        color: #9d543e;
+        font-weight: 600;
+      }
+    </style>
+    <script>
+      const installed =
+        window.navigator.standalone === true ||
+        window.matchMedia("(display-mode: standalone)").matches;
+      if (installed) {
+        window.location.replace("/");
+      }
+    </script>
+  </head>
+  <body>
+    <main>
+      <img src="matchwell-icon-512.png" alt="Matchwell" />
+      <h1>Add Matchwell to your iPhone</h1>
+      <p>
+        In Safari, tap the Share button, choose <strong>Add to Home Screen</strong>,
+        then tap <strong>Add</strong>. This page supplies the Matchwell icon before
+        iOS creates the shortcut.
+      </p>
+      <p><a href="/">Return to Matchwell</a></p>
+    </main>
+  </body>
+</html>

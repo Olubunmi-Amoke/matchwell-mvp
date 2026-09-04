@@ -38,7 +38,9 @@ Open `http://localhost:7860`.
 
 The supplied Matchwell artwork is used as the in-app logo, browser icon, and
 mobile home-screen artwork. On iPhone, open the deployed app in Safari and
-choose **Share → Add to Home Screen**.
+select **Install on iPhone** in the sidebar. From the installation page, choose
+**Share → Add to Home Screen**. The dedicated page supplies the icon in its
+initial HTML response, which avoids Safari ignoring late page metadata.
 
 ### Local development with Docker
 

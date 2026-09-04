@@ -43,3 +43,14 @@ def test_static_metadata_is_installed_idempotently(tmp_path: Path) -> None:
     assert 'rel="apple-touch-icon"' in document
     assert 'href="/app/static/matchwell-icon-180.png"' in document
     assert 'rel="manifest"' in document
+
+
+def test_iphone_install_page_has_static_icon_metadata() -> None:
+    document = (PROJECT_ROOT / "app" / "static" / "install.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'rel="apple-touch-icon"' in document
+    assert 'href="matchwell-icon-180.png"' in document
+    assert 'rel="manifest"' in document
+    assert "Add to Home Screen" in document

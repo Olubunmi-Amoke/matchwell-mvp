@@ -83,4 +83,10 @@ def install_static_app_metadata(index_path: Path | None = None) -> None:
 def render_app_branding() -> None:
     """Render the shared logo and install mobile app metadata."""
     st.logo(LOGO_PATH, size="large", icon_image=APP_ICON_PATH)
+    st.sidebar.link_button(
+        "Install on iPhone",
+        "/app/static/install.html",
+        icon=":material/install_mobile:",
+        width="stretch",
+    )
     st.html(_PWA_METADATA, width="content", unsafe_allow_javascript=True)

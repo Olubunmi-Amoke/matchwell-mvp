@@ -23,7 +23,6 @@ from matchwell.infrastructure.settings import Settings, get_runtime_settings
 from matchwell.presentation.branding import (
     APP_ICON_PATH,
     LOGO_PATH,
-    install_static_app_metadata,
     render_app_branding,
 )
 from matchwell.presentation.member import (
@@ -37,7 +36,6 @@ from matchwell.presentation.member import (
 from matchwell.presentation.operations import render_admin, render_counselor
 from matchwell.presentation.theme import inject_theme
 
-install_static_app_metadata()
 st.set_page_config(
     page_title="Matchwell",
     page_icon=APP_ICON_PATH,
