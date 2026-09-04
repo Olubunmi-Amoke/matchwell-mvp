@@ -660,6 +660,7 @@ remain an operator concern and are not provisioned by repository automation.
 | Secure messaging tests | `uv run --no-sync pytest -q` | 100 passed, 95.92% coverage | 2026-09-04T14:23:58-05:00 |
 | Secure messaging migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-04T14:23:58-05:00 |
 | Secure messaging Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04T14:23:58-05:00 |
+| Secure messaging CI | GitHub Actions `python` and `container` jobs | Pass | 2026-09-04 |
 
 ### Functional verification
 
