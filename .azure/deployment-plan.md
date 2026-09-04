@@ -1,6 +1,6 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 ## Active Milestone: Audited Member-to-Counselor Reassignment
 
@@ -404,13 +404,13 @@ remain an operator concern and are not provisioned by repository automation.
 
 ### Audited role reassignment validation
 
-- [ ] All validation checks pass
+- [x] All validation checks pass
   - [x] Ruff lint and formatting
   - [x] Strict mypy type checking
   - [x] Complete pytest suite with coverage threshold
   - [x] PostgreSQL upgrade and downgrade SQL generation
   - [x] Streamlit health endpoint smoke verification
-  - [ ] GitHub Actions Docker image build
+  - [x] GitHub Actions Docker image build
 
 ### Phase 4: Future Azure Preparation
 
@@ -442,7 +442,7 @@ remain an operator concern and are not provisioned by repository automation.
 | Role reassignment tests | `uv run pytest -q` | 76 passed, 95.29% coverage | 2026-09-03 |
 | PostgreSQL migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-03 |
 | Role reassignment Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-03 |
-| Role reassignment Docker image | GitHub Actions `docker build .` | Pending | 2026-09-03 |
+| Role reassignment Docker image | GitHub Actions `docker build .` | Pass | 2026-09-03 |
 
 ### Functional verification
 
