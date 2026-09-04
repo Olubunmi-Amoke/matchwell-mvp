@@ -105,6 +105,12 @@ def test_admin_workspace_rejects_member() -> None:
 
 
 @pytest.mark.parametrize("role", [Role.MEMBER, Role.COUNSELOR])
+def test_only_admin_can_view_candidate_diagnostics(role: Role) -> None:
+    with pytest.raises(AuthorizationError):
+        service().candidate_generation_diagnostics(actor(role))
+
+
+@pytest.mark.parametrize("role", [Role.MEMBER, Role.COUNSELOR])
 def test_only_admin_can_reassign_member_role(role: Role) -> None:
     with pytest.raises(AuthorizationError):
         service().reassign_member_to_counselor(
@@ -112,6 +118,17 @@ def test_only_admin_can_reassign_member_role(role: Role) -> None:
             uuid.uuid4(),
             "member@example.com",
             "counselor-onboarding",
+        )
+
+
+@pytest.mark.parametrize("role", [Role.MEMBER, Role.COUNSELOR])
+def test_only_admin_can_reassign_counselor_role(role: Role) -> None:
+    with pytest.raises(AuthorizationError):
+        service().reassign_counselor_to_member(
+            actor(role),
+            uuid.uuid4(),
+            "counselor@example.com",
+            "returning-to-member-journey",
         )
 
 
@@ -136,6 +153,27 @@ def test_admin_role_reassignment_is_forwarded_with_normalized_input() -> None:
     )
 
 
+def test_admin_counselor_reassignment_is_forwarded_with_normalized_input() -> None:
+    repository = MagicMock()
+    pilot_service = PilotService(cast(PilotRepository, repository), frozenset())
+    admin = actor(Role.ADMIN)
+    counselor_id = uuid.uuid4()
+
+    pilot_service.reassign_counselor_to_member(
+        admin,
+        counselor_id,
+        " COUNSELOR@EXAMPLE.COM ",
+        " returning-to-member-journey ",
+    )
+
+    repository.reassign_counselor_to_member.assert_called_once_with(
+        admin,
+        counselor_id,
+        "counselor@example.com",
+        "returning-to-member-journey",
+    )
+
+
 @pytest.mark.parametrize(
     ("confirmation_email", "reason_code"),
     [
@@ -149,6 +187,26 @@ def test_invalid_role_reassignment_confirmation_is_rejected(
 ) -> None:
     with pytest.raises(ValidationError):
         service().reassign_member_to_counselor(
+            actor(Role.ADMIN),
+            uuid.uuid4(),
+            confirmation_email,
+            reason_code,
+        )
+
+
+@pytest.mark.parametrize(
+    ("confirmation_email", "reason_code"),
+    [
+        ("", "returning-to-member-journey"),
+        ("counselor@example.com", "free-form explanation"),
+    ],
+)
+def test_invalid_counselor_reassignment_confirmation_is_rejected(
+    confirmation_email: str,
+    reason_code: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        service().reassign_counselor_to_member(
             actor(Role.ADMIN),
             uuid.uuid4(),
             confirmation_email,

@@ -17,6 +17,9 @@ from matchwell.domain.errors import ConflictError, NotFoundError, ValidationErro
 from matchwell.domain.matching import (
     BlockInput,
     CandidateEvidence,
+    CandidateGenerationDiagnostics,
+    CandidateMemberDiagnostic,
+    CandidatePairDiagnostic,
     CandidateReviewItem,
     CounselorReviewDecision,
     Gender,
@@ -455,6 +458,7 @@ class SqlAlchemyPilotRepository:
                     counselor_id,
                     Role.COUNSELOR,
                     actor.center_id,
+                    for_update=True,
                 )
                 now = self._now()
                 active = session.scalars(
@@ -546,6 +550,116 @@ class SqlAlchemyPilotRepository:
                         "center_id": str(actor.center_id),
                         "previous_role": Role.MEMBER.value,
                         "new_role": Role.COUNSELOR.value,
+                        "reason_code": reason_code,
+                    },
+                )
+            )
+
+    def reassign_counselor_to_member(
+        self,
+        actor: AuthenticatedUser,
+        counselor_id: uuid.UUID,
+        confirmation_email: str,
+        reason_code: str,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            counselor = session.scalar(
+                select(UserRecord)
+                .where(
+                    UserRecord.id == counselor_id,
+                    UserRecord.center_id == actor.center_id,
+                )
+                .with_for_update()
+            )
+            if counselor is None:
+                raise NotFoundError("The counselor was not found in this Center.")
+            if counselor.role != Role.COUNSELOR.value:
+                raise ConflictError("Only an existing counselor can become a member.")
+            if normalize_email(confirmation_email) != counselor.email:
+                raise ValidationError(
+                    "The confirmation email does not match the counselor."
+                )
+
+            active_assignments = session.scalars(
+                select(CounselorAssignmentRecord)
+                .where(
+                    CounselorAssignmentRecord.counselor_id == counselor.id,
+                    CounselorAssignmentRecord.ended_at.is_(None),
+                )
+                .with_for_update()
+            ).all()
+            if active_assignments:
+                raise ConflictError(
+                    "Reassign this counselor's active members before changing their role."
+                )
+
+            open_reviews = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.status == ProposalStatus.PENDING_REVIEW.value,
+                    or_(
+                        and_(
+                            MatchProposalRecord.counselor_a_id == counselor.id,
+                            MatchProposalRecord.counselor_a_decision
+                            == CounselorReviewDecision.PENDING.value,
+                        ),
+                        and_(
+                            MatchProposalRecord.counselor_b_id == counselor.id,
+                            MatchProposalRecord.counselor_b_decision
+                            == CounselorReviewDecision.PENDING.value,
+                        ),
+                    ),
+                )
+                .with_for_update()
+            ).all()
+            if open_reviews:
+                raise ConflictError(
+                    "Resolve or reassign this counselor's open match reviews "
+                    "before changing their role."
+                )
+
+            now = self._now()
+            screening = session.scalar(
+                select(ScreeningCaseRecord)
+                .where(ScreeningCaseRecord.member_id == counselor.id)
+                .with_for_update()
+            )
+            if screening is not None:
+                screening.expires_at = now
+                screening.updated_at = now
+
+            definition = self._active_assessment_definition(session)
+            session.add(
+                AssessmentAssignmentRecord(
+                    member_id=counselor.id,
+                    definition_id=definition.id,
+                    assigned_at=now,
+                    expires_at=now + timedelta(days=90),
+                )
+            )
+            counselor.role = Role.MEMBER.value
+            session.flush()
+            self._reevaluate(session, counselor.id, actor.id)
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="identity.role_reassigned",
+                subject_id=counselor.id,
+                center_id=actor.center_id,
+                metadata={
+                    "previous_role": Role.COUNSELOR.value,
+                    "new_role": Role.MEMBER.value,
+                    "reason_code": reason_code,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="identity.role_reassigned",
+                    payload={
+                        "user_id": str(counselor.id),
+                        "center_id": str(actor.center_id),
+                        "previous_role": Role.COUNSELOR.value,
+                        "new_role": Role.MEMBER.value,
                         "reason_code": reason_code,
                     },
                 )
@@ -820,66 +934,25 @@ class SqlAlchemyPilotRepository:
             ).all()
             evidences: list[CandidateEvidence] = []
             for member in members:
-                readiness = self._reevaluate(
+                evidence, _ = self._matching_member_evidence(
                     session,
-                    member.id,
+                    member,
                     actor.id,
-                    only_if_changed=True,
                 )
-                if not readiness.eligible:
-                    continue
-                preferences = session.get(MemberMatchPreferencesRecord, member.id)
-                profile = session.get(MemberProfileRecord, member.id)
-                if preferences is None or profile is None:
-                    continue
-                if self._has_open_proposal(session, member.id):
-                    continue
-                evidences.append(
-                    CandidateEvidence(
-                        member_id=member.id,
-                        gender=Gender(preferences.gender),
-                        age=self._age_on(profile.birth_date, self._now().date()),
-                        min_partner_age=preferences.min_partner_age,
-                        max_partner_age=preferences.max_partner_age,
-                        city=profile.city,
-                        state=profile.state,
-                        denomination=profile.denomination,
-                        relationship_intent=profile.relationship_intent,
-                    )
-                )
-            existing_pairs = {
-                (row.member_a_id, row.member_b_id)
-                for row in session.execute(
-                    select(
-                        MatchProposalRecord.member_a_id,
-                        MatchProposalRecord.member_b_id,
-                    )
-                )
-            }
-            restricted_pairs = {
-                self._pair_key(row[0], row[1])
-                for row in session.execute(
-                    select(MemberBlockRecord.blocker_id, MemberBlockRecord.blocked_id)
-                )
-            }
-            restricted_pairs |= {
-                self._pair_key(row[0], row[1])
-                for row in session.execute(
-                    select(
-                        MemberReportRecord.reporter_id,
-                        MemberReportRecord.reported_id,
-                    )
-                )
-            }
+                if evidence is not None:
+                    evidences.append(evidence)
+            existing_pairs, restricted_pairs = self._matching_pair_sets(session)
             scored_pairs: list[tuple[float, CandidateEvidence, CandidateEvidence]] = []
             for index, candidate_a in enumerate(evidences):
                 for candidate_b in evidences[index + 1 :]:
-                    if not self._scorer.is_reciprocally_compatible(
-                        candidate_a, candidate_b
-                    ):
-                        continue
                     pair = self._pair_key(candidate_a.member_id, candidate_b.member_id)
-                    if pair in existing_pairs or pair in restricted_pairs:
+                    if self._candidate_pair_exclusion_reasons(
+                        candidate_a,
+                        candidate_b,
+                        pair,
+                        existing_pairs,
+                        restricted_pairs,
+                    ):
                         continue
                     score = self._scorer.score(candidate_a, candidate_b)
                     scored_pairs.append((score.total, candidate_a, candidate_b))
@@ -949,6 +1022,205 @@ class SqlAlchemyPilotRepository:
                 )
             return created
 
+    def candidate_generation_diagnostics(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CandidateGenerationDiagnostics:
+        with self._sessions.session() as session, session.begin():
+            members = session.scalars(
+                select(UserRecord)
+                .where(
+                    UserRecord.center_id == actor.center_id,
+                    UserRecord.role == Role.MEMBER.value,
+                )
+                .order_by(UserRecord.name)
+            ).all()
+            member_diagnostics: list[CandidateMemberDiagnostic] = []
+            evidence_by_member: dict[uuid.UUID, CandidateEvidence] = {}
+            names: dict[uuid.UUID, str] = {}
+            for member in members:
+                profile = session.get(MemberProfileRecord, member.id)
+                display_name = (
+                    profile.display_name if profile is not None else member.name
+                )
+                names[member.id] = display_name
+                evidence, reasons = self._matching_member_evidence(
+                    session,
+                    member,
+                    actor.id,
+                    reevaluate=False,
+                )
+                if evidence is not None:
+                    evidence_by_member[member.id] = evidence
+                member_diagnostics.append(
+                    CandidateMemberDiagnostic(
+                        member_id=member.id,
+                        display_name=display_name,
+                        ready_for_pairing=not reasons,
+                        reasons=reasons,
+                    )
+                )
+
+            existing_pairs, restricted_pairs = self._matching_pair_sets(session)
+            evidences = tuple(evidence_by_member.values())
+            pair_diagnostics: list[CandidatePairDiagnostic] = []
+            for index, candidate_a in enumerate(evidences):
+                for candidate_b in evidences[index + 1 :]:
+                    pair = self._pair_key(
+                        candidate_a.member_id,
+                        candidate_b.member_id,
+                    )
+                    reasons = self._candidate_pair_exclusion_reasons(
+                        candidate_a,
+                        candidate_b,
+                        pair,
+                        existing_pairs,
+                        restricted_pairs,
+                    )
+                    pair_diagnostics.append(
+                        CandidatePairDiagnostic(
+                            member_a_id=candidate_a.member_id,
+                            member_a_display_name=names[candidate_a.member_id],
+                            member_b_id=candidate_b.member_id,
+                            member_b_display_name=names[candidate_b.member_id],
+                            eligible=not reasons,
+                            reasons=reasons,
+                        )
+                    )
+
+            diagnostics = CandidateGenerationDiagnostics(
+                total_members=len(members),
+                ready_members=len(evidences),
+                evaluated_pairs=len(pair_diagnostics),
+                eligible_pairs=sum(item.eligible for item in pair_diagnostics),
+                members=tuple(member_diagnostics),
+                pairs=tuple(pair_diagnostics),
+            )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="matching.diagnostics_accessed",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={
+                    "total_members": diagnostics.total_members,
+                    "ready_members": diagnostics.ready_members,
+                    "evaluated_pairs": diagnostics.evaluated_pairs,
+                    "eligible_pairs": diagnostics.eligible_pairs,
+                },
+            )
+            return diagnostics
+
+    def _matching_member_evidence(
+        self,
+        session: Session,
+        member: UserRecord,
+        actor_id: uuid.UUID,
+        *,
+        reevaluate: bool = True,
+    ) -> tuple[CandidateEvidence | None, tuple[str, ...]]:
+        reasons: list[str] = []
+        readiness = (
+            self._reevaluate(
+                session,
+                member.id,
+                actor_id,
+                only_if_changed=True,
+            )
+            if reevaluate
+            else self._evaluator.evaluate(
+                self._evidence(
+                    session,
+                    member.id,
+                    ensure_assessment=False,
+                )
+            )
+        )
+        if not readiness.eligible:
+            reasons.extend(readiness.explanations)
+        preferences = session.get(MemberMatchPreferencesRecord, member.id)
+        if preferences is None:
+            reasons.append(
+                "Complete matching preferences, including gender and partner age range."
+            )
+        profile = session.get(MemberProfileRecord, member.id)
+        if profile is None and readiness.eligible:
+            reasons.append("Complete the member profile.")
+        if self._has_open_proposal(session, member.id):
+            reasons.append(
+                "An existing candidate, introduction, or matched pair is still open."
+            )
+        if reasons or preferences is None or profile is None:
+            return None, tuple(reasons)
+        return (
+            CandidateEvidence(
+                member_id=member.id,
+                gender=Gender(preferences.gender),
+                age=self._age_on(profile.birth_date, self._now().date()),
+                min_partner_age=preferences.min_partner_age,
+                max_partner_age=preferences.max_partner_age,
+                city=profile.city,
+                state=profile.state,
+                denomination=profile.denomination,
+                relationship_intent=profile.relationship_intent,
+            ),
+            (),
+        )
+
+    def _matching_pair_sets(
+        self,
+        session: Session,
+    ) -> tuple[set[tuple[uuid.UUID, uuid.UUID]], set[tuple[uuid.UUID, uuid.UUID]]]:
+        existing_pairs = {
+            self._pair_key(row[0], row[1])
+            for row in session.execute(
+                select(
+                    MatchProposalRecord.member_a_id,
+                    MatchProposalRecord.member_b_id,
+                )
+            )
+        }
+        restricted_pairs = {
+            self._pair_key(row[0], row[1])
+            for row in session.execute(
+                select(MemberBlockRecord.blocker_id, MemberBlockRecord.blocked_id)
+            )
+        }
+        restricted_pairs |= {
+            self._pair_key(row[0], row[1])
+            for row in session.execute(
+                select(
+                    MemberReportRecord.reporter_id,
+                    MemberReportRecord.reported_id,
+                )
+            )
+        }
+        return existing_pairs, restricted_pairs
+
+    def _candidate_pair_exclusion_reasons(
+        self,
+        candidate_a: CandidateEvidence,
+        candidate_b: CandidateEvidence,
+        pair: tuple[uuid.UUID, uuid.UUID],
+        existing_pairs: set[tuple[uuid.UUID, uuid.UUID]],
+        restricted_pairs: set[tuple[uuid.UUID, uuid.UUID]],
+    ) -> tuple[str, ...]:
+        reasons: list[str] = []
+        if {candidate_a.gender, candidate_b.gender} != {
+            Gender.MAN,
+            Gender.WOMAN,
+        }:
+            reasons.append("The pilot currently generates only Man/Woman pairs.")
+        elif not self._scorer.is_reciprocally_compatible(candidate_a, candidate_b):
+            reasons.append("Their partner age preferences are not reciprocal.")
+        if pair in restricted_pairs:
+            reasons.append("A safety restriction prevents this pair from matching.")
+        if pair in existing_pairs:
+            reasons.append(
+                "This pair already has proposal history and cannot be generated again."
+            )
+        return tuple(reasons)
+
     def candidate_queue(
         self,
         counselor: AuthenticatedUser,
@@ -998,6 +1270,13 @@ class SqlAlchemyPilotRepository:
         reason_code: str | None,
     ) -> None:
         with self._sessions.session() as session, session.begin():
+            self._role_user(
+                session,
+                counselor.id,
+                Role.COUNSELOR,
+                counselor.center_id,
+                for_update=True,
+            )
             proposal = session.scalar(
                 select(MatchProposalRecord)
                 .where(
@@ -1575,7 +1854,13 @@ class SqlAlchemyPilotRepository:
             )
         return result
 
-    def _evidence(self, session: Session, member_id: uuid.UUID) -> ReadinessEvidence:
+    def _evidence(
+        self,
+        session: Session,
+        member_id: uuid.UUID,
+        *,
+        ensure_assessment: bool = True,
+    ) -> ReadinessEvidence:
         now = self._now()
         profile = session.get(MemberProfileRecord, member_id)
         adult_and_faith = (
@@ -1601,9 +1886,22 @@ class SqlAlchemyPilotRepository:
             )
             is not None
         )
-        assignment, _ = self._ensure_current_assessment(session, member_id)
+        assignment: AssessmentAssignmentRecord | None
+        if ensure_assessment:
+            assignment, _ = self._ensure_current_assessment(session, member_id)
+        else:
+            definition = self._active_assessment_definition(session)
+            assignment = session.scalar(
+                select(AssessmentAssignmentRecord)
+                .where(
+                    AssessmentAssignmentRecord.member_id == member_id,
+                    AssessmentAssignmentRecord.definition_id == definition.id,
+                )
+                .order_by(AssessmentAssignmentRecord.assigned_at.desc())
+            )
         assessment_complete = (
-            assignment.completed_at is not None
+            assignment is not None
+            and assignment.completed_at is not None
             and not self._is_expired(assignment.expires_at)
         )
         return ReadinessEvidence(
@@ -1953,14 +2251,17 @@ class SqlAlchemyPilotRepository:
         user_id: uuid.UUID,
         role: Role,
         center_id: uuid.UUID,
+        *,
+        for_update: bool = False,
     ) -> UserRecord:
-        user = session.scalar(
-            select(UserRecord).where(
-                UserRecord.id == user_id,
-                UserRecord.role == role.value,
-                UserRecord.center_id == center_id,
-            )
+        statement = select(UserRecord).where(
+            UserRecord.id == user_id,
+            UserRecord.role == role.value,
+            UserRecord.center_id == center_id,
         )
+        if for_update:
+            statement = statement.with_for_update()
+        user = session.scalar(statement)
         if user is None:
             raise NotFoundError(f"{role.value.title()} was not found.")
         return user

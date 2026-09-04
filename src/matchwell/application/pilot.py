@@ -18,6 +18,7 @@ from matchwell.domain.matching import (
     MAX_PARTNER_AGE,
     MIN_PARTNER_AGE,
     BlockInput,
+    CandidateGenerationDiagnostics,
     CandidateReviewItem,
     CounselorReviewDecision,
     IntroductionView,
@@ -43,6 +44,11 @@ from matchwell.domain.pilot import (
 
 ROLE_REASSIGNMENT_REASON_CODES = (
     "counselor-onboarding",
+    "account-role-correction",
+    "pilot-staffing-change",
+)
+COUNSELOR_TO_MEMBER_REASON_CODES = (
+    "returning-to-member-journey",
     "account-role-correction",
     "pilot-staffing-change",
 )
@@ -114,6 +120,14 @@ class PilotRepository(Protocol):
         reason_code: str,
     ) -> None: ...
 
+    def reassign_counselor_to_member(
+        self,
+        actor: AuthenticatedUser,
+        counselor_id: uuid.UUID,
+        confirmation_email: str,
+        reason_code: str,
+    ) -> None: ...
+
     def list_assigned_members(
         self,
         counselor: AuthenticatedUser,
@@ -159,6 +173,11 @@ class PilotRepository(Protocol):
     ) -> None: ...
 
     def generate_candidates(self, actor: AuthenticatedUser) -> int: ...
+
+    def candidate_generation_diagnostics(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CandidateGenerationDiagnostics: ...
 
     def candidate_queue(
         self,
@@ -345,6 +364,32 @@ class PilotService:
             safe_reason,
         )
 
+    def reassign_counselor_to_member(
+        self,
+        actor: AuthenticatedUser,
+        counselor_id: uuid.UUID,
+        confirmation_email: str,
+        reason_code: str,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        if counselor_id == actor.id:
+            raise ValidationError("You cannot reassign your own administrator account.")
+        if not confirmation_email.strip():
+            raise ValidationError("Type the counselor's exact email to confirm.")
+        try:
+            confirmed_email = normalize_email(confirmation_email)
+        except ValueError as error:
+            raise ValidationError(str(error)) from error
+        safe_reason = reason_code.strip()
+        if safe_reason not in COUNSELOR_TO_MEMBER_REASON_CODES:
+            raise ValidationError("Select a valid role reassignment reason.")
+        self._repository.reassign_counselor_to_member(
+            actor,
+            counselor_id,
+            confirmed_email,
+            safe_reason,
+        )
+
     def assigned_members(
         self,
         actor: AuthenticatedUser,
@@ -434,6 +479,13 @@ class PilotService:
     def generate_candidates(self, actor: AuthenticatedUser) -> int:
         self._require_role(actor, Role.ADMIN)
         return self._repository.generate_candidates(actor)
+
+    def candidate_generation_diagnostics(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CandidateGenerationDiagnostics:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.candidate_generation_diagnostics(actor)
 
     def candidate_queue(
         self,

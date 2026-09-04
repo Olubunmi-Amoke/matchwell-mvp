@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import streamlit as st
 
 from matchwell.application.pilot import (
+    COUNSELOR_TO_MEMBER_REASON_CODES,
     ROLE_REASSIGNMENT_REASON_CODES,
     PilotService,
 )
@@ -31,13 +32,15 @@ from matchwell.presentation.theme import (
 def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Pilot operations")
     st.caption("Task-oriented queues for the pilot Center.")
-    invitation_tab, members_tab, matching_tab = st.tabs(
-        ["Invitations", "Member readiness", "Matching"]
+    invitation_tab, members_tab, counselors_tab, matching_tab = st.tabs(
+        ["Invitations", "Member readiness", "Counselors", "Matching"]
     )
     with invitation_tab:
         _render_invitations(service, actor)
     with members_tab:
         _render_member_operations(service, actor)
+    with counselors_tab:
+        _render_counselor_operations(service, actor)
     with matching_tab:
         _render_admin_matching(service, actor)
 
@@ -193,6 +196,7 @@ def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> N
         "preferences and has no open proposal. Assessment answers, "
         "screening details, and counselor notes are never used."
     )
+    expand_diagnostics = False
     if st.button("Generate candidates", type="primary"):
         try:
             created = service.generate_candidates(actor)
@@ -203,6 +207,65 @@ def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> N
                 render_success_state(f"Created {created} candidate proposal(s).")
             else:
                 render_empty_state("No new eligible candidate pairs were found.")
+                expand_diagnostics = True
+
+    with st.expander("Candidate diagnostics", expanded=expand_diagnostics):
+        diagnostics_requested = st.button(
+            "Refresh diagnostics",
+            key="refresh-candidate-diagnostics",
+        )
+        if expand_diagnostics or diagnostics_requested:
+            _render_candidate_diagnostics(service, actor)
+        else:
+            st.caption(
+                "Run diagnostics to see member and pair eligibility explanations."
+            )
+
+
+def _render_candidate_diagnostics(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
+    try:
+        diagnostics = service.candidate_generation_diagnostics(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+
+    summary = st.columns(4)
+    with summary[0]:
+        st.metric("Members", diagnostics.total_members)
+    with summary[1]:
+        st.metric("Ready for pairing", diagnostics.ready_members)
+    with summary[2]:
+        st.metric("Pairs evaluated", diagnostics.evaluated_pairs)
+    with summary[3]:
+        st.metric("Eligible pairs", diagnostics.eligible_pairs)
+
+    blocked_members = [
+        member for member in diagnostics.members if not member.ready_for_pairing
+    ]
+    if blocked_members:
+        st.caption("Member-level next actions")
+        for member in blocked_members:
+            st.write(f"**{member.display_name}**")
+            for reason in member.reasons:
+                st.write(f"- {reason}")
+
+    if diagnostics.pairs:
+        st.caption("Pair compatibility")
+        for pair in diagnostics.pairs:
+            label = f"{pair.member_a_display_name} + {pair.member_b_display_name}"
+            if pair.eligible:
+                st.success(f"{label}: eligible for candidate generation.")
+            else:
+                st.write(f"**{label}**")
+                for reason in pair.reasons:
+                    st.write(f"- {reason}")
+    elif diagnostics.ready_members < 2:
+        render_empty_state(
+            "At least two individually ready members are needed to evaluate a pair."
+        )
 
 
 def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None:
@@ -256,6 +319,84 @@ def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None
             hide_index=True,
             use_container_width=True,
         )
+
+
+def _render_counselor_operations(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
+    try:
+        counselors = service.counselors(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not counselors:
+        render_empty_state("No counselors are currently active in this Center.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Counselor": counselor.name,
+                "Email": counselor.email,
+            }
+            for counselor in counselors
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    selected = st.selectbox(
+        "Counselor",
+        options=counselors,
+        format_func=lambda item: f"{item.name} ({item.email})",
+        key="operations-counselor",
+    )
+
+    st.subheader("Role management")
+    with st.container(border=True):
+        st.warning(
+            "Changing this counselor to a member is permanent in the pilot. "
+            "First reassign all active members and resolve their open match "
+            "reviews. Historical counseling activity will be retained, while "
+            "prior screening eligibility will reset."
+        )
+        with st.form(f"counselor-role-reassignment-{selected.id}"):
+            role_reason = st.selectbox(
+                "Reason",
+                options=COUNSELOR_TO_MEMBER_REASON_CODES,
+                format_func=humanize,
+                key=f"counselor-role-reason-{selected.id}",
+            )
+            confirmation_email = st.text_input(
+                f"Type {selected.email} to confirm",
+                autocomplete="off",
+                key=f"counselor-role-email-{selected.id}",
+            )
+            impact_confirmed = st.checkbox(
+                "I understand this account will restart the member readiness journey.",
+                key=f"counselor-role-confirmed-{selected.id}",
+            )
+            reassign_submitted = st.form_submit_button("Change counselor to member")
+        if reassign_submitted:
+            if not impact_confirmed:
+                st.error("Confirm that you understand the role change.")
+            else:
+                try:
+                    service.reassign_counselor_to_member(
+                        actor,
+                        selected.id,
+                        confirmation_email,
+                        role_reason,
+                    )
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state(
+                        "Role changed to member with fresh assessment and "
+                        "screening requirements. Ask the user to sign out and "
+                        "back in to open the member workspace."
+                    )
+                    st.rerun()
 
 
 def _render_member_operations(

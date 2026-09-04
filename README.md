@@ -93,6 +93,12 @@ readiness and safety records, ends the member's active counselor assignment,
 and closes any open introduction or matched-pair access. The reassigned user
 must sign out and back in to load the counselor workspace.
 
+The reverse transition is available from **Pilot operations → Counselors**.
+Before converting a counselor to a member, reassign all of their active members
+and resolve any open match reviews. The transition preserves counseling
+history, expires prior screening eligibility, and creates a fresh readiness
+assessment. The user must sign out and back in to load the member workspace.
+
 ### Community matching and introductions
 
 Once a member reaches 7/7 readiness, they can complete matching preferences
@@ -112,6 +118,12 @@ accept or decline on the **Introduction** page without ever seeing the other
 member's response; a matched-pair workspace activates only once both accept.
 Members can block or report the introduced member at any time with a
 structured category and minimum context, which immediately closes access.
+
+The administrator's **Candidate diagnostics** panel explains why members or
+pairs are excluded and identifies the next corrective action. It reports only
+safe operational reasons such as incomplete readiness, missing preferences,
+open proposals, incompatible gender or age rules, safety restrictions, and
+prior proposal history.
 Holds, blocks, reports, and lost readiness all reconcile and close any open
 proposal or introduction.
 

@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import OidcIdentity, Role
-from matchwell.domain.errors import NotFoundError
+from matchwell.domain.errors import ConflictError, NotFoundError
 from matchwell.domain.pilot import (
     CounselorDecisionStatus,
     InvitationInput,
@@ -151,6 +151,13 @@ def test_complete_invited_member_journey_is_audited_and_eligible(
     )
     service.assign_counselor(admin, member.id, counselor.id)
     assert service.assigned_members(counselor)[0].id == member.id
+    with pytest.raises(ConflictError):
+        service.reassign_counselor_to_member(
+            admin,
+            counselor.id,
+            counselor.email,
+            "returning-to-member-journey",
+        )
     service.record_counselor_decision(
         counselor,
         member.id,
@@ -298,8 +305,18 @@ def test_cross_center_member_is_not_visible_or_assignable(
             role=Role.MEMBER.value,
         )
         session.add(other_member)
+        other_counselor = UserRecord(
+            center_id=other_center.id,
+            oidc_issuer="https://accounts.google.com",
+            oidc_subject="other-counselor",
+            email="other-counselor@example.com",
+            name="Other Counselor",
+            role=Role.COUNSELOR.value,
+        )
+        session.add(other_counselor)
         session.flush()
         other_member_id = other_member.id
+        other_counselor_id = other_counselor.id
 
     assert all(item.id != other_member_id for item in service.members(admin))
     with pytest.raises(NotFoundError):
@@ -309,5 +326,12 @@ def test_cross_center_member_is_not_visible_or_assignable(
             admin,
             other_member_id,
             "other@example.com",
+            "account-role-correction",
+        )
+    with pytest.raises(NotFoundError):
+        service.reassign_counselor_to_member(
+            admin,
+            other_counselor_id,
+            "other-counselor@example.com",
             "account-role-correction",
         )
