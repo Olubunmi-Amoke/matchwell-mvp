@@ -127,6 +127,15 @@ prior proposal history.
 Holds, blocks, reports, and lost readiness all reconcile and close any open
 proposal or introduction.
 
+Once both members accept, the matched-pair workspace provides private,
+plain-text messaging. Messages are immutable, limited to 1,000 characters, and
+available only while the match remains active. Each member keeps their assigned
+counselor, so a pair may have two different counselors. Those counselors can
+see whether the conversation has started, its latest activity time, and message
+count, but never message content. Administrators also have no message-content
+view. A block, report, safety hold, readiness loss, or role change closes
+conversation access immediately.
+
 ### Quality checks
 
 ```powershell

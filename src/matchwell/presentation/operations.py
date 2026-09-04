@@ -47,11 +47,15 @@ def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
 
 def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Counselor workspace")
-    intake_tab, matching_tab = st.tabs(["Assigned members", "Matching review"])
+    intake_tab, matching_tab, activity_tab = st.tabs(
+        ["Assigned members", "Matching review", "Match activity"]
+    )
     with intake_tab:
         _render_counselor_intake(service, actor)
     with matching_tab:
         _render_counselor_matching(service, actor)
+    with activity_tab:
+        _render_counselor_conversation_activity(service, actor)
 
 
 def _render_counselor_intake(
@@ -186,6 +190,41 @@ def _render_counselor_matching(
                 else:
                     render_success_state("Candidate review recorded.")
                     st.rerun()
+
+
+def _render_counselor_conversation_activity(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
+    st.subheader("Matched-pair activity")
+    st.caption(
+        "Participation metadata supports timely guidance. Private message "
+        "content is never available to counselors."
+    )
+    try:
+        statuses = service.conversation_statuses(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not statuses:
+        render_empty_state("No active matched pairs involve your members.")
+        return
+    for status in statuses:
+        with st.container(border=True):
+            st.write(
+                f"**{status.member_a_display_name} + {status.member_b_display_name}**"
+            )
+            if status.started and status.latest_activity_at is not None:
+                render_badges([("Conversation started", "success")])
+                st.caption(
+                    "Latest activity "
+                    f"{status.latest_activity_at.strftime('%b %d, %Y at %I:%M %p')}"
+                    f" · {status.message_count} message"
+                    f"{'' if status.message_count == 1 else 's'}"
+                )
+            else:
+                render_badges([("Not started", "neutral")])
+                st.caption("No conversation activity yet.")
 
 
 def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> None:

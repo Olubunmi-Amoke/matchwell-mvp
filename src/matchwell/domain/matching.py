@@ -247,6 +247,30 @@ class MatchedPairView:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageView:
+    id: uuid.UUID
+    proposal_id: uuid.UUID
+    sender_id: uuid.UUID
+    sender_display_name: str
+    body: str
+    sent_at: datetime
+    is_mine: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CounselorConversationStatus:
+    proposal_id: uuid.UUID
+    member_a_display_name: str
+    member_b_display_name: str
+    message_count: int
+    latest_activity_at: datetime | None
+
+    @property
+    def started(self) -> bool:
+        return self.message_count > 0
+
+
+@dataclass(frozen=True, slots=True)
 class BlockInput:
     blocked_member_id: uuid.UUID
     category: SafetyCategory

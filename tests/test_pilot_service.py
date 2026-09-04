@@ -276,6 +276,28 @@ def test_pending_counselor_review_decision_is_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize("body", ["", "   ", "x" * 1001])
+def test_message_content_is_validated(body: str) -> None:
+    with pytest.raises(ValidationError):
+        service().send_message(actor(Role.MEMBER), uuid.uuid4(), body)
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_message_history_limit_is_bounded(limit: int) -> None:
+    with pytest.raises(ValidationError):
+        service().recent_messages(actor(Role.MEMBER), uuid.uuid4(), limit)
+
+
+def test_only_members_can_use_private_messages() -> None:
+    with pytest.raises(AuthorizationError):
+        service().send_message(actor(Role.COUNSELOR), uuid.uuid4(), "Hello")
+
+
+def test_only_counselors_can_view_conversation_statuses() -> None:
+    with pytest.raises(AuthorizationError):
+        service().conversation_statuses(actor(Role.ADMIN))
+
+
 def test_member_cannot_block_self() -> None:
     with pytest.raises(ValidationError):
         member = actor(Role.MEMBER)
