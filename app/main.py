@@ -20,6 +20,11 @@ from matchwell.infrastructure.persistence.pilot_repository import (
     SqlAlchemyPilotRepository,
 )
 from matchwell.infrastructure.settings import Settings, get_runtime_settings
+from matchwell.presentation.branding import (
+    APP_ICON_PATH,
+    LOGO_PATH,
+    render_app_branding,
+)
 from matchwell.presentation.member import (
     render_assessment,
     render_consent,
@@ -33,10 +38,11 @@ from matchwell.presentation.theme import inject_theme
 
 st.set_page_config(
     page_title="Matchwell",
-    page_icon=":handshake:",
+    page_icon=APP_ICON_PATH,
     layout="wide",
 )
 inject_theme()
+render_app_branding()
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +64,11 @@ def build_service(_settings: Settings) -> PilotService:
 
 
 def render_landing() -> None:
+    _, logo_column, _ = st.columns([1, 2, 1])
+    with logo_column:
+        st.image(LOGO_PATH, width="stretch")
     st.title("Matchwell")
-    st.subheader("Readiness before relationship")
+    st.subheader("Find love built on readiness")
     st.write(
         "A counselor-guided Christian community for intentional, safe, and "
         "relationship-ready connections."
