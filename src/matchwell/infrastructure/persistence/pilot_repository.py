@@ -1568,12 +1568,23 @@ class SqlAlchemyPilotRepository:
             proposal = self._active_participant_proposal(
                 session, member, proposal_id, lock=True
             )
+            sent_at = self._now()
+            latest_sent_at = session.scalar(
+                select(func.max(MatchedPairMessageRecord.sent_at)).where(
+                    MatchedPairMessageRecord.proposal_id == proposal.id
+                )
+            )
+            if latest_sent_at is not None:
+                if latest_sent_at.tzinfo is None:
+                    latest_sent_at = latest_sent_at.replace(tzinfo=UTC)
+                if sent_at <= latest_sent_at:
+                    sent_at = latest_sent_at + timedelta(microseconds=1)
             record = MatchedPairMessageRecord(
                 center_id=member.center_id,
                 proposal_id=proposal.id,
                 sender_id=member.id,
                 body=body,
-                sent_at=self._now(),
+                sent_at=sent_at,
             )
             session.add(record)
             session.flush()
