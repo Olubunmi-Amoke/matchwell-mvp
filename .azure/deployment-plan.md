@@ -1,6 +1,6 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 ## Active Milestone: Audited Counselor-to-Member Reassignment
 
@@ -476,13 +476,13 @@ remain an operator concern and are not provisioned by repository automation.
 
 ### Counselor-to-member validation
 
-- [ ] All validation checks pass
+- [x] All validation checks pass
   - [x] Ruff lint and formatting
   - [x] Strict mypy type checking
   - [x] Complete pytest suite with coverage threshold
   - [x] PostgreSQL upgrade and downgrade SQL generation
   - [x] Streamlit health endpoint smoke verification
-  - [ ] GitHub Actions Docker image build
+  - [x] GitHub Actions Docker image build
 
 ### Phase 4: Future Azure Preparation
 
@@ -521,7 +521,7 @@ remain an operator concern and are not provisioned by repository automation.
 | Counselor-to-member tests | `uv run pytest -q` | 82 passed, 95.24% coverage | 2026-09-03 |
 | Counselor-to-member migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-03 |
 | Counselor-to-member Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-03 |
-| Counselor-to-member Docker image | GitHub Actions `docker build .` | Pending | 2026-09-03 |
+| Counselor-to-member Docker image | GitHub Actions `docker build .` | Pass | 2026-09-03 |
 
 ### Functional verification
 
