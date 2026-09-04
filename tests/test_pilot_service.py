@@ -105,6 +105,12 @@ def test_admin_workspace_rejects_member() -> None:
 
 
 @pytest.mark.parametrize("role", [Role.MEMBER, Role.COUNSELOR])
+def test_only_admin_can_view_candidate_diagnostics(role: Role) -> None:
+    with pytest.raises(AuthorizationError):
+        service().candidate_generation_diagnostics(actor(role))
+
+
+@pytest.mark.parametrize("role", [Role.MEMBER, Role.COUNSELOR])
 def test_only_admin_can_reassign_member_role(role: Role) -> None:
     with pytest.raises(AuthorizationError):
         service().reassign_member_to_counselor(

@@ -18,6 +18,7 @@ from matchwell.domain.matching import (
     MAX_PARTNER_AGE,
     MIN_PARTNER_AGE,
     BlockInput,
+    CandidateGenerationDiagnostics,
     CandidateReviewItem,
     CounselorReviewDecision,
     IntroductionView,
@@ -172,6 +173,11 @@ class PilotRepository(Protocol):
     ) -> None: ...
 
     def generate_candidates(self, actor: AuthenticatedUser) -> int: ...
+
+    def candidate_generation_diagnostics(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CandidateGenerationDiagnostics: ...
 
     def candidate_queue(
         self,
@@ -473,6 +479,13 @@ class PilotService:
     def generate_candidates(self, actor: AuthenticatedUser) -> int:
         self._require_role(actor, Role.ADMIN)
         return self._repository.generate_candidates(actor)
+
+    def candidate_generation_diagnostics(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CandidateGenerationDiagnostics:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.candidate_generation_diagnostics(actor)
 
     def candidate_queue(
         self,

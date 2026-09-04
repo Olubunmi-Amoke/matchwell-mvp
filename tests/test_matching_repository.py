@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
@@ -17,6 +17,7 @@ from matchwell.domain.matching import (
     Gender,
     MatchPreferencesInput,
     MemberResponseDecision,
+    ProposalStatus,
     SafetyCategory,
 )
 from matchwell.domain.pilot import (
@@ -41,6 +42,8 @@ from matchwell.infrastructure.persistence.models import (
     CounselorAssignmentRecord,
     HoldRecord,
     MatchProposalRecord,
+    MemberBlockRecord,
+    MemberMatchPreferencesRecord,
     MemberProfileRecord,
     OutboxMessageRecord,
     ScreeningCaseRecord,
@@ -307,6 +310,200 @@ def test_full_two_member_matching_journey_activates_workspace(pilot: Pilot) -> N
             )
         )
         assert activated_audit is not None
+
+
+def test_candidate_diagnostics_explain_ready_pair_and_open_proposal(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+
+    before = service.candidate_generation_diagnostics(admin)
+
+    assert before.total_members == 2
+    assert before.ready_members == 2
+    assert before.evaluated_pairs == 1
+    assert before.eligible_pairs == 1
+    assert before.pairs[0].eligible
+    assert before.pairs[0].reasons == ()
+    with sessions.session() as session:
+        assert session.scalar(select(func.count(MatchProposalRecord.id))) == 0
+        audit = session.scalar(
+            select(AuditEventRecord).where(
+                AuditEventRecord.action == "matching.diagnostics_accessed"
+            )
+        )
+        assert audit is not None
+        assert audit.safe_metadata == {
+            "total_members": 2,
+            "ready_members": 2,
+            "evaluated_pairs": 1,
+            "eligible_pairs": 1,
+        }
+
+    assert service.generate_candidates(admin) == 1
+    after = service.candidate_generation_diagnostics(admin)
+
+    assert after.ready_members == 0
+    assert after.evaluated_pairs == 0
+    assert {item.member_id: item.reasons for item in after.members} == {
+        member_a.id: (
+            "An existing candidate, introduction, or matched pair is still open.",
+        ),
+        member_b.id: (
+            "An existing candidate, introduction, or matched pair is still open.",
+        ),
+    }
+
+
+def test_candidate_diagnostics_do_not_close_an_ineligible_members_proposal(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, _ = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    with sessions.session() as session, session.begin():
+        proposal = session.scalar(select(MatchProposalRecord))
+        assert proposal is not None
+        proposal_id = proposal.id
+        session.add(
+            HoldRecord(
+                member_id=member_a.id,
+                center_context_id=admin.center_id,
+                hold_type="administrative",
+                reason_code="manual-review",
+                applied_by_id=admin.id,
+                applied_at=datetime.now(UTC),
+            )
+        )
+
+    diagnostics = service.candidate_generation_diagnostics(admin)
+
+    assert any(
+        "hold" in reason.casefold()
+        for item in diagnostics.members
+        if item.member_id == member_a.id
+        for reason in item.reasons
+    )
+    with sessions.session() as session:
+        proposal = session.get(MatchProposalRecord, proposal_id)
+        assert proposal is not None
+        assert proposal.status == ProposalStatus.PENDING_REVIEW.value
+
+
+def test_candidate_diagnostics_explain_missing_preferences_and_readiness(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    service.apply_hold(admin, member_a.id, "manual-review")
+    with sessions.session() as session, session.begin():
+        preferences = session.get(MemberMatchPreferencesRecord, member_b.id)
+        assert preferences is not None
+        session.delete(preferences)
+
+    diagnostics = service.candidate_generation_diagnostics(admin)
+    reasons = {item.member_id: item.reasons for item in diagnostics.members}
+
+    assert diagnostics.ready_members == 0
+    assert any("hold" in reason.casefold() for reason in reasons[member_a.id])
+    assert reasons[member_b.id] == (
+        "Complete matching preferences, including gender and partner age range.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("gender_b", "min_age_b", "max_age_b", "expected_reason"),
+    [
+        (
+            Gender.MAN,
+            28,
+            45,
+            "The pilot currently generates only Man/Woman pairs.",
+        ),
+        (
+            Gender.WOMAN,
+            45,
+            55,
+            "Their partner age preferences are not reciprocal.",
+        ),
+    ],
+)
+def test_candidate_diagnostics_explain_pair_incompatibility(
+    pilot: Pilot,
+    gender_b: Gender,
+    min_age_b: int,
+    max_age_b: int,
+    expected_reason: str,
+) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    member_b = next(
+        item for item in service.members(admin) if item.email == "brooke@example.com"
+    )
+    service.save_match_preferences(
+        AuthenticatedUser(
+            id=member_b.id,
+            email=member_b.email,
+            name=member_b.display_name,
+            role=Role.MEMBER,
+            center_id=member_b.center_id,
+        ),
+        MatchPreferencesInput(
+            gender=gender_b,
+            min_partner_age=min_age_b,
+            max_partner_age=max_age_b,
+        ),
+    )
+
+    diagnostics = service.candidate_generation_diagnostics(admin)
+
+    assert diagnostics.eligible_pairs == 0
+    assert diagnostics.pairs[0].reasons == (expected_reason,)
+
+
+def test_candidate_diagnostics_explain_prior_pair_and_safety_restriction(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    with sessions.session() as session, session.begin():
+        member_a_id, member_b_id = sorted((member_a.id, member_b.id), key=str)
+        session.add(
+            MatchProposalRecord(
+                center_id=admin.center_id,
+                community_id=session.scalar(select(CommunityRecord.id)),
+                member_a_id=member_a_id,
+                member_b_id=member_b_id,
+                status=ProposalStatus.CLOSED.value,
+                score=0,
+                score_breakdown=[],
+                counselor_a_decision=CounselorReviewDecision.DECLINED.value,
+                counselor_b_decision=CounselorReviewDecision.DECLINED.value,
+            )
+        )
+        session.add(
+            MemberBlockRecord(
+                center_id=admin.center_id,
+                blocker_id=member_a.id,
+                blocked_id=member_b.id,
+                category=SafetyCategory.OTHER.value,
+                context=None,
+            )
+        )
+
+    diagnostics = service.candidate_generation_diagnostics(admin)
+
+    assert diagnostics.eligible_pairs == 0
+    assert set(diagnostics.pairs[0].reasons) == {
+        "A safety restriction prevents this pair from matching.",
+        "This pair already has proposal history and cannot be generated again.",
+    }
 
 
 def test_admin_reassigns_member_to_counselor_and_closes_active_workflows(

@@ -74,6 +74,34 @@ class CandidateEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateMemberDiagnostic:
+    member_id: uuid.UUID
+    display_name: str
+    ready_for_pairing: bool
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePairDiagnostic:
+    member_a_id: uuid.UUID
+    member_a_display_name: str
+    member_b_id: uuid.UUID
+    member_b_display_name: str
+    eligible: bool
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateGenerationDiagnostics:
+    total_members: int
+    ready_members: int
+    evaluated_pairs: int
+    eligible_pairs: int
+    members: tuple[CandidateMemberDiagnostic, ...]
+    pairs: tuple[CandidatePairDiagnostic, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ScoreContribution:
     label: str
     weight: float

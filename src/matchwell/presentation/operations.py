@@ -196,6 +196,7 @@ def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> N
         "preferences and has no open proposal. Assessment answers, "
         "screening details, and counselor notes are never used."
     )
+    expand_diagnostics = False
     if st.button("Generate candidates", type="primary"):
         try:
             created = service.generate_candidates(actor)
@@ -206,6 +207,65 @@ def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> N
                 render_success_state(f"Created {created} candidate proposal(s).")
             else:
                 render_empty_state("No new eligible candidate pairs were found.")
+                expand_diagnostics = True
+
+    with st.expander("Candidate diagnostics", expanded=expand_diagnostics):
+        diagnostics_requested = st.button(
+            "Refresh diagnostics",
+            key="refresh-candidate-diagnostics",
+        )
+        if expand_diagnostics or diagnostics_requested:
+            _render_candidate_diagnostics(service, actor)
+        else:
+            st.caption(
+                "Run diagnostics to see member and pair eligibility explanations."
+            )
+
+
+def _render_candidate_diagnostics(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
+    try:
+        diagnostics = service.candidate_generation_diagnostics(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+
+    summary = st.columns(4)
+    with summary[0]:
+        st.metric("Members", diagnostics.total_members)
+    with summary[1]:
+        st.metric("Ready for pairing", diagnostics.ready_members)
+    with summary[2]:
+        st.metric("Pairs evaluated", diagnostics.evaluated_pairs)
+    with summary[3]:
+        st.metric("Eligible pairs", diagnostics.eligible_pairs)
+
+    blocked_members = [
+        member for member in diagnostics.members if not member.ready_for_pairing
+    ]
+    if blocked_members:
+        st.caption("Member-level next actions")
+        for member in blocked_members:
+            st.write(f"**{member.display_name}**")
+            for reason in member.reasons:
+                st.write(f"- {reason}")
+
+    if diagnostics.pairs:
+        st.caption("Pair compatibility")
+        for pair in diagnostics.pairs:
+            label = f"{pair.member_a_display_name} + {pair.member_b_display_name}"
+            if pair.eligible:
+                st.success(f"{label}: eligible for candidate generation.")
+            else:
+                st.write(f"**{label}**")
+                for reason in pair.reasons:
+                    st.write(f"- {reason}")
+    elif diagnostics.ready_members < 2:
+        render_empty_state(
+            "At least two individually ready members are needed to evaluate a pair."
+        )
 
 
 def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None:

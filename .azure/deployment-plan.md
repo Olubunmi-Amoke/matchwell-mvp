@@ -1,6 +1,59 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Validated
+> **Status:** Ready for Validation
+
+## Active Milestone: Candidate Generation Diagnostics
+
+**Goal:** Explain why candidate generation produced no new pairs and give
+administrators clear corrective actions.
+
+### Diagnostic behavior
+
+- Add an administrator-only diagnostic query that does not mutate matching
+  records.
+- Evaluate every member in the administrator's Center against the same
+  readiness and matching rules used by candidate generation.
+- Report member-level exclusions such as incomplete readiness, missing matching
+  preferences, missing active counselor assignment, active proposal, or
+  unavailable profile data.
+- Evaluate otherwise available member pairs and report pair-level exclusions:
+  incompatible gender rule, non-reciprocal age preferences, safety restriction,
+  or prior proposal history.
+- Show a clear ready-state when a pair is eligible for generation.
+
+### User experience
+
+- Add a **Candidate diagnostics** section beside candidate generation.
+- Show summary counts for total members, individually ready members, evaluated
+  pairs, and eligible pairs.
+- Display member names with plain-language next actions.
+- Display pair names with safe compatibility explanations.
+- Refresh diagnostics after candidate generation so operators can distinguish
+  newly created/open proposals from unresolved eligibility problems.
+
+### Privacy and authorization
+
+- Restrict diagnostics to administrators and the current Center.
+- Do not expose assessment answers, counseling notes, screening details,
+  safety-report context, exact birth dates, or private member responses.
+- Use only operational status and corrective guidance already available to the
+  administrator.
+- Keep diagnostic reads audited with summary counts, not member details.
+
+### Validation
+
+- Test administrator-only access and Center isolation.
+- Test missing preferences, readiness, counselor, open proposal, gender,
+  reciprocal-age, safety restriction, prior-pair, and eligible-pair reasons.
+- Verify diagnostic evaluation does not create or modify proposals.
+- Run Ruff, formatting, strict mypy, the full pytest suite, PostgreSQL migration
+  SQL checks, Streamlit smoke verification, and CI container build.
+
+**Implementation status:** Complete.
+
+**Validation status:** Ruff, formatting, strict mypy, 90 tests with 95.72%
+coverage, PostgreSQL migration SQL generation, and read-path safety review
+passed. Streamlit smoke and CI container validation remain.
 
 ## Active Milestone: Audited Counselor-to-Member Reassignment
 
@@ -484,6 +537,16 @@ remain an operator concern and are not provisioned by repository automation.
   - [x] Streamlit health endpoint smoke verification
   - [x] GitHub Actions Docker image build
 
+### Candidate diagnostics validation
+
+- [ ] All validation checks pass
+  - [x] Ruff lint and formatting
+  - [x] Strict mypy type checking
+  - [x] Complete pytest suite with coverage threshold
+  - [x] PostgreSQL upgrade and downgrade SQL generation
+  - [x] Streamlit health endpoint smoke verification
+  - [ ] GitHub Actions Docker image build
+
 ### Phase 4: Future Azure Preparation
 
 - [ ] Confirm Azure subscription and US region
@@ -522,6 +585,13 @@ remain an operator concern and are not provisioned by repository automation.
 | Counselor-to-member migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-03 |
 | Counselor-to-member Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-03 |
 | Counselor-to-member Docker image | GitHub Actions `docker build .` | Pass | 2026-09-03 |
+| Candidate diagnostics lint | `uv run ruff check .` | Pass | 2026-09-04 |
+| Candidate diagnostics formatting | `uv run ruff format --check .` | Pass | 2026-09-04 |
+| Candidate diagnostics types | `uv run mypy` | Pass | 2026-09-04 |
+| Candidate diagnostics tests | `uv run pytest -q` | 90 passed, 95.72% coverage | 2026-09-04 |
+| Candidate diagnostics migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-04 |
+| Candidate diagnostics Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04 |
+| Candidate diagnostics Docker image | GitHub Actions `docker build .` | Pending | 2026-09-04 |
 
 ### Functional verification
 
