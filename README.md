@@ -93,6 +93,12 @@ readiness and safety records, ends the member's active counselor assignment,
 and closes any open introduction or matched-pair access. The reassigned user
 must sign out and back in to load the counselor workspace.
 
+The reverse transition is available from **Pilot operations → Counselors**.
+Before converting a counselor to a member, reassign all of their active members
+and resolve any open match reviews. The transition preserves counseling
+history, expires prior screening eligibility, and creates a fresh readiness
+assessment. The user must sign out and back in to load the member workspace.
+
 ### Community matching and introductions
 
 Once a member reaches 7/7 readiness, they can complete matching preferences

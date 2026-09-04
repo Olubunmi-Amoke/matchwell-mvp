@@ -1,6 +1,68 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Validated
+> **Status:** Ready for Validation
+
+## Active Milestone: Audited Counselor-to-Member Reassignment
+
+**Goal:** Let a platform administrator convert an existing counselor account
+into a member account without deleting identity, counseling history, or prior
+member history.
+
+### Supported transition
+
+- Support `Counselor -> Member` only in this command.
+- Keep the existing `Member -> Counselor` command unchanged.
+- Require exact-email confirmation, an explicit impact acknowledgment, and a
+  standardized operational reason code.
+
+### Preconditions
+
+- The actor must be an administrator in the counselor's Center.
+- The target must currently be a counselor.
+- Reject the transition while the counselor has active member assignments.
+- Reject the transition while an open matching proposal still depends on the
+  counselor's review.
+- Administrators must reassign those responsibilities before changing the role.
+
+### Transactional behavior
+
+1. Lock the target account.
+2. Recheck the target role, Center, active assignments, and open reviews.
+3. Change the account role to member.
+4. Preserve all historical counselor assignments, decisions, audits, profiles,
+   consents, assessments, screenings, safety records, and matching records.
+5. Expire any prior member screening eligibility so it cannot be silently
+   reused.
+6. Create a new incomplete readiness-assessment assignment.
+7. Re-evaluate readiness so the account remains ineligible until the new member
+   journey is complete.
+8. Append safe `identity.role_reassigned` audit and outbox events containing
+   only old/new roles and the standardized reason code.
+
+### User experience
+
+- Add a **Counselors** tab to Pilot operations.
+- Show the current counselor roster and a selected-counselor role-management
+  form.
+- Explain responsibility prerequisites and retained history.
+- Require the counselor's exact email and explicit acknowledgment.
+- After success, remove the account from counselor controls, add it to the
+  member readiness queue, and instruct the user to sign out and back in.
+
+### Validation
+
+- Cover administrator-only authorization, confirmation, reason validation,
+  Center isolation, repeated requests, responsibility blocking, fresh
+  assessment creation, screening reset, history preservation, queue movement,
+  and safe audit/outbox payloads.
+- Run Ruff, formatting, strict mypy, the complete pytest suite, PostgreSQL
+  migration SQL checks, Streamlit smoke verification, and CI container build.
+
+**Implementation status:** Complete.
+
+**Validation status:** Ruff, formatting, strict mypy, 82 tests with 95.24%
+coverage, PostgreSQL migration SQL generation, and Streamlit startup smoke
+verification passed. CI container validation is pending.
 
 ## Active Milestone: Audited Member-to-Counselor Reassignment
 
@@ -412,6 +474,16 @@ remain an operator concern and are not provisioned by repository automation.
   - [x] Streamlit health endpoint smoke verification
   - [x] GitHub Actions Docker image build
 
+### Counselor-to-member validation
+
+- [ ] All validation checks pass
+  - [x] Ruff lint and formatting
+  - [x] Strict mypy type checking
+  - [x] Complete pytest suite with coverage threshold
+  - [x] PostgreSQL upgrade and downgrade SQL generation
+  - [x] Streamlit health endpoint smoke verification
+  - [ ] GitHub Actions Docker image build
+
 ### Phase 4: Future Azure Preparation
 
 - [ ] Confirm Azure subscription and US region
@@ -443,6 +515,13 @@ remain an operator concern and are not provisioned by repository automation.
 | PostgreSQL migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-03 |
 | Role reassignment Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-03 |
 | Role reassignment Docker image | GitHub Actions `docker build .` | Pass | 2026-09-03 |
+| Counselor-to-member lint | `uv run ruff check .` | Pass | 2026-09-03 |
+| Counselor-to-member formatting | `uv run ruff format --check .` | Pass | 2026-09-03 |
+| Counselor-to-member types | `uv run mypy` | Pass | 2026-09-03 |
+| Counselor-to-member tests | `uv run pytest -q` | 82 passed, 95.24% coverage | 2026-09-03 |
+| Counselor-to-member migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-03 |
+| Counselor-to-member Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-03 |
+| Counselor-to-member Docker image | GitHub Actions `docker build .` | Pending | 2026-09-03 |
 
 ### Functional verification
 

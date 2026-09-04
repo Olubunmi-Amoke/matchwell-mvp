@@ -43,6 +43,7 @@ from matchwell.infrastructure.persistence.models import (
     MatchProposalRecord,
     MemberProfileRecord,
     OutboxMessageRecord,
+    ScreeningCaseRecord,
     UserRecord,
 )
 from matchwell.infrastructure.persistence.pilot_repository import (
@@ -409,6 +410,91 @@ def test_admin_reassigns_member_to_counselor_and_closes_active_workflows(
         )
     with pytest.raises(NotFoundError):
         service.assign_counselor(admin, member_a.id, counselor_b.id)
+
+    service.reassign_counselor_to_member(
+        admin,
+        member_a.id,
+        member_a.email,
+        "returning-to-member-journey",
+    )
+
+    assert member_a.id in {item.id for item in service.members(admin)}
+    assert member_a.id not in {item.id for item in service.counselors(admin)}
+    progress = service.progress(member_a)
+    assert not progress.readiness.eligible
+    assert progress.screening_status is ScreeningStatus.NOT_STARTED
+    fresh_assessment = service.assessment(member_a)
+    assert not fresh_assessment.completed
+
+    with sessions.session() as session:
+        assessments = session.scalars(
+            select(AssessmentAssignmentRecord)
+            .where(AssessmentAssignmentRecord.member_id == member_a.id)
+            .order_by(AssessmentAssignmentRecord.assigned_at)
+        ).all()
+        assert len(assessments) == 2
+        assert assessments[0].completed_at is not None
+        assert assessments[1].completed_at is None
+
+        screening = session.scalar(
+            select(ScreeningCaseRecord).where(
+                ScreeningCaseRecord.member_id == member_a.id
+            )
+        )
+        assert screening is not None
+        assert screening.expires_at is not None
+
+        role_audits = session.scalars(
+            select(AuditEventRecord).where(
+                AuditEventRecord.action == "identity.role_reassigned",
+                AuditEventRecord.subject_id == str(member_a.id),
+            )
+        ).all()
+        assert {
+            (
+                item.safe_metadata["previous_role"],
+                item.safe_metadata["new_role"],
+                item.safe_metadata["reason_code"],
+            )
+            for item in role_audits
+        } == {
+            ("member", "counselor", "counselor-onboarding"),
+            ("counselor", "member", "returning-to-member-journey"),
+        }
+
+    with pytest.raises(ConflictError):
+        service.reassign_counselor_to_member(
+            admin,
+            member_a.id,
+            member_a.email,
+            "returning-to-member-journey",
+        )
+
+
+def test_counselor_with_open_match_review_cannot_become_member(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    service.generate_candidates(admin)
+    with sessions.session() as session, session.begin():
+        assignments = session.scalars(
+            select(CounselorAssignmentRecord).where(
+                CounselorAssignmentRecord.counselor_id == counselor_a.id,
+                CounselorAssignmentRecord.ended_at.is_(None),
+            )
+        ).all()
+        for assignment in assignments:
+            assignment.ended_at = datetime.now(UTC)
+
+    with pytest.raises(ConflictError):
+        service.reassign_counselor_to_member(
+            admin,
+            counselor_a.id,
+            counselor_a.email,
+            "returning-to-member-journey",
+        )
 
 
 def test_ineligible_member_excluded_from_candidate_generation(pilot: Pilot) -> None:

@@ -455,6 +455,7 @@ class SqlAlchemyPilotRepository:
                     counselor_id,
                     Role.COUNSELOR,
                     actor.center_id,
+                    for_update=True,
                 )
                 now = self._now()
                 active = session.scalars(
@@ -546,6 +547,116 @@ class SqlAlchemyPilotRepository:
                         "center_id": str(actor.center_id),
                         "previous_role": Role.MEMBER.value,
                         "new_role": Role.COUNSELOR.value,
+                        "reason_code": reason_code,
+                    },
+                )
+            )
+
+    def reassign_counselor_to_member(
+        self,
+        actor: AuthenticatedUser,
+        counselor_id: uuid.UUID,
+        confirmation_email: str,
+        reason_code: str,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            counselor = session.scalar(
+                select(UserRecord)
+                .where(
+                    UserRecord.id == counselor_id,
+                    UserRecord.center_id == actor.center_id,
+                )
+                .with_for_update()
+            )
+            if counselor is None:
+                raise NotFoundError("The counselor was not found in this Center.")
+            if counselor.role != Role.COUNSELOR.value:
+                raise ConflictError("Only an existing counselor can become a member.")
+            if normalize_email(confirmation_email) != counselor.email:
+                raise ValidationError(
+                    "The confirmation email does not match the counselor."
+                )
+
+            active_assignments = session.scalars(
+                select(CounselorAssignmentRecord)
+                .where(
+                    CounselorAssignmentRecord.counselor_id == counselor.id,
+                    CounselorAssignmentRecord.ended_at.is_(None),
+                )
+                .with_for_update()
+            ).all()
+            if active_assignments:
+                raise ConflictError(
+                    "Reassign this counselor's active members before changing their role."
+                )
+
+            open_reviews = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.status == ProposalStatus.PENDING_REVIEW.value,
+                    or_(
+                        and_(
+                            MatchProposalRecord.counselor_a_id == counselor.id,
+                            MatchProposalRecord.counselor_a_decision
+                            == CounselorReviewDecision.PENDING.value,
+                        ),
+                        and_(
+                            MatchProposalRecord.counselor_b_id == counselor.id,
+                            MatchProposalRecord.counselor_b_decision
+                            == CounselorReviewDecision.PENDING.value,
+                        ),
+                    ),
+                )
+                .with_for_update()
+            ).all()
+            if open_reviews:
+                raise ConflictError(
+                    "Resolve or reassign this counselor's open match reviews "
+                    "before changing their role."
+                )
+
+            now = self._now()
+            screening = session.scalar(
+                select(ScreeningCaseRecord)
+                .where(ScreeningCaseRecord.member_id == counselor.id)
+                .with_for_update()
+            )
+            if screening is not None:
+                screening.expires_at = now
+                screening.updated_at = now
+
+            definition = self._active_assessment_definition(session)
+            session.add(
+                AssessmentAssignmentRecord(
+                    member_id=counselor.id,
+                    definition_id=definition.id,
+                    assigned_at=now,
+                    expires_at=now + timedelta(days=90),
+                )
+            )
+            counselor.role = Role.MEMBER.value
+            session.flush()
+            self._reevaluate(session, counselor.id, actor.id)
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="identity.role_reassigned",
+                subject_id=counselor.id,
+                center_id=actor.center_id,
+                metadata={
+                    "previous_role": Role.COUNSELOR.value,
+                    "new_role": Role.MEMBER.value,
+                    "reason_code": reason_code,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="identity.role_reassigned",
+                    payload={
+                        "user_id": str(counselor.id),
+                        "center_id": str(actor.center_id),
+                        "previous_role": Role.COUNSELOR.value,
+                        "new_role": Role.MEMBER.value,
                         "reason_code": reason_code,
                     },
                 )
@@ -998,6 +1109,13 @@ class SqlAlchemyPilotRepository:
         reason_code: str | None,
     ) -> None:
         with self._sessions.session() as session, session.begin():
+            self._role_user(
+                session,
+                counselor.id,
+                Role.COUNSELOR,
+                counselor.center_id,
+                for_update=True,
+            )
             proposal = session.scalar(
                 select(MatchProposalRecord)
                 .where(
@@ -1953,14 +2071,17 @@ class SqlAlchemyPilotRepository:
         user_id: uuid.UUID,
         role: Role,
         center_id: uuid.UUID,
+        *,
+        for_update: bool = False,
     ) -> UserRecord:
-        user = session.scalar(
-            select(UserRecord).where(
-                UserRecord.id == user_id,
-                UserRecord.role == role.value,
-                UserRecord.center_id == center_id,
-            )
+        statement = select(UserRecord).where(
+            UserRecord.id == user_id,
+            UserRecord.role == role.value,
+            UserRecord.center_id == center_id,
         )
+        if for_update:
+            statement = statement.with_for_update()
+        user = session.scalar(statement)
         if user is None:
             raise NotFoundError(f"{role.value.title()} was not found.")
         return user

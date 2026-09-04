@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import streamlit as st
 
 from matchwell.application.pilot import (
+    COUNSELOR_TO_MEMBER_REASON_CODES,
     ROLE_REASSIGNMENT_REASON_CODES,
     PilotService,
 )
@@ -31,13 +32,15 @@ from matchwell.presentation.theme import (
 def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Pilot operations")
     st.caption("Task-oriented queues for the pilot Center.")
-    invitation_tab, members_tab, matching_tab = st.tabs(
-        ["Invitations", "Member readiness", "Matching"]
+    invitation_tab, members_tab, counselors_tab, matching_tab = st.tabs(
+        ["Invitations", "Member readiness", "Counselors", "Matching"]
     )
     with invitation_tab:
         _render_invitations(service, actor)
     with members_tab:
         _render_member_operations(service, actor)
+    with counselors_tab:
+        _render_counselor_operations(service, actor)
     with matching_tab:
         _render_admin_matching(service, actor)
 
@@ -256,6 +259,84 @@ def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None
             hide_index=True,
             use_container_width=True,
         )
+
+
+def _render_counselor_operations(
+    service: PilotService,
+    actor: AuthenticatedUser,
+) -> None:
+    try:
+        counselors = service.counselors(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not counselors:
+        render_empty_state("No counselors are currently active in this Center.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Counselor": counselor.name,
+                "Email": counselor.email,
+            }
+            for counselor in counselors
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    selected = st.selectbox(
+        "Counselor",
+        options=counselors,
+        format_func=lambda item: f"{item.name} ({item.email})",
+        key="operations-counselor",
+    )
+
+    st.subheader("Role management")
+    with st.container(border=True):
+        st.warning(
+            "Changing this counselor to a member is permanent in the pilot. "
+            "First reassign all active members and resolve their open match "
+            "reviews. Historical counseling activity will be retained, while "
+            "prior screening eligibility will reset."
+        )
+        with st.form(f"counselor-role-reassignment-{selected.id}"):
+            role_reason = st.selectbox(
+                "Reason",
+                options=COUNSELOR_TO_MEMBER_REASON_CODES,
+                format_func=humanize,
+                key=f"counselor-role-reason-{selected.id}",
+            )
+            confirmation_email = st.text_input(
+                f"Type {selected.email} to confirm",
+                autocomplete="off",
+                key=f"counselor-role-email-{selected.id}",
+            )
+            impact_confirmed = st.checkbox(
+                "I understand this account will restart the member readiness journey.",
+                key=f"counselor-role-confirmed-{selected.id}",
+            )
+            reassign_submitted = st.form_submit_button("Change counselor to member")
+        if reassign_submitted:
+            if not impact_confirmed:
+                st.error("Confirm that you understand the role change.")
+            else:
+                try:
+                    service.reassign_counselor_to_member(
+                        actor,
+                        selected.id,
+                        confirmation_email,
+                        role_reason,
+                    )
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state(
+                        "Role changed to member with fresh assessment and "
+                        "screening requirements. Ask the user to sign out and "
+                        "back in to open the member workspace."
+                    )
+                    st.rerun()
 
 
 def _render_member_operations(
