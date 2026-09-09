@@ -21,6 +21,7 @@ from matchwell.domain.readiness import ReadinessEvaluator
 from matchwell.infrastructure.billing.stripe_gateway import build_stripe_gateway
 from matchwell.infrastructure.persistence.database import (
     DatabaseSessionFactory,
+    MigrationStatusProbe,
     SqlAlchemyDatabaseProbe,
     create_database_engine,
 )
@@ -61,7 +62,10 @@ def build_app() -> FastAPI:
         grace_period=timedelta(days=settings.billing_grace_period_days),
     )
     pilot_service = PilotService(repository, settings.normalized_admin_emails())
-    health_service = SystemHealthService(SqlAlchemyDatabaseProbe(database_url))
+    health_service = SystemHealthService(
+        SqlAlchemyDatabaseProbe(database_url),
+        MigrationStatusProbe(database_url),
+    )
     return create_app(
         pilot_service=pilot_service,
         payment_gateway=payment_gateway,

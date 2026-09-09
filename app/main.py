@@ -7,10 +7,15 @@ from streamlit.errors import StreamlitSecretNotFoundError
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
-from matchwell.domain.errors import MatchwellError
+from matchwell.domain.errors import AccountDisabledError, MatchwellError
 from matchwell.domain.matching import MatchScorer
 from matchwell.domain.readiness import ReadinessEvaluator
 from matchwell.infrastructure.billing.stripe_gateway import build_stripe_gateway
+from matchwell.infrastructure.observability.logging import (
+    OperationalEvent,
+    configure_json_logging,
+    log_event,
+)
 from matchwell.infrastructure.persistence.database import (
     DatabaseSessionFactory,
     SqlAlchemyDatabaseProbe,
@@ -46,6 +51,7 @@ st.set_page_config(
 inject_theme()
 render_app_branding()
 
+configure_json_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -88,8 +94,13 @@ def render_landing() -> None:
 
 
 def current_identity() -> OidcIdentity:
+    # Fail closed: never default the issuer to a trusted value. If Google's
+    # OIDC claim is missing from ``st.user`` (e.g. a stale or tampered
+    # session), an empty issuer will never match the required
+    # "https://accounts.google.com" issuer that PilotService.sign_in
+    # enforces, so sign-in is rejected rather than silently trusted.
     return OidcIdentity(
-        issuer=str(getattr(st.user, "iss", "https://accounts.google.com")),
+        issuer=str(getattr(st.user, "iss", "")),
         subject=str(getattr(st.user, "sub", "")),
         email=str(getattr(st.user, "email", "")),
         email_verified=bool(getattr(st.user, "email_verified", False)),
@@ -180,6 +191,13 @@ except StreamlitSecretNotFoundError:
     settings = get_runtime_settings({})
 database_url = settings.reveal_database_url()
 health = SqlAlchemyDatabaseProbe(database_url).check()
+if health.status.value != "ready":
+    log_event(
+        logger,
+        OperationalEvent.DATABASE_UNAVAILABLE,
+        component=health.name,
+        status=health.status.value,
+    )
 
 if database_url is None:
     st.title("Matchwell setup")
@@ -213,7 +231,17 @@ except (RuntimeError, SQLAlchemyError):
 
 try:
     actor = service.sign_in(current_identity())
+except AccountDisabledError as error:
+    log_event(logger, OperationalEvent.AUTH_SIGN_IN_DENIED_DISABLED)
+    st.title("Matchwell")
+    st.error(str(error))
+    st.stop()
 except MatchwellError as error:
+    log_event(
+        logger,
+        OperationalEvent.AUTH_SIGN_IN_REJECTED,
+        error_type=type(error).__name__,
+    )
     st.title("Matchwell")
     st.error(str(error))
     st.stop()

@@ -1,11 +1,17 @@
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from typing import cast
 
 import pytest
 from sqlalchemy import func, select
 
 from matchwell.application.pilot import PilotService
-from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
+from matchwell.domain.access import (
+    AccountDisableReasonCode,
+    AuthenticatedUser,
+    OidcIdentity,
+    Role,
+)
 from matchwell.domain.errors import (
     AuthorizationError,
     ConflictError,
@@ -1125,6 +1131,26 @@ def test_ineligible_member_excluded_from_candidate_generation(pilot: Pilot) -> N
     assert service.candidate_queue(counselor_b) == ()
 
 
+def test_disabled_member_is_excluded_from_matching_and_diagnostics(
+    pilot: Pilot,
+) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    _member_a, member_b = _make_reciprocal_pair(
+        service, admin, counselor_a, counselor_b
+    )
+
+    service.disable_account(
+        admin,
+        member_b.id,
+        AccountDisableReasonCode.SAFETY_CONCERN,
+    )
+
+    assert service.generate_candidates(admin) == 0
+    diagnostics = service.candidate_generation_diagnostics(admin)
+    assert all(row.member_id != member_b.id for row in diagnostics.members)
+
+
 def test_member_without_match_preferences_is_excluded(pilot: Pilot) -> None:
     service, _ = pilot
     admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
@@ -1647,3 +1673,103 @@ def test_hold_record_precedence_over_pending_candidate(pilot: Pilot) -> None:
         assert proposal.closed_reason == "hold_applied"
     assert service.candidate_queue(counselor_a) == ()
     assert member_b is not None
+
+
+def test_matching_pair_sets_scope_proposals_by_center_but_not_safety_restrictions(
+    pilot: Pilot,
+) -> None:
+    """``_matching_pair_sets`` must scope proposal history per Center while
+    keeping block/report safety restrictions global.
+
+    A proposal recorded in another Center must never appear in this
+    Center's ``existing_pairs`` (no cross-Center existence affects
+    matching), but a block recorded anywhere must still appear in
+    ``restricted_pairs`` regardless of which Center is queried (global user
+    safety semantics remain correct).
+    """
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    pilot_center_id = admin.center_id
+    pilot_pair = tuple(sorted((member_a.id, member_b.id), key=str))
+
+    with sessions.session() as session, session.begin():
+        other_center_id = uuid.uuid4()
+        other_community_id = uuid.uuid4()
+        session.add(
+            CenterRecord(id=other_center_id, slug="other-center", name="Other Center")
+        )
+        session.add(
+            CommunityRecord(
+                id=other_community_id,
+                center_id=other_center_id,
+                slug="other-community",
+                name="Other Community",
+            )
+        )
+        other_a = UserRecord(
+            center_id=other_center_id,
+            oidc_issuer="https://accounts.google.com",
+            oidc_subject="other-a-sub",
+            email="other-a@example.com",
+            name="Other A",
+            role=Role.MEMBER.value,
+        )
+        other_b = UserRecord(
+            center_id=other_center_id,
+            oidc_issuer="https://accounts.google.com",
+            oidc_subject="other-b-sub",
+            email="other-b@example.com",
+            name="Other B",
+            role=Role.MEMBER.value,
+        )
+        session.add_all([other_a, other_b])
+        session.flush()
+        session.add(
+            MatchProposalRecord(
+                center_id=other_center_id,
+                community_id=other_community_id,
+                member_a_id=other_a.id,
+                member_b_id=other_b.id,
+                status="pending_review",
+                score=50.0,
+                score_breakdown=[],
+                counselor_a_decision="pending",
+                counselor_b_decision="pending",
+            )
+        )
+        # A safety restriction recorded in the *other* Center must still be
+        # visible from the pilot Center's perspective: block/report safety
+        # semantics are global by design.
+        session.add(
+            MemberBlockRecord(
+                center_id=other_center_id,
+                blocker_id=other_a.id,
+                blocked_id=other_b.id,
+                category="harassment",
+            )
+        )
+        other_pair = tuple(sorted((other_a.id, other_b.id), key=str))
+        other_center_id_value = other_center_id
+
+    repository = cast(SqlAlchemyPilotRepository, service._repository)
+    with sessions.session() as session:
+        pilot_existing, pilot_restricted = repository._matching_pair_sets(
+            session, pilot_center_id
+        )
+        other_existing, other_restricted = repository._matching_pair_sets(
+            session, other_center_id_value
+        )
+
+    # Proposal history is Center-scoped: the pilot Center never sees the
+    # other Center's proposal, and vice versa.
+    assert pilot_pair in pilot_existing
+    assert other_pair not in pilot_existing
+    assert other_pair in other_existing
+    assert pilot_pair not in other_existing
+
+    # Safety restrictions are global: the other Center's block is visible
+    # from both Center contexts.
+    assert other_pair in pilot_restricted
+    assert other_pair in other_restricted

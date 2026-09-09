@@ -1,6 +1,144 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
+
+## Active Milestone: Pilot Hardening
+
+**Goal:** Prove the closed pilot can be operated safely and recovered reliably
+before inviting 30-50 members.
+
+### Scope to finalize
+
+- Add an explicit enabled/disabled account state checked at every sign-in.
+  Authorized administrators can immediately disable or reactivate accounts with
+  a reason code and immutable audit/outbox event. Self-disable and disabling the
+  last active administrator are prohibited.
+- Reconcile administrator access against `MATCHWELL_ADMIN_EMAILS` on every
+  sign-in. Removing an address revokes access even when the stored role is
+  administrator; reactivation remains an explicit privileged action.
+- Fail closed when the OIDC `iss` claim is missing and document secure
+  `cookie_secret` generation and rotation.
+- Add cross-Center and role/resource authorization matrices covering member,
+  counselor, administrator, provider callback, list, detail, and mutation
+  surfaces. Fix the global matching exclusion queries and Center-scope webhook
+  diagnostics before multi-Center readiness.
+- Add PostgreSQL `pg_dump`/`pg_restore` scripts that refuse unsafe targets,
+  restore into a separate database, run migrations, and verify invariant row
+  counts without exposing sensitive content.
+- Add an automated PostgreSQL dump/restore drill to GitHub Actions plus an
+  operator runbook for backup ownership, retention, encryption, restore,
+  rollback, and evidence capture.
+- Add screening and Stripe provider-failure drills, privacy-safe failure queues,
+  retry/recovery procedures, and idempotency tests.
+- Add automated semantic/accessibility checks for critical Streamlit surfaces
+  plus a documented keyboard and screen-reader checklist. Remediate headings,
+  labels, status communication, focus order, contrast, and non-color cues found
+  by the audit.
+- Add structured JSON operational events with correlation IDs and sensitive-key
+  redaction. Do not log messages, reflections, screening details, assessment
+  answers, tokens, secrets, or webhook bodies.
+- Expand health reporting with safe application/database/migration readiness
+  signals and add alert-ready aggregate metrics for authentication failures,
+  provider failures, overdue operational queues, safety activity, and backup
+  drill age.
+- Add a Center-scoped administrator operations dashboard with privacy-safe
+  aggregate funnel counts and conversion rates from invitation through
+  readiness, introduction, active match, guided check-ins, and subscription.
+  Include aggregate safety signals and provider failures; no raw member export
+  or sensitive free text.
+- Constrain screening reason codes to a safe enum so provider or report details
+  cannot enter audit metadata.
+- Correct the encryption-at-rest documentation to distinguish application
+  behavior from PostgreSQL/hosting storage encryption, and add a launch checklist
+  requiring evidence from the selected host.
+- Make production migrations a separate operator/CI step and document a DML-only
+  runtime database role; production examples must not enable auto-migration.
+- Add security, accessibility, restore, provider-failure, observability, and
+  pilot-analytics launch evidence to the release-gate checklist.
+
+### Confirmed product and operational decisions
+
+- Immediate account disable is available to administrators, and removing an
+  administrator email from the allow-list revokes its access.
+- Monitoring consists of structured logs, an administrator operations
+  dashboard, safe health metrics, and alert/runbook definitions; no hosted
+  monitoring provider is added.
+- Backup readiness is proven by an automated PostgreSQL dump/restore CI drill
+  and an operator runbook.
+- Pilot analytics are aggregate funnel/conversion, safety-signal, and
+  provider-failure metrics only.
+- Accessibility is gated by automated semantic checks and a documented
+  keyboard/screen-reader checklist.
+
+### Validation
+
+- Account disable/reactivate, allow-list removal, last-admin protection, and
+  missing-issuer tests.
+- Full role/Center/IDOR matrix, including admin queues, matching exclusions,
+  webhook failures, messages, reflections, billing, and earnings.
+- PostgreSQL live migration plus dump/restore/invariant verification in CI.
+- Screening and Stripe failure/replay/recovery tests.
+- Structured-log redaction and correlation tests.
+- Health/metric stale-state, threshold, Center-scope, and privacy tests.
+- Pilot analytics accuracy and small-cell suppression tests.
+- Automated semantic/accessibility tests and completed manual checklist.
+- Dependency and configuration review, Docker build, Ruff, strict mypy, full
+  pytest coverage gate, package build, Streamlit/FastAPI smoke checks, and final
+  security review.
+
+### Delivery boundaries
+
+- Harden the existing Streamlit, FastAPI, and PostgreSQL pilot; do not introduce
+  the deferred target architecture.
+- Do not add Azure resources or deploy infrastructure in this milestone.
+- Use synthetic data only for tests, drills, exports, and documentation.
+
+**Implementation status:** Complete for everything achievable in this
+codebase/environment. Delivered: explicit account enabled/disabled state
+checked on every sign-in (fail closed before returning an actor);
+admin disable/reactivate with self-disable and last-active-administrator
+protection; bidirectional `MATCHWELL_ADMIN_EMAILS` reconciliation on every
+sign-in with no silent reactivation of a disabled account; fail-closed
+OIDC issuer handling in `app/main.py`; migration `20260909_0007`
+(account status, Center-scoped billing webhook receipts, screening
+event-receipt diagnostics with a constrained reason-code allow-list,
+`backup_drill_runs`); fixed `_matching_pair_sets` to scope proposal
+history per Center while keeping block/report safety restrictions global;
+Center-scoped billing/screening provider-failure diagnostics with the
+same idempotent receipt pattern; PowerShell and POSIX shell
+`pg_dump`/`pg_restore` operator scripts plus an automated GitHub Actions
+dump/restore/migrate/verify drill against synthetic data; structured JSON
+logging with correlation IDs and denylist-based redaction; expanded
+app/database/migration health reporting; an alert-ready metric evaluator
+and a Center-scoped administrator Dashboard with privacy-safe aggregate
+funnel/conversion analytics and small-cell-suppressed safety/provider
+counts; automated Streamlit `AppTest`-based semantic/accessibility checks;
+corrected encryption-at-rest documentation; production configuration
+examples now set `MATCHWELL_AUTO_MIGRATE = false` with a documented
+DML-only role and separate migration step; `compose.yaml` documented as
+local-development-only; and the backup, provider-failure, monitoring,
+accessibility, and pilot-launch-checklist runbooks. The `uv.lock` package
+index was investigated (see the launch checklist) and deliberately left
+unchanged because the alternative could not be validated end-to-end from
+this environment.
+
+Truthfully **not** completed here, and gated in
+`docs/security/pilot-launch-checklist.md` as explicit operator actions:
+a real production PostgreSQL restore drill, host encryption-at-rest
+evidence, production `cookie_secret` generation, provisioning a real
+DML-only database role, and the manual keyboard/screen-reader
+accessibility pass. These require real hosting infrastructure or a human
+operator and are intentionally not fabricated here.
+
+**Validation status:** Validated. Locally: 242 tests pass with
+95.44% coverage (≥90% gate), Ruff lint and formatting pass, strict mypy
+passes, offline PostgreSQL migration upgrade/downgrade/upgrade renders
+cleanly for the full history including `20260909_0007`, and the source and
+wheel packages build. The Streamlit health endpoint returns HTTP 200. Two
+focused implementation reviews and two security reviews were completed, and
+all findings were resolved. GitHub Actions passed the Python/PostgreSQL,
+container build, and synthetic backup/restore drill jobs. No production
+deployment was performed because deployment is outside this milestone.
 
 ## Active Milestone: Billing, Entitlements, and Counselor Earnings
 
@@ -122,12 +260,11 @@ of open matches/introductions/messaging/guided journeys on entitlement loss,
 exactly-once $25 intake credits, and member/counselor/admin Streamlit UI are
 implemented.
 
-**Validation status:** Local validation complete: 174 tests pass with 95.47%
-coverage, Ruff lint and formatting and strict mypy pass, PostgreSQL offline
-upgrade/downgrade SQL generation passes, source and wheel packages build, both
-Streamlit and FastAPI health endpoints return HTTP 200, and three focused
-reviews have been resolved. Live PostgreSQL migration and container validation
-remain for GitHub Actions.
+**Validation status:** Validated: 174 tests pass with 95.47% coverage, Ruff lint
+and formatting and strict mypy pass, PostgreSQL migration validation passes in
+GitHub Actions, source and wheel packages build, both Streamlit and FastAPI
+health endpoints return HTTP 200, the container build passes, and three focused
+reviews have been resolved.
 
 ## Active Milestone: Guided Matched-Pair Journey
 
@@ -854,7 +991,7 @@ remain an operator concern and are not provisioned by repository automation.
 
 ### Billing, entitlements, and counselor earnings validation
 
-- [ ] All validation checks pass
+- [x] All validation checks pass
   - [x] Ruff lint and formatting
   - [x] Strict mypy type checking
   - [x] Complete pytest suite with coverage threshold
@@ -862,7 +999,7 @@ remain an operator concern and are not provisioned by repository automation.
   - [x] Python source distribution and wheel build
   - [x] Streamlit and FastAPI health endpoint smoke verification
   - [x] Focused Stripe, entitlement, webhook, migration, and concurrency reviews
-  - [ ] GitHub Actions PostgreSQL and container jobs
+  - [x] GitHub Actions PostgreSQL and container jobs
 
 ### Phase 4: Future Azure Preparation
 
@@ -933,6 +1070,16 @@ remain an operator concern and are not provisioned by repository automation.
 | Billing Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-08 |
 | Billing webhook health | `GET /health` | HTTP 200 `ready` | 2026-09-08 |
 | Billing focused reviews | Three implementation and release reviews | All findings resolved | 2026-09-08 |
+| Billing CI | GitHub Actions `python` and `container` jobs | Pass | 2026-09-08 |
+| Pilot hardening lint and formatting | `ruff check`; `ruff format --check` | Pass | 2026-09-09 |
+| Pilot hardening types | `uv run mypy --strict src app scripts` | Pass | 2026-09-09 |
+| Pilot hardening tests | `uv run pytest -q` | 242 passed, 95.44% coverage | 2026-09-09 |
+| Pilot hardening migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-09 |
+| Pilot hardening package build | `uv build --out-dir dist` | Source distribution and wheel built | 2026-09-09 |
+| Pilot hardening Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-09 |
+| Pilot hardening reviews | Focused implementation and security reviews | All findings resolved | 2026-09-09 |
+| Pilot hardening Azure RBAC review | No Azure infrastructure in this milestone | Not applicable | 2026-09-09 |
+| Pilot hardening CI | GitHub Actions `python`, `container`, and `backup-restore-drill` jobs | Pass | 2026-09-09 |
 
 ### Functional verification
 

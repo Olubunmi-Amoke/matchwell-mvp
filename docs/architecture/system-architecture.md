@@ -105,6 +105,15 @@ explicit policy and consent model rather than removing Center filters.
 - Production data and secrets are prohibited from coding prompts and test
   fixtures.
 
+> **Pilot delivery note:** the bullets above describe the target
+> architecture. The current Streamlit/FastAPI/PostgreSQL pilot enforces
+> authorization, sensitive-field exclusion, screening-summary reduction,
+> and auditability today, but does not itself add row-level encryption at
+> rest, managed identities, or Blob storage -- those are provided (or not)
+> by the selected hosting/database host, and must be evidenced there. See
+> [Authorization and data handling](../security/authorization-and-data-handling.md#encryption-at-rest-application-behavior-vs-hosting-evidence)
+> and [the pilot launch checklist](../security/pilot-launch-checklist.md).
+
 See
 [Authorization and data handling](../security/authorization-and-data-handling.md)
 for mandatory controls.

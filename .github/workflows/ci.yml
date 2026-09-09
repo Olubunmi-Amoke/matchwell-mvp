@@ -58,6 +58,55 @@ jobs:
       - name: Test
         run: uv run --no-sync pytest
 
+  backup-restore-drill:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: matchwell_test
+          POSTGRES_USER: matchwell
+          POSTGRES_PASSWORD: matchwell_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U matchwell -d matchwell_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://matchwell:matchwell_test@localhost:5432/matchwell_test
+      RESTORE_DATABASE_URL: postgresql+psycopg://matchwell:matchwell_test@localhost:5432/matchwell_test_restore_drill
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --disable-pip-version-check uv==0.11.19
+          uv sync --frozen --extra dev
+
+      - name: Confirm PostgreSQL client tools are available
+        run: |
+          pg_dump --version
+          pg_restore --version
+          createdb --version
+          psql --version
+
+      - name: Migrate and seed the source database with synthetic data
+        run: |
+          uv run --no-sync alembic upgrade head
+          uv run --no-sync python scripts/backup/seed_synthetic_data.py
+
+      - name: Create backup
+        run: bash scripts/backup/pg-dump.sh /tmp/matchwell-ci-drill.dump
+
+      - name: Restore into a separate, explicitly named database and verify
+        run: bash scripts/backup/pg-restore.sh /tmp/matchwell-ci-drill.dump --compare-source
+
   container:
     runs-on: ubuntu-latest
     steps:

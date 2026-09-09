@@ -9,10 +9,26 @@ from sqlalchemy.orm import Session
 
 from matchwell.application.pilot import PaymentGateway
 from matchwell.domain.access import (
+    AccountStatus,
     AuthenticatedUser,
     OidcIdentity,
     Role,
     normalize_email,
+)
+from matchwell.domain.alerts import (
+    AlertSnapshot,
+    evaluate_auth_failures,
+    evaluate_backup_drill_age,
+    evaluate_overdue_queues,
+    evaluate_provider_failures,
+    evaluate_safety_activity,
+)
+from matchwell.domain.analytics import (
+    FunnelSnapshot,
+    PilotAnalyticsSnapshot,
+    ProviderFailureSnapshot,
+    SafetySnapshot,
+    suppress_small_cell,
 )
 from matchwell.domain.billing import (
     BILLING_SYSTEM_ACTOR_ID,
@@ -31,7 +47,12 @@ from matchwell.domain.billing import (
     SubscriptionStatus,
     WebhookFailureView,
 )
-from matchwell.domain.errors import ConflictError, NotFoundError, ValidationError
+from matchwell.domain.errors import (
+    AccountDisabledError,
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+)
 from matchwell.domain.journey import (
     PILOT_CURRICULUM_KEY,
     CheckInMilestone,
@@ -67,6 +88,8 @@ from matchwell.domain.matching import (
     ReportInput,
 )
 from matchwell.domain.pilot import (
+    SCREENING_SYSTEM_ACTOR_ID,
+    AccountRow,
     AssessmentAnswers,
     AssessmentQuestion,
     AssessmentView,
@@ -77,6 +100,9 @@ from matchwell.domain.pilot import (
     MemberProgress,
     OperationsMember,
     ProfileInput,
+    ScreeningFailureView,
+    ScreeningProviderEvent,
+    ScreeningReasonCode,
     ScreeningStatus,
 )
 from matchwell.domain.readiness import (
@@ -89,6 +115,7 @@ from matchwell.infrastructure.persistence.models import (
     AssessmentAssignmentRecord,
     AssessmentDefinitionRecord,
     AuditEventRecord,
+    BackupDrillRunRecord,
     BillingCustomerRecord,
     BillingWebhookReceiptRecord,
     CenterRecord,
@@ -161,7 +188,26 @@ class SqlAlchemyPilotRepository:
                 )
             )
             if existing is not None:
+                # Disabled accounts are checked first and fail closed before
+                # any role reconciliation or actor is ever returned. Adding
+                # the email back to MATCHWELL_ADMIN_EMAILS never reactivates
+                # a disabled account -- that remains an explicit privileged
+                # administrator action (see reactivate_account).
+                if existing.status == AccountStatus.DISABLED.value:
+                    self._audit(
+                        session,
+                        actor_id=existing.id,
+                        action="identity.sign_in_denied_disabled",
+                        subject_id=existing.id,
+                        center_id=existing.center_id,
+                        metadata={"reason_code": existing.disabled_reason_code},
+                    )
+                    raise AccountDisabledError(
+                        "This account has been disabled. Contact a pilot "
+                        "administrator if you believe this is an error."
+                    )
                 existing.name = identity.name.strip() or existing.name
+                self._reconcile_admin_access(session, existing, admin_emails)
                 return self._user(existing)
 
             center = self._pilot_center(session)
@@ -191,6 +237,7 @@ class SqlAlchemyPilotRepository:
                 email=email,
                 name=identity.name.strip() or email,
                 role=role.value,
+                status=AccountStatus.ACTIVE.value,
             )
             session.add(user)
             session.flush()
@@ -222,6 +269,234 @@ class SqlAlchemyPilotRepository:
                 session.flush()
                 self._reevaluate(session, user.id, user.id)
             return self._user(user)
+
+    def _reconcile_admin_access(
+        self,
+        session: Session,
+        user: UserRecord,
+        admin_emails: frozenset[str],
+    ) -> None:
+        """Reconcile stored admin role against ``MATCHWELL_ADMIN_EMAILS``.
+
+        Runs on every sign-in of an active account. Removing an email from
+        the allow-list revokes admin access even though the stored role
+        still says admin; adding it back grants admin access again. Neither
+        direction ever touches ``status`` -- a disabled account is handled
+        entirely by the caller before this runs.
+        """
+        is_admin = user.email in admin_emails
+        stored_role = Role(user.role)
+        if stored_role is Role.ADMIN and not is_admin:
+            invited_role = session.scalar(
+                select(InvitationRecord.role)
+                .where(InvitationRecord.accepted_by_user_id == user.id)
+                .order_by(InvitationRecord.accepted_at.desc())
+            )
+            restored_role = (
+                Role(invited_role)
+                if invited_role in {Role.MEMBER.value, Role.COUNSELOR.value}
+                else Role.MEMBER
+            )
+            user.role = restored_role.value
+            self._audit(
+                session,
+                actor_id=user.id,
+                action="identity.admin_access_revoked",
+                subject_id=user.id,
+                center_id=user.center_id,
+                metadata={
+                    "reason": "email_removed_from_allowlist",
+                    "restored_role": restored_role.value,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="identity.admin_access_revoked",
+                    payload={"user_id": str(user.id)},
+                )
+            )
+        elif stored_role is not Role.ADMIN and is_admin:
+            user.role = Role.ADMIN.value
+            self._audit(
+                session,
+                actor_id=user.id,
+                action="identity.admin_access_granted",
+                subject_id=user.id,
+                center_id=user.center_id,
+                metadata={
+                    "reason": "email_added_to_allowlist",
+                    "previous_role": stored_role.value,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="identity.admin_access_granted",
+                    payload={"user_id": str(user.id)},
+                )
+            )
+
+    def disable_account(
+        self,
+        actor: AuthenticatedUser,
+        target_user_id: uuid.UUID,
+        reason_code: str,
+        admin_emails: frozenset[str],
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            if target_user_id == actor.id:
+                raise ValidationError(
+                    "An administrator cannot disable their own account."
+                )
+            target = session.scalar(
+                select(UserRecord)
+                .where(
+                    UserRecord.id == target_user_id,
+                    UserRecord.center_id == actor.center_id,
+                )
+                .with_for_update()
+            )
+            if target is None:
+                raise NotFoundError("The account was not found in this Center.")
+            if target.status == AccountStatus.DISABLED.value:
+                raise ConflictError("This account is already disabled.")
+            if target.role == Role.ADMIN.value:
+                active_admins = session.scalar(
+                    select(func.count(UserRecord.id)).where(
+                        UserRecord.center_id == actor.center_id,
+                        UserRecord.role == Role.ADMIN.value,
+                        UserRecord.status == AccountStatus.ACTIVE.value,
+                        UserRecord.email.in_(admin_emails),
+                    )
+                )
+                if (active_admins or 0) <= 1:
+                    raise ConflictError(
+                        "The last active administrator in this Center cannot "
+                        "be disabled."
+                    )
+            now = self._now()
+            target.status = AccountStatus.DISABLED.value
+            target.disabled_reason_code = reason_code
+            target.disabled_at = now
+            target.disabled_by_id = actor.id
+            if target.role == Role.MEMBER.value:
+                self._close_open_proposals_for_member(
+                    session,
+                    target.id,
+                    actor.id,
+                    "account_disabled",
+                )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="account.disabled",
+                subject_id=target.id,
+                center_id=actor.center_id,
+                metadata={"reason_code": reason_code, "role": target.role},
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="account.disabled",
+                    payload={
+                        "user_id": str(target.id),
+                        "center_id": str(actor.center_id),
+                        "role": target.role,
+                        "reason_code": reason_code,
+                    },
+                )
+            )
+
+    def reactivate_account(
+        self,
+        actor: AuthenticatedUser,
+        target_user_id: uuid.UUID,
+        reason_code: str,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            target = session.scalar(
+                select(UserRecord)
+                .where(
+                    UserRecord.id == target_user_id,
+                    UserRecord.center_id == actor.center_id,
+                )
+                .with_for_update()
+            )
+            if target is None:
+                raise NotFoundError("The account was not found in this Center.")
+            if target.status != AccountStatus.DISABLED.value:
+                raise ConflictError("This account is not currently disabled.")
+            now = self._now()
+            target.status = AccountStatus.ACTIVE.value
+            target.reactivated_reason_code = reason_code
+            target.reactivated_at = now
+            target.reactivated_by_id = actor.id
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="account.reactivated",
+                subject_id=target.id,
+                center_id=actor.center_id,
+                metadata={"reason_code": reason_code, "role": target.role},
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="account.reactivated",
+                    payload={
+                        "user_id": str(target.id),
+                        "center_id": str(actor.center_id),
+                        "role": target.role,
+                        "reason_code": reason_code,
+                    },
+                )
+            )
+
+    def list_accounts(self, actor: AuthenticatedUser) -> Sequence[AccountRow]:
+        with self._sessions.session() as session, session.begin():
+            records = session.scalars(
+                select(UserRecord)
+                .where(UserRecord.center_id == actor.center_id)
+                .order_by(UserRecord.role, UserRecord.name)
+            ).all()
+            rows = [
+                AccountRow(
+                    id=record.id,
+                    email=record.email,
+                    display_name=record.name,
+                    role=Role(record.role),
+                    status=AccountStatus(record.status),
+                    disabled_reason_code=record.disabled_reason_code,
+                    disabled_at=record.disabled_at,
+                    is_self=record.id == actor.id,
+                    counselor_needs_reassignment=(
+                        record.role == Role.COUNSELOR.value
+                        and record.status == AccountStatus.DISABLED.value
+                        and self._counselor_has_active_members(session, record.id)
+                    ),
+                )
+                for record in records
+            ]
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="admin.account_queue_accessed",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={"record_count": len(rows)},
+            )
+            return rows
+
+    @staticmethod
+    def _counselor_has_active_members(
+        session: Session, counselor_id: uuid.UUID
+    ) -> bool:
+        return (
+            session.scalar(
+                select(CounselorAssignmentRecord.id).where(
+                    CounselorAssignmentRecord.counselor_id == counselor_id,
+                    CounselorAssignmentRecord.ended_at.is_(None),
+                )
+            )
+            is not None
+        )
 
     def get_active_consent(self, member_id: uuid.UUID) -> ConsentView:
         with self._sessions.session() as session:
@@ -847,7 +1122,7 @@ class SqlAlchemyPilotRepository:
         status: ScreeningStatus,
         provider_event_id: str,
         provider_reference: str,
-        reason_code: str | None,
+        reason_code: ScreeningReasonCode | None,
     ) -> bool:
         provider = "manual-pilot"
         with self._sessions.session() as session, session.begin():
@@ -858,12 +1133,17 @@ class SqlAlchemyPilotRepository:
                         ScreeningEventReceiptRecord(
                             provider=provider,
                             provider_event_id=provider_event_id,
+                            member_id=member_id,
+                            center_id=actor.center_id,
+                            event_type="status_update",
+                            applied=True,
                         )
                     )
                     session.flush()
             except IntegrityError:
                 return False
             now = self._now()
+            reason_value = reason_code.value if reason_code is not None else None
             case = session.scalar(
                 select(ScreeningCaseRecord).where(
                     ScreeningCaseRecord.member_id == member_id
@@ -875,7 +1155,7 @@ class SqlAlchemyPilotRepository:
                     provider=provider,
                     provider_reference=provider_reference,
                     status=status.value,
-                    reason_code=reason_code,
+                    reason_code=reason_value,
                     requested_at=now,
                     updated_at=now,
                 )
@@ -883,7 +1163,7 @@ class SqlAlchemyPilotRepository:
             else:
                 case.provider_reference = provider_reference
                 case.status = status.value
-                case.reason_code = reason_code
+                case.reason_code = reason_value
                 case.updated_at = now
             case.expires_at = (
                 now + timedelta(days=365)
@@ -899,13 +1179,514 @@ class SqlAlchemyPilotRepository:
                 metadata={
                     "provider": provider,
                     "status": status.value,
-                    "reason_code": reason_code,
+                    "reason_code": reason_value,
                     "event_id": provider_event_id,
                 },
             )
             session.flush()
             self._reevaluate(session, member_id, actor.id)
             return True
+
+    def process_screening_provider_event(
+        self,
+        event: ScreeningProviderEvent,
+    ) -> bool:
+        """Idempotently process a normalized screening provider callback.
+
+        Mirrors ``process_billing_webhook_event``: a receipt is always
+        recorded first (duplicates are acknowledged without reprocessing),
+        an unrecognized event type is recorded unapplied, and a reference
+        that cannot be resolved to a member is recorded unapplied with a
+        safe reason code. Never stores a screening report or free text.
+        """
+        with self._sessions.session() as session, session.begin():
+            receipt = ScreeningEventReceiptRecord(
+                provider=event.provider,
+                provider_event_id=event.provider_event_id,
+                event_type=(
+                    event.status.value if event.status is not None else "unrecognized"
+                ),
+                applied=False,
+                unresolved_reason=(
+                    None
+                    if event.status is not None
+                    else ScreeningReasonCode.OTHER_OPERATIONAL.value
+                ),
+            )
+            try:
+                with session.begin_nested():
+                    session.add(receipt)
+                    session.flush()
+            except IntegrityError:
+                return False
+
+            if event.status is None or event.provider_reference is None:
+                return True
+
+            case = session.scalar(
+                select(ScreeningCaseRecord).where(
+                    ScreeningCaseRecord.provider_reference == event.provider_reference
+                )
+            )
+            if case is None:
+                receipt.unresolved_reason = "manual_review_required"
+                session.flush()
+                return True
+
+            receipt.member_id = case.member_id
+            receipt.center_id = self._member_center_id(session, case.member_id)
+            now = self._now()
+            case.status = event.status.value
+            case.reason_code = (
+                event.reason_code.value if event.reason_code is not None else None
+            )
+            case.updated_at = now
+            case.expires_at = (
+                now + timedelta(days=365)
+                if event.status is ScreeningStatus.ELIGIBLE
+                else None
+            )
+            receipt.applied = True
+            receipt.unresolved_reason = None
+            self._audit(
+                session,
+                actor_id=SCREENING_SYSTEM_ACTOR_ID,
+                action="screening.status_recorded",
+                subject_id=case.member_id,
+                center_id=receipt.center_id,
+                metadata={
+                    "provider": event.provider,
+                    "status": event.status.value,
+                    "reason_code": case.reason_code,
+                    "event_id": event.provider_event_id,
+                },
+            )
+            session.flush()
+            self._reevaluate(session, case.member_id, SCREENING_SYSTEM_ACTOR_ID)
+            return True
+
+    def screening_failures(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[ScreeningFailureView]:
+        """Unapplied screening receipts an admin can triage.
+
+        Scoped to the admin's own Center, same as billing webhook failures.
+        A receipt that never resolved to a member has ``center_id IS NULL``
+        and is therefore never returned to any Center admin here.
+        """
+        with self._sessions.session() as session, session.begin():
+            rows = session.scalars(
+                select(ScreeningEventReceiptRecord)
+                .where(
+                    ScreeningEventReceiptRecord.applied.is_(False),
+                    ScreeningEventReceiptRecord.center_id == actor.center_id,
+                )
+                .order_by(ScreeningEventReceiptRecord.received_at.desc())
+            ).all()
+            views = [
+                ScreeningFailureView(
+                    id=row.id,
+                    provider=row.provider,
+                    provider_event_id=row.provider_event_id,
+                    event_type=row.event_type,
+                    member_id=row.member_id,
+                    unresolved_reason=row.unresolved_reason,
+                    received_at=row.received_at,
+                )
+                for row in rows
+            ]
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="screening.failures_accessed",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={"record_count": len(views)},
+            )
+            return views
+
+    def analytics_snapshot(
+        self,
+        actor: AuthenticatedUser,
+    ) -> PilotAnalyticsSnapshot:
+        """Center-scoped, privacy-safe aggregate funnel/safety/provider
+        counts. No raw member export, free text, or content of any kind is
+        ever read here -- every value is a ``COUNT(*)``."""
+        with self._sessions.session() as session, session.begin():
+            center_id = actor.center_id
+            member_ids = select(UserRecord.id).where(
+                UserRecord.center_id == center_id,
+                UserRecord.role == Role.MEMBER.value,
+                UserRecord.status == AccountStatus.ACTIVE.value,
+            )
+
+            def _count(statement: Any) -> int:
+                return session.scalar(statement) or 0
+
+            invitations_sent = _count(
+                select(func.count()).select_from(
+                    select(InvitationRecord.id)
+                    .where(InvitationRecord.center_id == center_id)
+                    .subquery()
+                )
+            )
+            accounts_created = _count(
+                select(func.count()).select_from(member_ids.subquery())
+            )
+            profile_completed = _count(
+                select(func.count(func.distinct(MemberProfileRecord.user_id))).where(
+                    MemberProfileRecord.user_id.in_(member_ids)
+                )
+            )
+            consent_accepted = _count(
+                select(
+                    func.count(func.distinct(ConsentAcceptanceRecord.user_id))
+                ).where(ConsentAcceptanceRecord.user_id.in_(member_ids))
+            )
+            assessment_completed = _count(
+                select(
+                    func.count(func.distinct(AssessmentAssignmentRecord.member_id))
+                ).where(
+                    AssessmentAssignmentRecord.member_id.in_(member_ids),
+                    AssessmentAssignmentRecord.completed_at.isnot(None),
+                )
+            )
+            counselor_assigned = _count(
+                select(
+                    func.count(func.distinct(CounselorAssignmentRecord.member_id))
+                ).where(
+                    CounselorAssignmentRecord.member_id.in_(member_ids),
+                    CounselorAssignmentRecord.ended_at.is_(None),
+                )
+            )
+            screening_eligible = _count(
+                select(func.count(func.distinct(ScreeningCaseRecord.member_id))).where(
+                    ScreeningCaseRecord.member_id.in_(member_ids),
+                    ScreeningCaseRecord.status == "eligible",
+                )
+            )
+            subscription_ready = _count(
+                select(func.count()).select_from(
+                    select(SubscriptionRecord.id)
+                    .where(
+                        SubscriptionRecord.center_id == center_id,
+                        SubscriptionRecord.status.in_(
+                            (
+                                SubscriptionStatus.ACTIVE.value,
+                                SubscriptionStatus.GRACE.value,
+                                SubscriptionStatus.COMPLIMENTARY.value,
+                            )
+                        ),
+                    )
+                    .subquery()
+                )
+            )
+            latest_readiness = (
+                select(
+                    ReadinessDecisionRecord.member_id,
+                    func.max(ReadinessDecisionRecord.evaluated_at).label("max_at"),
+                )
+                .where(ReadinessDecisionRecord.member_id.in_(member_ids))
+                .group_by(ReadinessDecisionRecord.member_id)
+                .subquery()
+            )
+            community_eligible = _count(
+                select(func.count())
+                .select_from(ReadinessDecisionRecord)
+                .join(
+                    latest_readiness,
+                    and_(
+                        ReadinessDecisionRecord.member_id
+                        == latest_readiness.c.member_id,
+                        ReadinessDecisionRecord.evaluated_at
+                        == latest_readiness.c.max_at,
+                    ),
+                )
+                .where(ReadinessDecisionRecord.eligible.is_(True))
+            )
+            proposals_generated = _count(
+                select(func.count()).select_from(
+                    select(MatchProposalRecord.id)
+                    .where(MatchProposalRecord.center_id == center_id)
+                    .subquery()
+                )
+            )
+            introductions_awaiting_response = _count(
+                select(func.count()).select_from(
+                    select(MatchProposalRecord.id)
+                    .where(
+                        MatchProposalRecord.center_id == center_id,
+                        MatchProposalRecord.status == ProposalStatus.INTRODUCED.value,
+                    )
+                    .subquery()
+                )
+            )
+            active_matches = _count(
+                select(func.count()).select_from(
+                    select(MatchProposalRecord.id)
+                    .where(
+                        MatchProposalRecord.center_id == center_id,
+                        MatchProposalRecord.status == ProposalStatus.ACTIVE.value,
+                    )
+                    .subquery()
+                )
+            )
+            guided_journeys_started = _count(
+                select(func.count()).select_from(
+                    select(PairJourneyRecord.id)
+                    .where(PairJourneyRecord.center_id == center_id)
+                    .subquery()
+                )
+            )
+            checkins_submitted = _count(
+                select(func.count()).select_from(
+                    select(JourneyCheckInRecord.id)
+                    .where(JourneyCheckInRecord.center_id == center_id)
+                    .subquery()
+                )
+            )
+            blocks = _count(
+                select(func.count()).select_from(
+                    select(MemberBlockRecord.id)
+                    .where(MemberBlockRecord.center_id == center_id)
+                    .subquery()
+                )
+            )
+            reports = _count(
+                select(func.count()).select_from(
+                    select(MemberReportRecord.id)
+                    .where(MemberReportRecord.center_id == center_id)
+                    .subquery()
+                )
+            )
+            active_holds = _count(
+                select(func.count()).select_from(
+                    select(HoldRecord.id)
+                    .where(
+                        HoldRecord.center_context_id == center_id,
+                        HoldRecord.released_at.is_(None),
+                    )
+                    .subquery()
+                )
+            )
+            billing_failures = _count(
+                select(func.count()).select_from(
+                    select(BillingWebhookReceiptRecord.id)
+                    .where(
+                        BillingWebhookReceiptRecord.applied.is_(False),
+                        BillingWebhookReceiptRecord.center_id == center_id,
+                    )
+                    .subquery()
+                )
+            )
+            screening_failure_count = _count(
+                select(func.count()).select_from(
+                    select(ScreeningEventReceiptRecord.id)
+                    .where(
+                        ScreeningEventReceiptRecord.applied.is_(False),
+                        ScreeningEventReceiptRecord.center_id == center_id,
+                    )
+                    .subquery()
+                )
+            )
+
+            snapshot = PilotAnalyticsSnapshot(
+                funnel=FunnelSnapshot(
+                    invitations_sent=invitations_sent,
+                    accounts_created=accounts_created,
+                    profile_completed=profile_completed,
+                    consent_accepted=consent_accepted,
+                    assessment_completed=assessment_completed,
+                    counselor_assigned=counselor_assigned,
+                    screening_eligible=screening_eligible,
+                    subscription_ready=subscription_ready,
+                    community_eligible=community_eligible,
+                    proposals_generated=proposals_generated,
+                    introductions_awaiting_response=introductions_awaiting_response,
+                    active_matches=active_matches,
+                    guided_journeys_started=guided_journeys_started,
+                    checkins_submitted=checkins_submitted,
+                ),
+                safety=SafetySnapshot(
+                    blocks=suppress_small_cell(blocks),
+                    reports=suppress_small_cell(reports),
+                    active_holds=suppress_small_cell(active_holds),
+                ),
+                provider_failures=ProviderFailureSnapshot(
+                    billing_webhook_failures=suppress_small_cell(billing_failures),
+                    screening_failures=suppress_small_cell(screening_failure_count),
+                ),
+            )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="admin.analytics_accessed",
+                subject_id=actor.id,
+                center_id=center_id,
+                metadata={},
+            )
+            return snapshot
+
+    def alert_snapshot(self, actor: AuthenticatedUser) -> AlertSnapshot:
+        """Alert-ready aggregate metrics evaluated against real,
+        DB-queryable signals only. No hosted monitoring provider is added;
+        this is what the admin dashboard renders in its place."""
+        with self._sessions.session() as session, session.begin():
+            center_id = actor.center_id
+            now = self._now()
+
+            denied_sign_ins = (
+                session.scalar(
+                    select(func.count()).select_from(
+                        select(AuditEventRecord.id)
+                        .where(
+                            AuditEventRecord.center_id == center_id,
+                            AuditEventRecord.action
+                            == "identity.sign_in_denied_disabled",
+                            AuditEventRecord.occurred_at >= now - timedelta(hours=24),
+                        )
+                        .subquery()
+                    )
+                )
+                or 0
+            )
+            billing_failures = (
+                session.scalar(
+                    select(func.count()).select_from(
+                        select(BillingWebhookReceiptRecord.id)
+                        .where(
+                            BillingWebhookReceiptRecord.applied.is_(False),
+                            BillingWebhookReceiptRecord.center_id == center_id,
+                        )
+                        .subquery()
+                    )
+                )
+                or 0
+            )
+            screening_failure_count = (
+                session.scalar(
+                    select(func.count()).select_from(
+                        select(ScreeningEventReceiptRecord.id)
+                        .where(
+                            ScreeningEventReceiptRecord.applied.is_(False),
+                            ScreeningEventReceiptRecord.center_id == center_id,
+                        )
+                        .subquery()
+                    )
+                )
+                or 0
+            )
+            overdue_check_ins = self._overdue_check_in_count(session, center_id, now)
+            recent_safety_events = (
+                session.scalar(
+                    select(func.count()).select_from(
+                        select(MemberBlockRecord.id)
+                        .where(
+                            MemberBlockRecord.center_id == center_id,
+                            MemberBlockRecord.created_at >= now - timedelta(days=7),
+                        )
+                        .subquery()
+                    )
+                )
+                or 0
+            ) + (
+                session.scalar(
+                    select(func.count()).select_from(
+                        select(MemberReportRecord.id)
+                        .where(
+                            MemberReportRecord.center_id == center_id,
+                            MemberReportRecord.created_at >= now - timedelta(days=7),
+                        )
+                        .subquery()
+                    )
+                )
+                or 0
+            )
+            latest_drill_at = session.scalar(
+                select(func.max(BackupDrillRunRecord.performed_at)).where(
+                    BackupDrillRunRecord.verification_passed.is_(True)
+                )
+            )
+            drill_age_days = (
+                (now - latest_drill_at).days if latest_drill_at is not None else None
+            )
+
+            metrics = (
+                evaluate_auth_failures(denied_sign_ins),
+                evaluate_provider_failures(billing_failures + screening_failure_count),
+                evaluate_overdue_queues(overdue_check_ins),
+                evaluate_safety_activity(recent_safety_events),
+                evaluate_backup_drill_age(drill_age_days),
+            )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="admin.alerts_accessed",
+                subject_id=actor.id,
+                center_id=center_id,
+                metadata={"overall_status": AlertSnapshot(metrics).overall_status},
+            )
+            return AlertSnapshot(metrics=metrics)
+
+    @staticmethod
+    def _overdue_check_in_count(
+        session: Session,
+        center_id: uuid.UUID,
+        now: datetime,
+    ) -> int:
+        """Count overdue per-member check-ins across every active pair
+        journey in this Center.
+
+        Two grouped queries (journeys+proposals, then check-ins), not a
+        per-member round trip, using the same ``reminder_state`` due-date
+        logic as the member/counselor journey views.
+        """
+        journey_rows = session.execute(
+            select(
+                PairJourneyRecord.id,
+                PairJourneyRecord.started_at,
+                MatchProposalRecord.member_a_id,
+                MatchProposalRecord.member_b_id,
+            )
+            .join(
+                MatchProposalRecord,
+                MatchProposalRecord.id == PairJourneyRecord.proposal_id,
+            )
+            .where(
+                PairJourneyRecord.center_id == center_id,
+                MatchProposalRecord.status == ProposalStatus.ACTIVE.value,
+            )
+        ).all()
+        if not journey_rows:
+            return 0
+        journey_ids = [row.id for row in journey_rows]
+        submitted = {
+            (row.journey_id, row.member_id, row.milestone)
+            for row in session.execute(
+                select(
+                    JourneyCheckInRecord.journey_id,
+                    JourneyCheckInRecord.member_id,
+                    JourneyCheckInRecord.milestone,
+                ).where(JourneyCheckInRecord.journey_id.in_(journey_ids))
+            )
+        }
+        overdue = 0
+        for journey_id, started_at, member_a_id, member_b_id in journey_rows:
+            for member_id in (member_a_id, member_b_id):
+                for milestone in CheckInMilestone:
+                    due_at = started_at + timedelta(days=milestone.days)
+                    already_submitted = (
+                        journey_id,
+                        member_id,
+                        milestone.value,
+                    ) in submitted
+                    submitted_at = now if already_submitted else None
+                    if reminder_state(due_at, submitted_at, now) is (
+                        ReminderState.OVERDUE
+                    ):
+                        overdue += 1
+        return overdue
 
     def apply_hold(
         self,
@@ -1033,6 +1814,7 @@ class SqlAlchemyPilotRepository:
                 .where(
                     UserRecord.center_id == actor.center_id,
                     UserRecord.role == Role.MEMBER.value,
+                    UserRecord.status == AccountStatus.ACTIVE.value,
                 )
                 .with_for_update()
             ).all()
@@ -1045,7 +1827,9 @@ class SqlAlchemyPilotRepository:
                 )
                 if evidence is not None:
                     evidences.append(evidence)
-            existing_pairs, restricted_pairs = self._matching_pair_sets(session)
+            existing_pairs, restricted_pairs = self._matching_pair_sets(
+                session, actor.center_id
+            )
             scored_pairs: list[tuple[float, CandidateEvidence, CandidateEvidence]] = []
             for index, candidate_a in enumerate(evidences):
                 for candidate_b in evidences[index + 1 :]:
@@ -1136,6 +1920,7 @@ class SqlAlchemyPilotRepository:
                 .where(
                     UserRecord.center_id == actor.center_id,
                     UserRecord.role == Role.MEMBER.value,
+                    UserRecord.status == AccountStatus.ACTIVE.value,
                 )
                 .order_by(UserRecord.name)
             ).all()
@@ -1165,7 +1950,9 @@ class SqlAlchemyPilotRepository:
                     )
                 )
 
-            existing_pairs, restricted_pairs = self._matching_pair_sets(session)
+            existing_pairs, restricted_pairs = self._matching_pair_sets(
+                session, actor.center_id
+            )
             evidences = tuple(evidence_by_member.values())
             pair_diagnostics: list[CandidatePairDiagnostic] = []
             for index, candidate_a in enumerate(evidences):
@@ -1274,14 +2061,21 @@ class SqlAlchemyPilotRepository:
     def _matching_pair_sets(
         self,
         session: Session,
+        center_id: uuid.UUID,
     ) -> tuple[set[tuple[uuid.UUID, uuid.UUID]], set[tuple[uuid.UUID, uuid.UUID]]]:
+        # Proposal history is scoped to this Center: a proposal recorded in
+        # another Center must never block or otherwise affect candidate
+        # generation here. Blocks and reports are deliberately left
+        # unscoped: they are global user-safety restrictions on the pair of
+        # member IDs involved, and must hold regardless of which Center
+        # context matching happens to run in.
         existing_pairs = {
             self._pair_key(row[0], row[1])
             for row in session.execute(
                 select(
                     MatchProposalRecord.member_a_id,
                     MatchProposalRecord.member_b_id,
-                )
+                ).where(MatchProposalRecord.center_id == center_id)
             )
         }
         restricted_pairs = {
@@ -2278,11 +3072,20 @@ class SqlAlchemyPilotRepository:
         type, and a safe reason code are exposed. The raw payload, signature,
         and provider secrets are never stored on the receipt, so there is
         nothing sensitive to leak here.
+
+        Scoped to the admin's own Center. A receipt whose member/customer
+        could not be resolved has ``center_id IS NULL`` and is therefore
+        never returned to any Center admin here -- this pilot has no
+        platform-wide scope, so those events require direct engineering
+        investigation (see docs/runbooks/provider-failure-recovery.md).
         """
         with self._sessions.session() as session, session.begin():
             rows = session.scalars(
                 select(BillingWebhookReceiptRecord)
-                .where(BillingWebhookReceiptRecord.applied.is_(False))
+                .where(
+                    BillingWebhookReceiptRecord.applied.is_(False),
+                    BillingWebhookReceiptRecord.center_id == actor.center_id,
+                )
                 .order_by(BillingWebhookReceiptRecord.received_at.desc())
             ).all()
             views = [
@@ -2481,6 +3284,7 @@ class SqlAlchemyPilotRepository:
                 return True
 
             center_id = self._member_center_id(session, member_id)
+            receipt.center_id = center_id
             applied, reason = self._apply_billing_event(
                 session, member_id, center_id, event
             )
@@ -3407,6 +4211,14 @@ class SqlAlchemyPilotRepository:
             )
             is not None
         )
+        counselor_disabled = False
+        if assignment is not None:
+            counselor_status = session.scalar(
+                select(UserRecord.status).where(
+                    UserRecord.id == assignment.counselor_id
+                )
+            )
+            counselor_disabled = counselor_status == AccountStatus.DISABLED.value
         return OperationsMember(
             id=member.id,
             email=member.email,
@@ -3417,6 +4229,8 @@ class SqlAlchemyPilotRepository:
             screening_status=self._screening_status(session, member.id),
             hold_active=hold_active,
             readiness=readiness,
+            account_status=AccountStatus(member.status),
+            counselor_needs_reassignment=counselor_disabled,
         )
 
     def _counselor_status(

@@ -4,11 +4,15 @@ from datetime import date
 from typing import Protocol
 
 from matchwell.domain.access import (
+    AccountDisableReasonCode,
+    AccountReactivateReasonCode,
     AuthenticatedUser,
     OidcIdentity,
     Role,
     normalize_email,
 )
+from matchwell.domain.alerts import AlertSnapshot
+from matchwell.domain.analytics import PilotAnalyticsSnapshot
 from matchwell.domain.billing import (
     AdminBillingRow,
     BillingPortalSessionView,
@@ -48,6 +52,7 @@ from matchwell.domain.matching import (
     SafetyCategory,
 )
 from matchwell.domain.pilot import (
+    AccountRow,
     AssessmentAnswers,
     AssessmentView,
     ConsentView,
@@ -57,6 +62,9 @@ from matchwell.domain.pilot import (
     MemberProgress,
     OperationsMember,
     ProfileInput,
+    ScreeningFailureView,
+    ScreeningProviderEvent,
+    ScreeningReasonCode,
     ScreeningStatus,
 )
 
@@ -196,8 +204,37 @@ class PilotRepository(Protocol):
         status: ScreeningStatus,
         provider_event_id: str,
         provider_reference: str,
-        reason_code: str | None,
+        reason_code: ScreeningReasonCode | None,
     ) -> bool: ...
+
+    def screening_failures(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[ScreeningFailureView]: ...
+
+    def analytics_snapshot(
+        self,
+        actor: AuthenticatedUser,
+    ) -> PilotAnalyticsSnapshot: ...
+
+    def alert_snapshot(self, actor: AuthenticatedUser) -> AlertSnapshot: ...
+
+    def disable_account(
+        self,
+        actor: AuthenticatedUser,
+        target_user_id: uuid.UUID,
+        reason_code: str,
+        admin_emails: frozenset[str],
+    ) -> None: ...
+
+    def reactivate_account(
+        self,
+        actor: AuthenticatedUser,
+        target_user_id: uuid.UUID,
+        reason_code: str,
+    ) -> None: ...
+
+    def list_accounts(self, actor: AuthenticatedUser) -> Sequence[AccountRow]: ...
 
     def apply_hold(
         self,
@@ -382,6 +419,10 @@ class PilotRepository(Protocol):
     ) -> None: ...
 
     def process_billing_webhook_event(self, event: BillingWebhookEvent) -> bool: ...
+
+    def process_screening_provider_event(
+        self, event: ScreeningProviderEvent
+    ) -> bool: ...
 
 
 class PilotService:
@@ -576,7 +617,7 @@ class PilotService:
         status: ScreeningStatus,
         provider_event_id: str,
         provider_reference: str,
-        reason_code: str | None = None,
+        reason_code: ScreeningReasonCode | None = None,
     ) -> bool:
         self._require_role(actor, Role.ADMIN)
         if not provider_event_id.strip() or not provider_reference.strip():
@@ -589,6 +630,48 @@ class PilotService:
             provider_reference.strip(),
             reason_code,
         )
+
+    def screening_failures(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[ScreeningFailureView]:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.screening_failures(actor)
+
+    def analytics(self, actor: AuthenticatedUser) -> PilotAnalyticsSnapshot:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.analytics_snapshot(actor)
+
+    def alerts(self, actor: AuthenticatedUser) -> AlertSnapshot:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.alert_snapshot(actor)
+
+    def accounts(self, actor: AuthenticatedUser) -> Sequence[AccountRow]:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.list_accounts(actor)
+
+    def disable_account(
+        self,
+        actor: AuthenticatedUser,
+        target_user_id: uuid.UUID,
+        reason_code: AccountDisableReasonCode,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        self._repository.disable_account(
+            actor,
+            target_user_id,
+            reason_code.value,
+            self._admin_emails,
+        )
+
+    def reactivate_account(
+        self,
+        actor: AuthenticatedUser,
+        target_user_id: uuid.UUID,
+        reason_code: AccountReactivateReasonCode,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        self._repository.reactivate_account(actor, target_user_id, reason_code.value)
 
     def apply_hold(
         self,
@@ -924,6 +1007,9 @@ class PilotService:
 
     def process_billing_webhook_event(self, event: BillingWebhookEvent) -> bool:
         return self._repository.process_billing_webhook_event(event)
+
+    def process_screening_provider_event(self, event: ScreeningProviderEvent) -> bool:
+        return self._repository.process_screening_provider_event(event)
 
     @staticmethod
     def _require_role(actor: AuthenticatedUser, role: Role) -> None:
