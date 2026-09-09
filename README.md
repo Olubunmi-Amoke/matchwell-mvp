@@ -49,6 +49,12 @@ The Compose stack exposes Streamlit on port 7860 and PostgreSQL on port 5432.
 The checked-in password is for local development only; hosted environments must
 set `DATABASE_URL` and secrets through platform settings.
 
+Compose also defines a `webhook` service that runs the companion FastAPI
+Stripe webhook receiver (`uvicorn app.webhook_service:app`) on port 8000 from
+the same image and database. It only starts successfully once
+`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PILOT_PRICE_ID` are
+set; it is otherwise optional for local development.
+
 ### Hugging Face Spaces
 
 Create a Docker Space and push this repository to it. The README metadata,
@@ -61,6 +67,51 @@ Space storage is ephemeral.
 Import the repository into Replit. The `.replit` file starts Streamlit on
 `0.0.0.0:7860` and maps it to the public web port. Configure `DATABASE_URL`
 through Replit Secrets.
+
+### Billing, entitlements, and counselor earnings
+
+Matchwell offers one `Matchwell Pilot` plan at $49 USD/month through Stripe
+test-mode Checkout. An active subscription, or a payment failure within its
+seven-day grace period, is required to unlock the community and every later
+matching, introduction, messaging, and guided-journey feature. Existing
+members received a one-time complimentary entitlement when this milestone's
+migration ran; new members must complete Stripe Checkout.
+
+Configure billing with the `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
+`STRIPE_PILOT_PRICE_ID`, `MATCHWELL_CHECKOUT_SUCCESS_URL`,
+`MATCHWELL_CHECKOUT_CANCEL_URL`, `MATCHWELL_BILLING_PORTAL_RETURN_URL`, and
+`MATCHWELL_BILLING_GRACE_DAYS` settings (see `.env.example` and
+`.streamlit/secrets.toml.example`). Leaving them unset keeps billing disabled
+in the Streamlit app and fails explicitly rather than silently.
+
+Because Streamlit Community Cloud cannot receive verified POST requests,
+Stripe webhooks are handled by a narrowly scoped, independently deployable
+FastAPI companion service that shares the billing application layer and
+PostgreSQL database but has no UI:
+
+```powershell
+uv run uvicorn app.webhook_service:app --host 0.0.0.0 --port 8000
+```
+
+Configure its Stripe endpoint at `https://YOUR-WEBHOOK-HOST/webhooks/stripe`
+and point Stripe test-mode webhooks at
+`checkout.session.completed`, `customer.subscription.updated`,
+`customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed`, and
+`charge.refunded`. The service verifies every signature from the raw request
+body before parsing, processes each Stripe event ID exactly once, and exposes
+`GET /health` for platform health checks. It never logs Stripe secrets,
+payment instruments, or raw webhook bodies.
+
+Members manage only their own subscription from **Billing**: plan, normalized
+status, paid-through date, grace deadline, and safe checkout or
+manage-subscription actions. Administrators get a Center-scoped billing queue
+under **Pilot operations → Billing** for status review and reasoned
+complimentary grants or manual suspensions. The assigned counselor receives
+exactly one immutable $25 USD credit for a member's first completed intake
+decision; counselors review their own balance under **Earnings**, and
+administrators review every counselor's append-only ledger and record
+reasoned manual adjustments under **Pilot operations → Ledger**. Automated
+payout remains deferred for the pilot.
 
 ## Pilot sign-in and first-run setup
 
@@ -103,7 +154,8 @@ assessment. The user must sign out and back in to load the member workspace.
 
 ### Community matching and introductions
 
-Once a member reaches 7/7 readiness, they can complete matching preferences
+Once a member reaches 8/8 readiness (including an active or grace-period
+subscription entitlement), they can complete matching preferences
 (gender identity and acceptable partner age range) on the **Matching** page.
 Existing hosted members are never silently matching-eligible: preferences live
 in a separate, opt-in table, so nothing changes for a member until they submit

@@ -9,6 +9,16 @@ from matchwell.domain.access import (
     Role,
     normalize_email,
 )
+from matchwell.domain.billing import (
+    AdminBillingRow,
+    BillingPortalSessionView,
+    BillingWebhookEvent,
+    CheckoutSessionView,
+    CounselorEarningsView,
+    EntitlementView,
+    LedgerEntryView,
+    WebhookFailureView,
+)
 from matchwell.domain.errors import (
     AuthenticationError,
     AuthorizationError,
@@ -60,6 +70,36 @@ COUNSELOR_TO_MEMBER_REASON_CODES = (
     "account-role-correction",
     "pilot-staffing-change",
 )
+
+
+class PaymentGateway(Protocol):
+    """Injected boundary to the payment provider.
+
+    Keeping every Stripe-specific object behind this port lets repository and
+    service tests use deterministic fakes and keeps provider objects out of
+    the domain and other modules.
+    """
+
+    def create_checkout_session(
+        self,
+        *,
+        member_id: uuid.UUID,
+        member_email: str,
+        existing_provider_customer_id: str | None,
+    ) -> CheckoutSessionView: ...
+
+    def create_billing_portal_session(
+        self,
+        *,
+        provider_customer_id: str,
+    ) -> BillingPortalSessionView: ...
+
+    def verify_and_parse_webhook(
+        self,
+        *,
+        payload: bytes,
+        signature_header: str,
+    ) -> BillingWebhookEvent: ...
 
 
 class PilotRepository(Protocol):
@@ -289,6 +329,59 @@ class PilotRepository(Protocol):
         actor: AuthenticatedUser,
         report: ReportInput,
     ) -> None: ...
+
+    def billing_status(self, member_id: uuid.UUID) -> EntitlementView: ...
+
+    def create_checkout_session(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CheckoutSessionView: ...
+
+    def create_billing_portal_session(
+        self,
+        actor: AuthenticatedUser,
+    ) -> BillingPortalSessionView: ...
+
+    def billing_queue(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[AdminBillingRow]: ...
+
+    def billing_webhook_failures(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[WebhookFailureView]: ...
+
+    def grant_complimentary_entitlement(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: str,
+    ) -> None: ...
+
+    def suspend_entitlement(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: str,
+    ) -> None: ...
+
+    def counselor_earnings(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CounselorEarningsView: ...
+
+    def ledger(self, actor: AuthenticatedUser) -> Sequence[LedgerEntryView]: ...
+
+    def record_earnings_adjustment(
+        self,
+        actor: AuthenticatedUser,
+        counselor_id: uuid.UUID,
+        amount_minor_units: int,
+        reason_code: str,
+    ) -> None: ...
+
+    def process_billing_webhook_event(self, event: BillingWebhookEvent) -> bool: ...
 
 
 class PilotService:
@@ -743,6 +836,94 @@ class PilotService:
                 context=safe_context,
             ),
         )
+
+    def billing_status(self, actor: AuthenticatedUser) -> EntitlementView:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.billing_status(actor.id)
+
+    def create_checkout_session(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CheckoutSessionView:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.create_checkout_session(actor)
+
+    def create_billing_portal_session(
+        self,
+        actor: AuthenticatedUser,
+    ) -> BillingPortalSessionView:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.create_billing_portal_session(actor)
+
+    def billing_queue(self, actor: AuthenticatedUser) -> Sequence[AdminBillingRow]:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.billing_queue(actor)
+
+    def billing_webhook_failures(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[WebhookFailureView]:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.billing_webhook_failures(actor)
+
+    def grant_complimentary_entitlement(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: str,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        safe_reason = reason_code.strip()
+        if not safe_reason:
+            raise ValidationError("A safe reason code is required.")
+        self._repository.grant_complimentary_entitlement(
+            actor,
+            member_id,
+            safe_reason,
+        )
+
+    def suspend_entitlement(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: str,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        safe_reason = reason_code.strip()
+        if not safe_reason:
+            raise ValidationError("A safe reason code is required.")
+        self._repository.suspend_entitlement(actor, member_id, safe_reason)
+
+    def counselor_earnings(self, actor: AuthenticatedUser) -> CounselorEarningsView:
+        self._require_role(actor, Role.COUNSELOR)
+        return self._repository.counselor_earnings(actor)
+
+    def ledger(self, actor: AuthenticatedUser) -> Sequence[LedgerEntryView]:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.ledger(actor)
+
+    def record_earnings_adjustment(
+        self,
+        actor: AuthenticatedUser,
+        counselor_id: uuid.UUID,
+        amount_minor_units: int,
+        reason_code: str,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        safe_reason = reason_code.strip()
+        if not safe_reason:
+            raise ValidationError("A safe reason code is required.")
+        if amount_minor_units == 0:
+            raise ValidationError("Enter a non-zero adjustment amount.")
+        self._repository.record_earnings_adjustment(
+            actor,
+            counselor_id,
+            amount_minor_units,
+            safe_reason,
+        )
+
+    def process_billing_webhook_event(self, event: BillingWebhookEvent) -> bool:
+        return self._repository.process_billing_webhook_event(event)
 
     @staticmethod
     def _require_role(actor: AuthenticatedUser, role: Role) -> None:

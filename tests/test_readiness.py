@@ -16,6 +16,7 @@ def complete_evidence(**overrides: bool) -> ReadinessEvidence:
         "assessment_complete": True,
         "counselor_approved": True,
         "screening_eligible": True,
+        "subscription_active": True,
         "active_hold": False,
     }
     values.update(overrides)
@@ -63,6 +64,7 @@ def test_hold_overrides_complete_evidence() -> None:
         ({"assessment_complete": False}, ReadinessStage.ASSESSMENT),
         ({"counselor_approved": False}, ReadinessStage.COUNSELOR_INTAKE),
         ({"screening_eligible": False}, ReadinessStage.SCREENING),
+        ({"subscription_active": False}, ReadinessStage.BILLING),
     ],
 )
 def test_stage_tracks_first_unmet_requirement(
@@ -72,3 +74,12 @@ def test_stage_tracks_first_unmet_requirement(
     result = ReadinessEvaluator().evaluate(complete_evidence(**overrides))
 
     assert result.stage is expected
+
+
+def test_unsubscribed_member_is_ineligible_for_community_unlock() -> None:
+    result = ReadinessEvaluator().evaluate(complete_evidence(subscription_active=False))
+
+    assert not result.eligible
+    assert result.unmet_requirements == (RequirementCode.SUBSCRIPTION,)
+    assert result.explanations == ("Activate the Matchwell Pilot subscription",)
+    assert result.stage is ReadinessStage.BILLING

@@ -13,6 +13,7 @@ from matchwell.application.pilot import (
     PilotService,
 )
 from matchwell.domain.access import AuthenticatedUser, Role
+from matchwell.domain.billing import SubscriptionStatus
 from matchwell.domain.errors import MatchwellError
 from matchwell.domain.journey import ReminderState
 from matchwell.domain.matching import CounselorReviewDecision
@@ -22,6 +23,7 @@ from matchwell.domain.pilot import (
     OperationsMember,
     ScreeningStatus,
 )
+from matchwell.domain.readiness import TOTAL_ORDINARY_REQUIREMENTS
 from matchwell.presentation.theme import (
     Tone,
     humanize,
@@ -35,8 +37,22 @@ from matchwell.presentation.theme import (
 def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Pilot operations")
     st.caption("Task-oriented queues for the pilot Center.")
-    invitation_tab, members_tab, counselors_tab, matching_tab = st.tabs(
-        ["Invitations", "Member readiness", "Counselors", "Matching"]
+    (
+        invitation_tab,
+        members_tab,
+        counselors_tab,
+        matching_tab,
+        billing_tab,
+        ledger_tab,
+    ) = st.tabs(
+        [
+            "Invitations",
+            "Member readiness",
+            "Counselors",
+            "Matching",
+            "Billing",
+            "Ledger",
+        ]
     )
     with invitation_tab:
         _render_invitations(service, actor)
@@ -46,16 +62,21 @@ def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
         _render_counselor_operations(service, actor)
     with matching_tab:
         _render_admin_matching(service, actor)
+    with billing_tab:
+        _render_admin_billing(service, actor)
+    with ledger_tab:
+        _render_admin_ledger(service, actor)
 
 
 def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Counselor workspace")
-    intake_tab, matching_tab, activity_tab, journey_tab = st.tabs(
+    intake_tab, matching_tab, activity_tab, journey_tab, earnings_tab = st.tabs(
         [
             "Assigned members",
             "Matching review",
             "Match activity",
             "Guided journeys",
+            "Earnings",
         ]
     )
     with intake_tab:
@@ -66,6 +87,8 @@ def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
         _render_counselor_conversation_activity(service, actor)
     with journey_tab:
         _render_counselor_journeys(service, actor)
+    with earnings_tab:
+        _render_counselor_earnings(service, actor)
 
 
 def _render_counselor_intake(
@@ -84,7 +107,10 @@ def _render_counselor_intake(
     selected = _member_selector(members, "counselor-member")
     with st.container(border=True):
         render_eyebrow(f"Stage: {humanize(selected.readiness.stage.value)}")
-        st.write(f"**Readiness:** {selected.readiness_completed_count}/7")
+        st.write(
+            f"**Readiness:** {selected.readiness_completed_count}/"
+            f"{TOTAL_ORDINARY_REQUIREMENTS}"
+        )
         render_badges(
             [
                 (humanize(selected.screening_status.value), "info"),
@@ -329,7 +355,8 @@ def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> N
     st.subheader("Candidate generation")
     st.write(
         "Generate deterministic, explainable candidate proposals for every "
-        "7/7 community-eligible member who has completed matching "
+        f"{TOTAL_ORDINARY_REQUIREMENTS}/{TOTAL_ORDINARY_REQUIREMENTS} "
+        "community-eligible member who has completed matching "
         "preferences and has no open proposal. Assessment answers, "
         "screening details, and counselor notes are never used."
     )
@@ -565,7 +592,9 @@ def _render_member_operations(
             {
                 "Member": item.display_name,
                 "Email": item.email,
-                "Readiness": f"{item.readiness_completed_count}/7",
+                "Readiness": (
+                    f"{item.readiness_completed_count}/{TOTAL_ORDINARY_REQUIREMENTS}"
+                ),
                 "Stage": humanize(item.readiness.stage.value),
                 "Counselor": humanize(item.counselor_status.value),
                 "Screening": humanize(item.screening_status.value),
@@ -700,6 +729,225 @@ def _render_member_operations(
                         "and back in to open the counselor workspace."
                     )
                     st.rerun()
+
+
+def _render_admin_billing(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.subheader("Center billing queue")
+    st.caption(
+        "Normalized subscription status only. Payment instruments are never "
+        "stored or displayed here."
+    )
+    try:
+        rows = service.billing_queue(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not rows:
+        render_empty_state("Invite a member to begin the pilot journey.")
+    else:
+        attention = sum(
+            1
+            for row in rows
+            if row.status in (SubscriptionStatus.GRACE, SubscriptionStatus.SUSPENDED)
+        )
+        if attention:
+            st.warning(f"{attention} member(s) are in payment grace or suspended.")
+
+        st.dataframe(
+            [
+                {
+                    "Member": row.display_name,
+                    "Email": row.email,
+                    "Status": humanize(row.status.value),
+                    "Paid through": row.current_period_end,
+                    "Cancels at period end": (
+                        "Yes" if row.cancel_at_period_end else "No"
+                    ),
+                    "Grace deadline": row.grace_expires_at,
+                    "Updated": row.updated_at,
+                }
+                for row in rows
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        selected = st.selectbox(
+            "Member",
+            options=rows,
+            format_func=lambda item: f"{item.display_name} ({item.email})",
+            key="admin-billing-member",
+        )
+        action = st.radio(
+            "Reasoned correction",
+            options=["Grant complimentary access", "Suspend subscription"],
+            key="admin-billing-action",
+        )
+        with st.form("admin-billing-correction"):
+            reason_code = st.text_input("Reason code")
+            submitted = st.form_submit_button("Apply correction", type="primary")
+        if submitted:
+            try:
+                if action == "Grant complimentary access":
+                    service.grant_complimentary_entitlement(
+                        actor, selected.member_id, reason_code
+                    )
+                else:
+                    service.suspend_entitlement(actor, selected.member_id, reason_code)
+            except MatchwellError as error:
+                st.error(str(error))
+            else:
+                render_success_state("Billing correction recorded.")
+                st.rerun()
+
+    _render_admin_webhook_failures(service, actor)
+
+
+def _render_admin_webhook_failures(
+    service: PilotService, actor: AuthenticatedUser
+) -> None:
+    st.subheader("Webhook failures")
+    st.caption(
+        "Provider events that never applied. Safe identifiers and reason "
+        "codes only; no payload, signature, or secret is ever stored."
+    )
+    try:
+        failures = service.billing_webhook_failures(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not failures:
+        render_empty_state("No webhook events are awaiting review.")
+        return
+    st.warning(f"{len(failures)} webhook event(s) need review or reprocessing.")
+    st.dataframe(
+        [
+            {
+                "Provider": failure.provider,
+                "Event type": failure.event_type,
+                "Event ID": failure.provider_event_id,
+                "Reason": humanize(failure.unresolved_reason or "unknown"),
+                "Received": failure.received_at,
+            }
+            for failure in failures
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def _render_admin_ledger(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.subheader("Counselor earnings ledger")
+    st.caption(
+        "Append-only credits and corrections. Balances are always derived, "
+        "never overwritten."
+    )
+    try:
+        entries = service.ledger(actor)
+        counselors = service.counselors(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+
+    if not entries:
+        render_empty_state("No earnings have been recorded yet.")
+    else:
+        balances: dict[uuid.UUID, int] = {}
+        names: dict[uuid.UUID, str] = {}
+        for entry in entries:
+            balances[entry.counselor_id] = (
+                balances.get(entry.counselor_id, 0) + entry.amount_minor_units
+            )
+            names[entry.counselor_id] = entry.counselor_name
+        st.dataframe(
+            [
+                {"Counselor": names[counselor_id], "Balance": f"${balance / 100:.2f}"}
+                for counselor_id, balance in balances.items()
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption("Ledger history")
+        st.dataframe(
+            [
+                {
+                    "Counselor": entry.counselor_name,
+                    "Type": humanize(entry.entry_type.value),
+                    "Amount": f"${entry.amount_minor_units / 100:.2f}",
+                    "Reason": entry.reason_code or "",
+                    "Recorded": entry.created_at,
+                }
+                for entry in entries
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    if not counselors:
+        render_empty_state("Invite a counselor to record adjustments.")
+        return
+
+    st.subheader("Record a manual adjustment")
+    with st.form("admin-earnings-adjustment"):
+        counselor = st.selectbox(
+            "Counselor",
+            options=counselors,
+            format_func=lambda item: f"{item.name} ({item.email})",
+        )
+        amount_dollars = st.number_input(
+            "Amount in USD (negative for a correction)",
+            value=0.0,
+            step=0.01,
+            format="%.2f",
+        )
+        reason_code = st.text_input("Reason code")
+        adjustment_submitted = st.form_submit_button(
+            "Record adjustment", type="primary"
+        )
+    if adjustment_submitted:
+        try:
+            service.record_earnings_adjustment(
+                actor,
+                counselor.id,
+                round(amount_dollars * 100),
+                reason_code,
+            )
+        except MatchwellError as error:
+            st.error(str(error))
+        else:
+            render_success_state("Adjustment recorded.")
+            st.rerun()
+
+
+def _render_counselor_earnings(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.subheader("Your earnings")
+    st.caption(
+        "One $25 credit per member's first completed intake decision. "
+        "Automated payout remains deferred for the pilot."
+    )
+    try:
+        earnings = service.counselor_earnings(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+
+    st.metric("Balance", f"${earnings.balance_minor_units / 100:.2f}")
+    if not earnings.entries:
+        render_empty_state("No earnings have been recorded yet.")
+        return
+    st.dataframe(
+        [
+            {
+                "Type": humanize(entry.entry_type.value),
+                "Amount": f"${entry.amount_minor_units / 100:.2f}",
+                "Reason": entry.reason_code or "",
+                "Recorded": entry.created_at,
+            }
+            for entry in earnings.entries
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
 
 
 def _member_selector(

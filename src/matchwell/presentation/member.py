@@ -8,6 +8,7 @@ import streamlit as st
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import AuthenticatedUser
+from matchwell.domain.billing import SubscriptionStatus
 from matchwell.domain.errors import MatchwellError
 from matchwell.domain.journey import (
     MemberCheckInView,
@@ -25,6 +26,7 @@ from matchwell.domain.matching import (
     SafetyCategory,
 )
 from matchwell.domain.pilot import ProfileInput
+from matchwell.domain.readiness import TOTAL_ORDINARY_REQUIREMENTS
 from matchwell.presentation.theme import (
     Tone,
     humanize,
@@ -44,12 +46,15 @@ def render_dashboard(service: PilotService, actor: AuthenticatedUser) -> None:
         st.error(str(error))
         return
 
-    completed = 7 - len(progress.readiness.unmet_requirements)
+    completed = TOTAL_ORDINARY_REQUIREMENTS - len(progress.readiness.unmet_requirements)
     with st.container(border=True):
         render_eyebrow(f"Stage: {humanize(progress.readiness.stage.value)}")
         st.progress(
-            completed / 7,
-            text=f"{completed} of 7 readiness requirements complete",
+            completed / TOTAL_ORDINARY_REQUIREMENTS,
+            text=(
+                f"{completed} of {TOTAL_ORDINARY_REQUIREMENTS} readiness "
+                "requirements complete"
+            ),
         )
         if progress.readiness.eligible:
             render_badges([(f"Eligible for {progress.community_name}", "success")])
@@ -188,6 +193,74 @@ def render_assessment(service: PilotService, actor: AuthenticatedUser) -> None:
             st.error(str(error))
         else:
             st.success("Your assessment was submitted securely.")
+
+
+def render_billing(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.title("Billing")
+    st.caption(
+        "Manage your own Matchwell Pilot subscription. Only you can see this page."
+    )
+    try:
+        entitlement = service.billing_status(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+
+    with st.container(border=True):
+        render_eyebrow(entitlement.plan_name)
+        st.write(
+            f"${entitlement.price_minor_units / 100:.2f} "
+            f"{entitlement.currency.upper()} / month"
+        )
+        tone: Tone = "success" if entitlement.active else "warning"
+        render_badges([(humanize(entitlement.status.value), tone)])
+        if entitlement.current_period_end is not None:
+            label = (
+                "Access ends" if entitlement.cancel_at_period_end else "Paid through"
+            )
+            formatted = entitlement.current_period_end.strftime("%B %d, %Y")
+            st.caption(f"{label} {formatted}")
+        if entitlement.status is SubscriptionStatus.GRACE and (
+            entitlement.grace_expires_at is not None
+        ):
+            deadline = entitlement.grace_expires_at.strftime("%B %d, %Y")
+            st.warning(
+                "Your last payment failed. Update your payment method by "
+                f"{deadline} to keep your access active."
+            )
+        elif entitlement.cancel_at_period_end and entitlement.active:
+            st.info(
+                "Your subscription is scheduled to cancel at the end of the "
+                "current period."
+            )
+        elif entitlement.status is SubscriptionStatus.SUSPENDED:
+            st.error(
+                "Your subscription is suspended. Subscribe again to restore access."
+            )
+
+    if entitlement.has_provider_subscription:
+        if st.button("Manage subscription", type="primary"):
+            try:
+                portal = service.create_billing_portal_session(actor)
+            except MatchwellError as error:
+                st.error(str(error))
+            else:
+                st.link_button("Open the Stripe billing portal", portal.url)
+    else:
+        st.write(
+            "Subscribe to unlock community matching, introductions, "
+            "messaging, and the guided journey."
+        )
+        if st.button(
+            f"Subscribe for ${entitlement.price_minor_units / 100:.2f}/month",
+            type="primary",
+        ):
+            try:
+                checkout = service.create_checkout_session(actor)
+            except MatchwellError as error:
+                st.error(str(error))
+            else:
+                st.link_button("Continue to secure Stripe checkout", checkout.url)
 
 
 def render_matching(service: PilotService, actor: AuthenticatedUser) -> None:

@@ -9,6 +9,7 @@ class RequirementCode(StrEnum):
     ASSESSMENT = "assessment"
     COUNSELOR = "counselor"
     SCREENING = "screening"
+    SUBSCRIPTION = "subscription"
     NO_ACTIVE_HOLD = "no_active_hold"
 
 
@@ -17,6 +18,7 @@ class ReadinessStage(StrEnum):
     ASSESSMENT = "assessment"
     COUNSELOR_INTAKE = "counselor_intake"
     SCREENING = "screening"
+    BILLING = "billing"
     HELD = "held"
     COMMUNITY_ELIGIBLE = "community_eligible"
 
@@ -28,8 +30,11 @@ REQUIREMENT_LABELS: dict[RequirementCode, str] = {
     RequirementCode.ASSESSMENT: "Complete the readiness assessment",
     RequirementCode.COUNSELOR: "Receive counselor intake approval",
     RequirementCode.SCREENING: "Receive an eligible screening status",
+    RequirementCode.SUBSCRIPTION: "Activate the Matchwell Pilot subscription",
     RequirementCode.NO_ACTIVE_HOLD: "Resolve the active account hold",
 }
+
+TOTAL_ORDINARY_REQUIREMENTS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +45,7 @@ class ReadinessEvidence:
     assessment_complete: bool
     counselor_approved: bool
     screening_eligible: bool
+    subscription_active: bool
     active_hold: bool
 
 
@@ -71,6 +77,8 @@ class ReadinessResult:
             return ReadinessStage.COUNSELOR_INTAKE
         if RequirementCode.SCREENING in self.unmet_requirements:
             return ReadinessStage.SCREENING
+        if RequirementCode.SUBSCRIPTION in self.unmet_requirements:
+            return ReadinessStage.BILLING
         return ReadinessStage.COMMUNITY_ELIGIBLE
 
 
@@ -82,6 +90,7 @@ class ReadinessEvaluator:
         (RequirementCode.ASSESSMENT, "assessment_complete"),
         (RequirementCode.COUNSELOR, "counselor_approved"),
         (RequirementCode.SCREENING, "screening_eligible"),
+        (RequirementCode.SUBSCRIPTION, "subscription_active"),
     )
 
     def evaluate(self, evidence: ReadinessEvidence) -> ReadinessResult:

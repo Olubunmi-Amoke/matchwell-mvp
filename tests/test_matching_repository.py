@@ -56,7 +56,9 @@ from matchwell.infrastructure.persistence.models import (
     MemberProfileRecord,
     OutboxMessageRecord,
     PairJourneyRecord,
+    PilotPlanRecord,
     ScreeningCaseRecord,
+    SubscriptionRecord,
     UserRecord,
 )
 from matchwell.infrastructure.persistence.pilot_repository import (
@@ -106,6 +108,16 @@ def pilot() -> Pilot:
                     {"id": "communication", "prompt": "I communicate clearly."},
                     {"id": "faith", "prompt": "Faith guides my relationships."},
                 ],
+                is_active=True,
+            )
+        )
+        session.add(
+            PilotPlanRecord(
+                id=uuid.uuid4(),
+                key="matchwell-pilot",
+                name="Matchwell Pilot",
+                price_minor_units=4_900,
+                currency="usd",
                 is_active=True,
             )
         )
@@ -226,6 +238,7 @@ def _make_ready_member(
         f"case-{subject}",
     )
     assert created
+    service.grant_complimentary_entitlement(admin, member.id, "pilot-migration")
     service.save_match_preferences(
         member,
         MatchPreferencesInput(
@@ -1161,6 +1174,7 @@ def test_member_without_match_preferences_is_excluded(pilot: Pilot) -> None:
     service.record_screening_status(
         admin, member_b.id, ScreeningStatus.ELIGIBLE, "event-b", "case-b"
     )
+    service.grant_complimentary_entitlement(admin, member_b.id, "pilot-migration")
     # member_b never completes match preferences.
     assert service.progress(member_b).readiness.eligible
     assert not service.match_preferences(member_b).completed
@@ -1478,6 +1492,23 @@ def test_center_isolation_for_candidate_queue(pilot: Pilot) -> None:
         )
         session.add_all([other_counselor, other_member_a, other_member_b])
         session.flush()
+        pilot_plan = session.scalar(
+            select(PilotPlanRecord).where(PilotPlanRecord.is_active.is_(True))
+        )
+        assert pilot_plan is not None
+        session.add_all(
+            [
+                SubscriptionRecord(
+                    member_id=member.id,
+                    center_id=other_center_id,
+                    plan_id=pilot_plan.id,
+                    status="complimentary",
+                    provider="complimentary",
+                    cancel_at_period_end=False,
+                )
+                for member in (other_member_a, other_member_b)
+            ]
+        )
         session.add(
             MatchProposalRecord(
                 center_id=other_center_id,

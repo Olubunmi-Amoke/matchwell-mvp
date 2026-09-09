@@ -27,6 +27,7 @@ from matchwell.infrastructure.persistence.models import (
     CommunityRecord,
     ConsentVersionRecord,
     OutboxMessageRecord,
+    PilotPlanRecord,
     ReadinessDecisionRecord,
     UserRecord,
 )
@@ -79,6 +80,16 @@ def pilot() -> tuple[PilotService, DatabaseSessionFactory]:
                     {"id": "communication", "prompt": "I communicate clearly."},
                     {"id": "faith", "prompt": "Faith guides my relationships."},
                 ],
+                is_active=True,
+            )
+        )
+        session.add(
+            PilotPlanRecord(
+                id=uuid.uuid4(),
+                key="matchwell-pilot",
+                name="Matchwell Pilot",
+                price_minor_units=4_900,
+                currency="usd",
                 is_active=True,
             )
         )
@@ -172,6 +183,7 @@ def test_complete_invited_member_journey_is_audited_and_eligible(
     )
 
     assert created
+    service.grant_complimentary_entitlement(admin, member.id, "pilot-migration")
     assert service.progress(member).readiness.eligible
 
     duplicate = service.record_screening_status(
@@ -226,7 +238,9 @@ def test_complete_invited_member_journey_is_audited_and_eligible(
             replacement.assignment_id
         )
         outbox_count = session.scalar(select(func.count(OutboxMessageRecord.id)))
-        assert outbox_count == 5
+        # 5 readiness/matching-era events plus 2 from the complimentary grant
+        # (billing.entitlement_changed and the resulting eligibility change).
+        assert outbox_count == 7
 
 
 def test_uninvited_identity_is_denied(

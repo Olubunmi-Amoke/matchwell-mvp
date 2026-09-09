@@ -7,11 +7,29 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from matchwell.application.pilot import PaymentGateway
 from matchwell.domain.access import (
     AuthenticatedUser,
     OidcIdentity,
     Role,
     normalize_email,
+)
+from matchwell.domain.billing import (
+    BILLING_SYSTEM_ACTOR_ID,
+    PILOT_INTAKE_CREDIT_MINOR_UNITS,
+    PILOT_PLAN_CURRENCY,
+    AdminBillingRow,
+    BillingEventSource,
+    BillingPortalSessionView,
+    BillingWebhookEvent,
+    CheckoutSessionView,
+    CounselorEarningsView,
+    EarningEntryType,
+    EntitlementView,
+    LedgerEntryView,
+    ProviderEventType,
+    SubscriptionStatus,
+    WebhookFailureView,
 )
 from matchwell.domain.errors import ConflictError, NotFoundError, ValidationError
 from matchwell.domain.journey import (
@@ -71,12 +89,16 @@ from matchwell.infrastructure.persistence.models import (
     AssessmentAssignmentRecord,
     AssessmentDefinitionRecord,
     AuditEventRecord,
+    BillingCustomerRecord,
+    BillingWebhookReceiptRecord,
     CenterRecord,
     CommunityRecord,
     ConsentAcceptanceRecord,
     ConsentVersionRecord,
     CounselorAssignmentRecord,
     CounselorDecisionRecord,
+    CounselorEarningRecord,
+    EntitlementHistoryRecord,
     HoldRecord,
     InvitationRecord,
     JourneyCheckInRecord,
@@ -91,14 +113,17 @@ from matchwell.infrastructure.persistence.models import (
     MemberReportRecord,
     OutboxMessageRecord,
     PairJourneyRecord,
+    PilotPlanRecord,
     ReadinessDecisionRecord,
     ScreeningCaseRecord,
     ScreeningEventReceiptRecord,
+    SubscriptionRecord,
     UserRecord,
 )
 
 PILOT_CENTER_SLUG = "matchwell-pilot"
 READINESS_CONFIGURATION_VERSION = "pilot-v1"
+DEFAULT_GRACE_PERIOD = timedelta(days=7)
 _OPEN_PROPOSAL_STATUSES = (
     ProposalStatus.PENDING_REVIEW.value,
     ProposalStatus.INTRODUCED.value,
@@ -112,10 +137,14 @@ class SqlAlchemyPilotRepository:
         sessions: DatabaseSessionFactory,
         evaluator: ReadinessEvaluator,
         scorer: MatchScorer | None = None,
+        payment_gateway: PaymentGateway | None = None,
+        grace_period: timedelta = DEFAULT_GRACE_PERIOD,
     ) -> None:
         self._sessions = sessions
         self._evaluator = evaluator
         self._scorer = scorer or MatchScorer()
+        self._payment_gateway = payment_gateway
+        self._grace_period = grace_period
 
     def resolve_identity(
         self,
@@ -755,8 +784,61 @@ class SqlAlchemyPilotRepository:
                 center_id=counselor.center_id,
                 metadata={"status": status.value, "reason_code": reason_code},
             )
+            if status is not CounselorDecisionStatus.PENDING:
+                self._maybe_credit_intake_earning(session, counselor, member_id)
             session.flush()
             self._reevaluate(session, member_id, counselor.id)
+
+    def _maybe_credit_intake_earning(
+        self,
+        session: Session,
+        counselor: AuthenticatedUser,
+        member_id: uuid.UUID,
+    ) -> None:
+        """Credit exactly one $25 earning for a member's first intake decision.
+
+        The unique partial index on ``intake_member_id`` for
+        ``entry_type = 'intake_credit'`` guarantees this can never duplicate or
+        move to a later counselor, even after reassignment.
+        """
+        try:
+            with session.begin_nested():
+                session.add(
+                    CounselorEarningRecord(
+                        center_id=counselor.center_id,
+                        counselor_id=counselor.id,
+                        intake_member_id=member_id,
+                        entry_type=EarningEntryType.INTAKE_CREDIT.value,
+                        amount_minor_units=PILOT_INTAKE_CREDIT_MINOR_UNITS,
+                        currency=PILOT_PLAN_CURRENCY,
+                        reason_code=None,
+                        created_by_id=counselor.id,
+                    )
+                )
+                session.flush()
+        except IntegrityError:
+            return
+        self._audit(
+            session,
+            actor_id=counselor.id,
+            action="billing.earnings_credited",
+            subject_id=member_id,
+            center_id=counselor.center_id,
+            metadata={
+                "counselor_id": str(counselor.id),
+                "amount_minor_units": PILOT_INTAKE_CREDIT_MINOR_UNITS,
+            },
+        )
+        session.add(
+            OutboxMessageRecord(
+                event_type="billing.earnings_credited",
+                payload={
+                    "counselor_id": str(counselor.id),
+                    "member_id": str(member_id),
+                    "amount_minor_units": PILOT_INTAKE_CREDIT_MINOR_UNITS,
+                },
+            )
+        )
 
     def record_screening_status(
         self,
@@ -1272,7 +1354,9 @@ class SqlAlchemyPilotRepository:
                 )
             ).all()
             items = tuple(
-                self._candidate_review_item(session, row, counselor.id) for row in rows
+                self._candidate_review_item(session, row, counselor.id)
+                for row in rows
+                if self._pair_entitled(session, row)
             )
             self._audit(
                 session,
@@ -1310,6 +1394,9 @@ class SqlAlchemyPilotRepository:
             if proposal is None:
                 raise NotFoundError("Candidate proposal was not found.")
             if proposal.status != ProposalStatus.PENDING_REVIEW.value:
+                raise ConflictError("This candidate is no longer pending review.")
+            if not self._pair_entitled(session, proposal):
+                self._reconcile_entitlement_lapse(session, proposal)
                 raise ConflictError("This candidate is no longer pending review.")
             is_counselor_a = proposal.counselor_a_id == counselor.id
             is_counselor_b = proposal.counselor_b_id == counselor.id
@@ -1389,17 +1476,22 @@ class SqlAlchemyPilotRepository:
         self,
         member_id: uuid.UUID,
     ) -> IntroductionView | None:
-        with self._sessions.session() as session:
+        with self._sessions.session() as session, session.begin():
             proposal = session.scalar(
-                select(MatchProposalRecord).where(
+                select(MatchProposalRecord)
+                .where(
                     MatchProposalRecord.status == ProposalStatus.INTRODUCED.value,
                     or_(
                         MatchProposalRecord.member_a_id == member_id,
                         MatchProposalRecord.member_b_id == member_id,
                     ),
                 )
+                .with_for_update()
             )
             if proposal is None:
+                return None
+            if not self._pair_entitled(session, proposal):
+                self._reconcile_entitlement_lapse(session, proposal)
                 return None
             return self._introduction_view(session, proposal, member_id)
 
@@ -1424,6 +1516,11 @@ class SqlAlchemyPilotRepository:
             if proposal is None:
                 raise NotFoundError("Introduction was not found.")
             if proposal.status != ProposalStatus.INTRODUCED.value:
+                raise ConflictError(
+                    "This introduction is no longer awaiting a response."
+                )
+            if not self._pair_entitled(session, proposal):
+                self._reconcile_entitlement_lapse(session, proposal)
                 raise ConflictError(
                     "This introduction is no longer awaiting a response."
                 )
@@ -1491,17 +1588,22 @@ class SqlAlchemyPilotRepository:
         self,
         member_id: uuid.UUID,
     ) -> MatchedPairView | None:
-        with self._sessions.session() as session:
+        with self._sessions.session() as session, session.begin():
             proposal = session.scalar(
-                select(MatchProposalRecord).where(
+                select(MatchProposalRecord)
+                .where(
                     MatchProposalRecord.status == ProposalStatus.ACTIVE.value,
                     or_(
                         MatchProposalRecord.member_a_id == member_id,
                         MatchProposalRecord.member_b_id == member_id,
                     ),
                 )
+                .with_for_update()
             )
             if proposal is None or proposal.activated_at is None:
+                return None
+            if not self._pair_entitled(session, proposal):
+                self._reconcile_entitlement_lapse(session, proposal)
                 return None
             partner_id = (
                 proposal.member_b_id
@@ -1658,6 +1760,13 @@ class SqlAlchemyPilotRepository:
             ).all()
             statuses: list[CounselorConversationStatus] = []
             for proposal in proposals:
+                if not self._pair_entitled(session, proposal):
+                    self._reconcile_entitlement_lapse(
+                        session,
+                        proposal,
+                        commit_immediately=False,
+                    )
+                    continue
                 message_count, latest_activity_at = session.execute(
                     select(
                         func.count(MatchedPairMessageRecord.id),
@@ -1938,19 +2047,28 @@ class SqlAlchemyPilotRepository:
                 .order_by(MatchProposalRecord.activated_at.desc())
                 .with_for_update()
             ).all()
-            return [
-                self._counselor_journey_view(
-                    session,
-                    proposal,
-                    session.scalar(
-                        select(PairJourneyRecord).where(
-                            PairJourneyRecord.proposal_id == proposal.id
-                        )
-                    ),
-                    counselor,
+            views: list[CounselorJourneyView] = []
+            for proposal in proposals:
+                if not self._pair_entitled(session, proposal):
+                    self._reconcile_entitlement_lapse(
+                        session,
+                        proposal,
+                        commit_immediately=False,
+                    )
+                    continue
+                views.append(
+                    self._counselor_journey_view(
+                        session,
+                        proposal,
+                        session.scalar(
+                            select(PairJourneyRecord).where(
+                                PairJourneyRecord.proposal_id == proposal.id
+                            )
+                        ),
+                        counselor,
+                    )
                 )
-                for proposal in proposals
-            ]
+            return views
 
     def block_member(
         self,
@@ -2040,6 +2158,842 @@ class SqlAlchemyPilotRepository:
                 proposal.closed_reason = "member_report"
                 self._close_proposal_audit(session, actor.id, proposal, "member_report")
             session.flush()
+
+    def billing_status(self, member_id: uuid.UUID) -> EntitlementView:
+        with self._sessions.session() as session:
+            return self._entitlement_view(session, member_id)
+
+    def create_checkout_session(
+        self,
+        actor: AuthenticatedUser,
+    ) -> CheckoutSessionView:
+        if self._payment_gateway is None:
+            raise ValidationError("Billing is not configured for this environment.")
+        with self._sessions.session() as session, session.begin():
+            member = self._member(session, actor.id, actor.center_id)
+            customer = self._billing_customer(session, actor.id)
+            result = self._payment_gateway.create_checkout_session(
+                member_id=member.id,
+                member_email=member.email,
+                existing_provider_customer_id=(
+                    customer.provider_customer_id if customer is not None else None
+                ),
+            )
+            if customer is None:
+                session.add(
+                    BillingCustomerRecord(
+                        member_id=actor.id,
+                        center_id=actor.center_id,
+                        provider="stripe",
+                        provider_customer_id=result.provider_customer_id,
+                    )
+                )
+            elif customer.provider_customer_id != result.provider_customer_id:
+                customer.provider_customer_id = result.provider_customer_id
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="billing.checkout_session_created",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={"provider_session_id": result.provider_session_id},
+            )
+            session.flush()
+            return CheckoutSessionView(
+                url=result.url,
+                provider_session_id=result.provider_session_id,
+                provider_customer_id=result.provider_customer_id,
+            )
+
+    def create_billing_portal_session(
+        self,
+        actor: AuthenticatedUser,
+    ) -> BillingPortalSessionView:
+        if self._payment_gateway is None:
+            raise ValidationError("Billing is not configured for this environment.")
+        with self._sessions.session() as session, session.begin():
+            self._member(session, actor.id, actor.center_id)
+            customer = self._billing_customer(session, actor.id)
+            if customer is None:
+                raise NotFoundError("Start checkout before opening the billing portal.")
+            result = self._payment_gateway.create_billing_portal_session(
+                provider_customer_id=customer.provider_customer_id,
+            )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="billing.portal_session_created",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={},
+            )
+            return result
+
+    def billing_queue(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[AdminBillingRow]:
+        with self._sessions.session() as session, session.begin():
+            members = session.scalars(
+                select(UserRecord).where(
+                    UserRecord.center_id == actor.center_id,
+                    UserRecord.role == Role.MEMBER.value,
+                )
+            ).all()
+            rows = []
+            for member in members:
+                view = self._entitlement_view(session, member.id)
+                profile = session.get(MemberProfileRecord, member.id)
+                rows.append(
+                    AdminBillingRow(
+                        member_id=member.id,
+                        display_name=(
+                            profile.display_name if profile is not None else member.name
+                        ),
+                        email=member.email,
+                        status=view.status,
+                        current_period_end=view.current_period_end,
+                        cancel_at_period_end=view.cancel_at_period_end,
+                        grace_expires_at=view.grace_expires_at,
+                        updated_at=view.updated_at,
+                    )
+                )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="billing.queue_accessed",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={"record_count": len(rows)},
+            )
+            return rows
+
+    def billing_webhook_failures(
+        self,
+        actor: AuthenticatedUser,
+    ) -> Sequence[WebhookFailureView]:
+        """Unapplied webhook receipts an admin can triage and reprocess.
+
+        Deliberately safe: only identifiers, the recognized-or-not event
+        type, and a safe reason code are exposed. The raw payload, signature,
+        and provider secrets are never stored on the receipt, so there is
+        nothing sensitive to leak here.
+        """
+        with self._sessions.session() as session, session.begin():
+            rows = session.scalars(
+                select(BillingWebhookReceiptRecord)
+                .where(BillingWebhookReceiptRecord.applied.is_(False))
+                .order_by(BillingWebhookReceiptRecord.received_at.desc())
+            ).all()
+            views = [
+                WebhookFailureView(
+                    id=row.id,
+                    provider=row.provider,
+                    provider_event_id=row.provider_event_id,
+                    event_type=row.event_type,
+                    unresolved_reason=row.unresolved_reason,
+                    received_at=row.received_at,
+                )
+                for row in rows
+            ]
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="billing.webhook_failures_accessed",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={"record_count": len(views)},
+            )
+            return views
+
+    def grant_complimentary_entitlement(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: str,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            self._member(session, member_id, actor.center_id)
+            self._transition_subscription(
+                session,
+                member_id=member_id,
+                center_id=actor.center_id,
+                to_status=SubscriptionStatus.COMPLIMENTARY,
+                provider="complimentary",
+                provider_subscription_id=None,
+                current_period_end=None,
+                cancel_at_period_end=False,
+                grace_expires_at=None,
+                source=BillingEventSource.ADMIN_COMPLIMENTARY,
+                reason_code=reason_code,
+                provider_event_id=None,
+                occurred_at=self._now(),
+                actor_id=actor.id,
+            )
+            session.flush()
+            self._reevaluate(session, member_id, actor.id)
+
+    def suspend_entitlement(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: str,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            self._member(session, member_id, actor.center_id)
+            record = self._subscription(session, member_id)
+            self._transition_subscription(
+                session,
+                member_id=member_id,
+                center_id=actor.center_id,
+                to_status=SubscriptionStatus.SUSPENDED,
+                provider=record.provider if record is not None else "manual",
+                provider_subscription_id=(
+                    record.provider_subscription_id if record is not None else None
+                ),
+                current_period_end=(
+                    record.current_period_end if record is not None else None
+                ),
+                cancel_at_period_end=(
+                    record.cancel_at_period_end if record is not None else False
+                ),
+                grace_expires_at=None,
+                source=BillingEventSource.ADMIN_CORRECTION,
+                reason_code=reason_code,
+                provider_event_id=None,
+                occurred_at=self._now(),
+                actor_id=actor.id,
+            )
+            session.flush()
+            self._reevaluate(session, member_id, actor.id)
+
+    def counselor_earnings(self, actor: AuthenticatedUser) -> CounselorEarningsView:
+        with self._sessions.session() as session:
+            rows = session.scalars(
+                select(CounselorEarningRecord)
+                .where(
+                    CounselorEarningRecord.counselor_id == actor.id,
+                    CounselorEarningRecord.center_id == actor.center_id,
+                )
+                .order_by(CounselorEarningRecord.created_at)
+            ).all()
+            return CounselorEarningsView(
+                entries=tuple(self._ledger_entry(session, row) for row in rows)
+            )
+
+    def ledger(self, actor: AuthenticatedUser) -> Sequence[LedgerEntryView]:
+        with self._sessions.session() as session, session.begin():
+            rows = session.scalars(
+                select(CounselorEarningRecord)
+                .where(CounselorEarningRecord.center_id == actor.center_id)
+                .order_by(CounselorEarningRecord.created_at)
+            ).all()
+            entries = [self._ledger_entry(session, row) for row in rows]
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="billing.ledger_accessed",
+                subject_id=actor.id,
+                center_id=actor.center_id,
+                metadata={"record_count": len(entries)},
+            )
+            return entries
+
+    def record_earnings_adjustment(
+        self,
+        actor: AuthenticatedUser,
+        counselor_id: uuid.UUID,
+        amount_minor_units: int,
+        reason_code: str,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            counselor = self._role_user(
+                session, counselor_id, Role.COUNSELOR, actor.center_id
+            )
+            session.add(
+                CounselorEarningRecord(
+                    center_id=actor.center_id,
+                    counselor_id=counselor.id,
+                    intake_member_id=None,
+                    entry_type=EarningEntryType.ADMIN_ADJUSTMENT.value,
+                    amount_minor_units=amount_minor_units,
+                    currency=PILOT_PLAN_CURRENCY,
+                    reason_code=reason_code,
+                    created_by_id=actor.id,
+                )
+            )
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="billing.earnings_adjusted",
+                subject_id=counselor.id,
+                center_id=actor.center_id,
+                metadata={
+                    "amount_minor_units": amount_minor_units,
+                    "reason_code": reason_code,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="billing.earnings_adjusted",
+                    payload={
+                        "counselor_id": str(counselor.id),
+                        "amount_minor_units": amount_minor_units,
+                    },
+                )
+            )
+
+    def process_billing_webhook_event(self, event: BillingWebhookEvent) -> bool:
+        with self._sessions.session() as session, session.begin():
+            receipt = BillingWebhookReceiptRecord(
+                provider=event.provider,
+                provider_event_id=event.provider_event_id,
+                event_type=(
+                    event.event_type.value
+                    if event.event_type is not None
+                    else "unrecognized"
+                ),
+                # A receipt always starts unapplied: it only flips to applied
+                # once a recognized event has actually changed domain state
+                # below. Nothing here ever claims success prematurely.
+                applied=False,
+                unresolved_reason=(
+                    None if event.event_type is not None else "unrecognized_event_type"
+                ),
+            )
+            try:
+                with session.begin_nested():
+                    session.add(receipt)
+                    session.flush()
+            except IntegrityError:
+                # Duplicate provider event ID: already recorded (applied or
+                # not). Acknowledge without reprocessing or overwriting the
+                # existing receipt's outcome.
+                return False
+
+            if event.event_type is None:
+                return True
+
+            member_id = self._resolve_billing_member(session, event)
+            if member_id is None:
+                receipt.unresolved_reason = "unresolvable_member"
+                session.flush()
+                return True
+
+            center_id = self._member_center_id(session, member_id)
+            applied, reason = self._apply_billing_event(
+                session, member_id, center_id, event
+            )
+            if applied:
+                receipt.applied = True
+                receipt.unresolved_reason = None
+                session.flush()
+                self._reevaluate(session, member_id, BILLING_SYSTEM_ACTOR_ID)
+            else:
+                receipt.unresolved_reason = reason
+                session.flush()
+            return True
+
+    def _apply_billing_event(
+        self,
+        session: Session,
+        member_id: uuid.UUID,
+        center_id: uuid.UUID,
+        event: BillingWebhookEvent,
+    ) -> tuple[bool, str | None]:
+        record = self._subscription(session, member_id)
+        if event.event_type is ProviderEventType.CHECKOUT_COMPLETED:
+            self._sync_billing_customer(session, member_id, center_id, event)
+            applied = self._transition_subscription(
+                session,
+                member_id=member_id,
+                center_id=center_id,
+                to_status=SubscriptionStatus.ACTIVE,
+                provider="stripe",
+                provider_subscription_id=event.provider_subscription_id,
+                current_period_end=(
+                    event.current_period_end
+                    if event.current_period_end is not None
+                    else (record.current_period_end if record is not None else None)
+                ),
+                cancel_at_period_end=(
+                    record.cancel_at_period_end if record is not None else False
+                ),
+                grace_expires_at=None,
+                source=BillingEventSource.STRIPE_WEBHOOK,
+                reason_code=None,
+                provider_event_id=event.provider_event_id,
+                occurred_at=event.occurred_at,
+                actor_id=BILLING_SYSTEM_ACTOR_ID,
+                enforce_ordering=True,
+            )
+            return applied, (None if applied else "out_of_order_event")
+        elif event.event_type is ProviderEventType.SUBSCRIPTION_UPDATED:
+            status = self._normalize_provider_status(event.provider_status)
+            grace_expires_at = (
+                self._grace_window(record, event.occurred_at)
+                if status is SubscriptionStatus.GRACE
+                else None
+            )
+            applied = self._transition_subscription(
+                session,
+                member_id=member_id,
+                center_id=center_id,
+                to_status=status,
+                provider="stripe",
+                provider_subscription_id=event.provider_subscription_id,
+                current_period_end=(
+                    event.current_period_end
+                    if event.current_period_end is not None
+                    else (record.current_period_end if record is not None else None)
+                ),
+                cancel_at_period_end=event.cancel_at_period_end,
+                grace_expires_at=grace_expires_at,
+                source=BillingEventSource.STRIPE_WEBHOOK,
+                reason_code=None,
+                provider_event_id=event.provider_event_id,
+                occurred_at=event.occurred_at,
+                actor_id=BILLING_SYSTEM_ACTOR_ID,
+                enforce_ordering=True,
+            )
+            return applied, (None if applied else "out_of_order_event")
+        elif event.event_type is ProviderEventType.SUBSCRIPTION_DELETED:
+            applied = self._transition_subscription(
+                session,
+                member_id=member_id,
+                center_id=center_id,
+                to_status=SubscriptionStatus.CANCELED,
+                provider="stripe",
+                provider_subscription_id=event.provider_subscription_id,
+                current_period_end=(
+                    event.current_period_end
+                    if event.current_period_end is not None
+                    else (record.current_period_end if record is not None else None)
+                ),
+                cancel_at_period_end=True,
+                grace_expires_at=None,
+                source=BillingEventSource.STRIPE_WEBHOOK,
+                reason_code=None,
+                provider_event_id=event.provider_event_id,
+                occurred_at=event.occurred_at,
+                actor_id=BILLING_SYSTEM_ACTOR_ID,
+                enforce_ordering=True,
+            )
+            return applied, (None if applied else "out_of_order_event")
+        elif event.event_type is ProviderEventType.INVOICE_PAID:
+            applied = self._transition_subscription(
+                session,
+                member_id=member_id,
+                center_id=center_id,
+                to_status=SubscriptionStatus.ACTIVE,
+                provider="stripe",
+                provider_subscription_id=(
+                    event.provider_subscription_id
+                    or (record.provider_subscription_id if record is not None else None)
+                ),
+                current_period_end=(
+                    event.current_period_end
+                    if event.current_period_end is not None
+                    else (record.current_period_end if record is not None else None)
+                ),
+                cancel_at_period_end=(
+                    record.cancel_at_period_end if record is not None else False
+                ),
+                grace_expires_at=None,
+                source=BillingEventSource.STRIPE_WEBHOOK,
+                reason_code=None,
+                provider_event_id=event.provider_event_id,
+                occurred_at=event.occurred_at,
+                actor_id=BILLING_SYSTEM_ACTOR_ID,
+                enforce_ordering=True,
+            )
+            return applied, (None if applied else "out_of_order_event")
+        elif event.event_type is ProviderEventType.INVOICE_PAYMENT_FAILED:
+            if record is not None and record.status in (
+                SubscriptionStatus.SUSPENDED.value,
+                SubscriptionStatus.CANCELED.value,
+            ):
+                return False, "already_suspended_or_canceled"
+            applied = self._transition_subscription(
+                session,
+                member_id=member_id,
+                center_id=center_id,
+                to_status=SubscriptionStatus.GRACE,
+                provider="stripe",
+                provider_subscription_id=(
+                    event.provider_subscription_id
+                    or (record.provider_subscription_id if record is not None else None)
+                ),
+                current_period_end=(
+                    record.current_period_end if record is not None else None
+                ),
+                cancel_at_period_end=(
+                    record.cancel_at_period_end if record is not None else False
+                ),
+                grace_expires_at=self._grace_window(record, event.occurred_at),
+                source=BillingEventSource.STRIPE_WEBHOOK,
+                reason_code=None,
+                provider_event_id=event.provider_event_id,
+                occurred_at=event.occurred_at,
+                actor_id=BILLING_SYSTEM_ACTOR_ID,
+                enforce_ordering=True,
+            )
+            return applied, (None if applied else "out_of_order_event")
+        elif event.event_type is ProviderEventType.REFUND_ISSUED:
+            self._audit(
+                session,
+                actor_id=BILLING_SYSTEM_ACTOR_ID,
+                action="billing.refund_recorded",
+                subject_id=member_id,
+                center_id=center_id,
+                metadata={
+                    "amount_minor_units": event.amount_minor_units,
+                    "currency": event.currency,
+                },
+            )
+            session.add(
+                OutboxMessageRecord(
+                    event_type="billing.refund_recorded",
+                    payload={
+                        "member_id": str(member_id),
+                        "amount_minor_units": event.amount_minor_units,
+                    },
+                )
+            )
+            return True, None
+        return False, "unhandled_event_type"
+
+    def _sync_billing_customer(
+        self,
+        session: Session,
+        member_id: uuid.UUID,
+        center_id: uuid.UUID,
+        event: BillingWebhookEvent,
+    ) -> None:
+        if event.provider_customer_id is None:
+            return
+        customer = self._billing_customer(session, member_id)
+        if customer is None:
+            session.add(
+                BillingCustomerRecord(
+                    member_id=member_id,
+                    center_id=center_id,
+                    provider=event.provider,
+                    provider_customer_id=event.provider_customer_id,
+                )
+            )
+        elif customer.provider_customer_id != event.provider_customer_id:
+            customer.provider_customer_id = event.provider_customer_id
+
+    def _grace_window(
+        self,
+        record: SubscriptionRecord | None,
+        occurred_at: datetime,
+    ) -> datetime:
+        if (
+            record is not None
+            and record.status == SubscriptionStatus.GRACE.value
+            and record.grace_expires_at is not None
+        ):
+            return record.grace_expires_at
+        return occurred_at + self._grace_period
+
+    @staticmethod
+    def _normalize_provider_status(provider_status: str | None) -> SubscriptionStatus:
+        if provider_status in ("active", "trialing"):
+            return SubscriptionStatus.ACTIVE
+        if provider_status == "past_due":
+            return SubscriptionStatus.GRACE
+        if provider_status in ("canceled", "unpaid", "incomplete_expired"):
+            return SubscriptionStatus.CANCELED
+        if provider_status == "paused":
+            return SubscriptionStatus.SUSPENDED
+        return SubscriptionStatus.INCOMPLETE
+
+    @staticmethod
+    def _resolve_billing_member(
+        session: Session,
+        event: BillingWebhookEvent,
+    ) -> uuid.UUID | None:
+        if event.member_id is not None:
+            return event.member_id
+        if event.provider_customer_id is None:
+            return None
+        customer = session.scalar(
+            select(BillingCustomerRecord).where(
+                BillingCustomerRecord.provider == event.provider,
+                BillingCustomerRecord.provider_customer_id
+                == event.provider_customer_id,
+            )
+        )
+        return customer.member_id if customer is not None else None
+
+    def _transition_subscription(
+        self,
+        session: Session,
+        *,
+        member_id: uuid.UUID,
+        center_id: uuid.UUID,
+        to_status: SubscriptionStatus,
+        provider: str,
+        provider_subscription_id: str | None,
+        current_period_end: datetime | None,
+        cancel_at_period_end: bool,
+        grace_expires_at: datetime | None,
+        source: BillingEventSource,
+        reason_code: str | None,
+        provider_event_id: str | None,
+        occurred_at: datetime,
+        actor_id: uuid.UUID,
+        enforce_ordering: bool = False,
+    ) -> bool:
+        plan = self._pilot_plan(session)
+        record = self._subscription(session, member_id, for_update=True)
+        now = self._now()
+        if record is None:
+            from_status = None
+            session.add(
+                SubscriptionRecord(
+                    member_id=member_id,
+                    center_id=center_id,
+                    plan_id=plan.id,
+                    status=to_status.value,
+                    provider=provider,
+                    provider_subscription_id=provider_subscription_id,
+                    current_period_end=current_period_end,
+                    cancel_at_period_end=cancel_at_period_end,
+                    grace_expires_at=grace_expires_at,
+                    last_provider_event_at=(occurred_at if enforce_ordering else None),
+                    reason_code=reason_code,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            if (
+                enforce_ordering
+                and record.last_provider_event_at is not None
+                and occurred_at < self._as_utc(record.last_provider_event_at)
+            ):
+                return False
+            from_status = record.status
+            record.status = to_status.value
+            record.provider = provider
+            if provider_subscription_id is not None:
+                record.provider_subscription_id = provider_subscription_id
+            record.current_period_end = current_period_end
+            record.cancel_at_period_end = cancel_at_period_end
+            record.grace_expires_at = grace_expires_at
+            record.reason_code = reason_code
+            record.updated_at = now
+            if enforce_ordering:
+                record.last_provider_event_at = occurred_at
+        session.flush()
+        session.add(
+            EntitlementHistoryRecord(
+                member_id=member_id,
+                center_id=center_id,
+                from_status=from_status,
+                to_status=to_status.value,
+                source=source.value,
+                provider_event_id=provider_event_id,
+                reason_code=reason_code,
+                safe_metadata={
+                    "current_period_end": (
+                        current_period_end.isoformat()
+                        if current_period_end is not None
+                        else None
+                    ),
+                    "cancel_at_period_end": cancel_at_period_end,
+                },
+                occurred_at=occurred_at,
+            )
+        )
+        self._audit(
+            session,
+            actor_id=actor_id,
+            action="billing.entitlement_transitioned",
+            subject_id=member_id,
+            center_id=center_id,
+            metadata={
+                "from_status": from_status,
+                "to_status": to_status.value,
+                "source": source.value,
+                "reason_code": reason_code,
+            },
+        )
+        if from_status != to_status.value:
+            session.add(
+                OutboxMessageRecord(
+                    event_type="billing.entitlement_changed",
+                    payload={"member_id": str(member_id), "status": to_status.value},
+                )
+            )
+        return True
+
+    def _entitlement_view(
+        self,
+        session: Session,
+        member_id: uuid.UUID,
+    ) -> EntitlementView:
+        plan = self._pilot_plan(session)
+        record = self._subscription(session, member_id)
+        now = self._now()
+        if record is None:
+            return EntitlementView(
+                plan_name=plan.name,
+                price_minor_units=plan.price_minor_units,
+                currency=plan.currency,
+                status=SubscriptionStatus.INCOMPLETE,
+                active=False,
+                current_period_end=None,
+                cancel_at_period_end=False,
+                grace_expires_at=None,
+                has_provider_subscription=False,
+                updated_at=None,
+            )
+        status = SubscriptionStatus(record.status)
+        return EntitlementView(
+            plan_name=plan.name,
+            price_minor_units=plan.price_minor_units,
+            currency=plan.currency,
+            status=status,
+            active=self._entitlement_active(
+                status,
+                record.current_period_end,
+                record.grace_expires_at,
+                now,
+            ),
+            current_period_end=record.current_period_end,
+            cancel_at_period_end=record.cancel_at_period_end,
+            grace_expires_at=record.grace_expires_at,
+            has_provider_subscription=record.provider_subscription_id is not None,
+            updated_at=record.updated_at,
+        )
+
+    def _billing_evidence(self, session: Session, member_id: uuid.UUID) -> bool:
+        record = self._subscription(session, member_id)
+        if record is None:
+            return False
+        return self._entitlement_active(
+            SubscriptionStatus(record.status),
+            record.current_period_end,
+            record.grace_expires_at,
+            self._now(),
+        )
+
+    def _pair_entitled(self, session: Session, proposal: MatchProposalRecord) -> bool:
+        """Both participants of a matched pair must hold active entitlement.
+
+        This is evaluated fresh on every access so a time-based grace or
+        current-period expiry blocks direct operations immediately, without
+        waiting for a webhook, admin action, or ``progress()`` call to
+        reconcile it.
+        """
+        return self._billing_evidence(
+            session, proposal.member_a_id
+        ) and self._billing_evidence(session, proposal.member_b_id)
+
+    def _reconcile_entitlement_lapse(
+        self,
+        session: Session,
+        proposal: MatchProposalRecord,
+        *,
+        commit_immediately: bool = True,
+    ) -> None:
+        """Safely close a matched pair whose entitlement has lapsed.
+
+        History is retained (the proposal row and its audit trail are never
+        deleted); only its status transitions to closed so the pair loses
+        access to further messaging and guided-journey activity.
+
+        Callers that raise after detecting a lapse commit immediately so the
+        surrounding transaction rollback does not discard the closure. Queue
+        readers pass ``commit_immediately=False`` because they continue issuing
+        queries and let their outer transaction commit all closures together.
+        """
+        if proposal.status not in _OPEN_PROPOSAL_STATUSES:
+            return
+        proposal.status = ProposalStatus.CLOSED.value
+        proposal.closed_at = self._now()
+        proposal.closed_reason = "entitlement_lapsed"
+        self._close_proposal_audit(
+            session, BILLING_SYSTEM_ACTOR_ID, proposal, "entitlement_lapsed"
+        )
+        if commit_immediately:
+            session.commit()
+
+    @classmethod
+    def _entitlement_active(
+        cls,
+        status: SubscriptionStatus,
+        current_period_end: datetime | None,
+        grace_expires_at: datetime | None,
+        now: datetime,
+    ) -> bool:
+        if status is SubscriptionStatus.COMPLIMENTARY:
+            return True
+        if status is SubscriptionStatus.ACTIVE:
+            if current_period_end is not None and now > cls._as_utc(current_period_end):
+                return False
+            return True
+        if status is SubscriptionStatus.GRACE:
+            return grace_expires_at is not None and now <= cls._as_utc(grace_expires_at)
+        return False
+
+    @staticmethod
+    def _ledger_entry(
+        session: Session,
+        record: CounselorEarningRecord,
+    ) -> LedgerEntryView:
+        counselor = session.get(UserRecord, record.counselor_id)
+        return LedgerEntryView(
+            id=record.id,
+            counselor_id=record.counselor_id,
+            counselor_name=counselor.name if counselor is not None else "Counselor",
+            member_id=record.intake_member_id,
+            entry_type=EarningEntryType(record.entry_type),
+            amount_minor_units=record.amount_minor_units,
+            currency=record.currency,
+            reason_code=record.reason_code,
+            created_at=record.created_at,
+        )
+
+    @staticmethod
+    def _pilot_plan(session: Session) -> PilotPlanRecord:
+        plan = session.scalar(
+            select(PilotPlanRecord).where(PilotPlanRecord.is_active.is_(True))
+        )
+        if plan is None:
+            raise NotFoundError("No active pilot plan is configured.")
+        return plan
+
+    @staticmethod
+    def _subscription(
+        session: Session,
+        member_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> SubscriptionRecord | None:
+        statement = select(SubscriptionRecord).where(
+            SubscriptionRecord.member_id == member_id
+        )
+        if for_update:
+            statement = statement.with_for_update().execution_options(
+                populate_existing=True
+            )
+        return session.scalar(statement)
+
+    @staticmethod
+    def _billing_customer(
+        session: Session,
+        member_id: uuid.UUID,
+    ) -> BillingCustomerRecord | None:
+        return session.scalar(
+            select(BillingCustomerRecord).where(
+                BillingCustomerRecord.member_id == member_id
+            )
+        )
 
     def _candidate_review_item(
         self,
@@ -2355,6 +3309,7 @@ class SqlAlchemyPilotRepository:
             screening_eligible=(
                 self._screening_status(session, member_id) is ScreeningStatus.ELIGIBLE
             ),
+            subscription_active=self._billing_evidence(session, member_id),
             active_hold=(
                 session.scalar(
                     select(HoldRecord.id).where(
@@ -2403,6 +3358,7 @@ class SqlAlchemyPilotRepository:
             )
             .order_by(HoldRecord.applied_at.desc())
         )
+        subscription = self._subscription(session, member_id)
         return {
             "consent_version": consent.version,
             "consent_acceptance_id": str(acceptance_id or "none"),
@@ -2420,6 +3376,10 @@ class SqlAlchemyPilotRepository:
             "screening_case_id": str(screening.id if screening else "none"),
             "screening_updated_at": (
                 screening.updated_at.isoformat() if screening else "none"
+            ),
+            "subscription_status": subscription.status if subscription else "none",
+            "subscription_updated_at": (
+                subscription.updated_at.isoformat() if subscription else "none"
             ),
             "active_hold_id": str(hold.id if hold else "none"),
         }
@@ -2529,8 +3489,8 @@ class SqlAlchemyPilotRepository:
             )
         )
 
-    @staticmethod
     def _active_participant_proposal(
+        self,
         session: Session,
         member: AuthenticatedUser,
         proposal_id: uuid.UUID,
@@ -2551,6 +3511,9 @@ class SqlAlchemyPilotRepository:
         if proposal is None:
             raise NotFoundError("Matched-pair conversation was not found.")
         if proposal.status != ProposalStatus.ACTIVE.value:
+            raise ConflictError("This matched-pair conversation is no longer active.")
+        if not self._pair_entitled(session, proposal):
+            self._reconcile_entitlement_lapse(session, proposal)
             raise ConflictError("This matched-pair conversation is no longer active.")
         return proposal
 
@@ -2609,6 +3572,9 @@ class SqlAlchemyPilotRepository:
         if assigned_member_id is None:
             raise NotFoundError("Matched pair was not found.")
         if proposal.status != ProposalStatus.ACTIVE.value:
+            raise ConflictError("This matched pair is no longer active.")
+        if not self._pair_entitled(session, proposal):
+            self._reconcile_entitlement_lapse(session, proposal)
             raise ConflictError("This matched pair is no longer active.")
         return proposal
 

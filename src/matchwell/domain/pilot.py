@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 
 from matchwell.domain.access import Role
-from matchwell.domain.readiness import ReadinessResult
+from matchwell.domain.readiness import TOTAL_ORDINARY_REQUIREMENTS, ReadinessResult
 
 
 class CounselorDecisionStatus(StrEnum):
@@ -85,7 +85,7 @@ class OperationsMember:
 
     @property
     def readiness_completed_count(self) -> int:
-        return 7 - len(self.readiness.unmet_requirements)
+        return TOTAL_ORDINARY_REQUIREMENTS - len(self.readiness.unmet_requirements)
 
 
 @dataclass(frozen=True, slots=True)
