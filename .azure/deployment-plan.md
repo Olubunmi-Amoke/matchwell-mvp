@@ -1,6 +1,6 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 ## Active Milestone: Billing, Entitlements, and Counselor Earnings
 
@@ -122,12 +122,11 @@ of open matches/introductions/messaging/guided journeys on entitlement loss,
 exactly-once $25 intake credits, and member/counselor/admin Streamlit UI are
 implemented.
 
-**Validation status:** Local validation complete: 174 tests pass with 95.47%
-coverage, Ruff lint and formatting and strict mypy pass, PostgreSQL offline
-upgrade/downgrade SQL generation passes, source and wheel packages build, both
-Streamlit and FastAPI health endpoints return HTTP 200, and three focused
-reviews have been resolved. Live PostgreSQL migration and container validation
-remain for GitHub Actions.
+**Validation status:** Validated: 174 tests pass with 95.47% coverage, Ruff lint
+and formatting and strict mypy pass, PostgreSQL migration validation passes in
+GitHub Actions, source and wheel packages build, both Streamlit and FastAPI
+health endpoints return HTTP 200, the container build passes, and three focused
+reviews have been resolved.
 
 ## Active Milestone: Guided Matched-Pair Journey
 
@@ -854,7 +853,7 @@ remain an operator concern and are not provisioned by repository automation.
 
 ### Billing, entitlements, and counselor earnings validation
 
-- [ ] All validation checks pass
+- [x] All validation checks pass
   - [x] Ruff lint and formatting
   - [x] Strict mypy type checking
   - [x] Complete pytest suite with coverage threshold
@@ -862,7 +861,7 @@ remain an operator concern and are not provisioned by repository automation.
   - [x] Python source distribution and wheel build
   - [x] Streamlit and FastAPI health endpoint smoke verification
   - [x] Focused Stripe, entitlement, webhook, migration, and concurrency reviews
-  - [ ] GitHub Actions PostgreSQL and container jobs
+  - [x] GitHub Actions PostgreSQL and container jobs
 
 ### Phase 4: Future Azure Preparation
 
@@ -933,6 +932,7 @@ remain an operator concern and are not provisioned by repository automation.
 | Billing Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-08 |
 | Billing webhook health | `GET /health` | HTTP 200 `ready` | 2026-09-08 |
 | Billing focused reviews | Three implementation and release reviews | All findings resolved | 2026-09-08 |
+| Billing CI | GitHub Actions `python` and `container` jobs | Pass | 2026-09-08 |
 
 ### Functional verification
 
