@@ -7,8 +7,37 @@ services:
       MATCHWELL_ADMIN_EMAILS: ${MATCHWELL_ADMIN_EMAILS:-admin@example.com}
       MATCHWELL_AUTO_MIGRATE: "true"
       MATCHWELL_ENVIRONMENT: development
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PILOT_PRICE_ID: ${STRIPE_PILOT_PRICE_ID:-}
+      MATCHWELL_CHECKOUT_SUCCESS_URL: ${MATCHWELL_CHECKOUT_SUCCESS_URL:-}
+      MATCHWELL_CHECKOUT_CANCEL_URL: ${MATCHWELL_CHECKOUT_CANCEL_URL:-}
+      MATCHWELL_BILLING_PORTAL_RETURN_URL: ${MATCHWELL_BILLING_PORTAL_RETURN_URL:-}
     ports:
       - "7860:7860"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Companion Stripe webhook receiver. Streamlit Community Cloud cannot
+  # receive verified POST requests, so this shares the app image and
+  # database but runs FastAPI/uvicorn instead of Streamlit. Only starts
+  # correctly once every STRIPE_* variable above is set.
+  webhook:
+    build:
+      context: .
+    command: ["uvicorn", "app.webhook_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://matchwell:${POSTGRES_PASSWORD:-matchwell_dev}@db:5432/matchwell
+      MATCHWELL_ENVIRONMENT: development
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PILOT_PRICE_ID: ${STRIPE_PILOT_PRICE_ID:-}
+      MATCHWELL_CHECKOUT_SUCCESS_URL: ${MATCHWELL_CHECKOUT_SUCCESS_URL:-}
+      MATCHWELL_CHECKOUT_CANCEL_URL: ${MATCHWELL_CHECKOUT_CANCEL_URL:-}
+      MATCHWELL_BILLING_PORTAL_RETURN_URL: ${MATCHWELL_BILLING_PORTAL_RETURN_URL:-}
+    ports:
+      - "8000:8000"
     depends_on:
       db:
         condition: service_healthy

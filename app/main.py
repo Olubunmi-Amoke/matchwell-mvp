@@ -10,6 +10,7 @@ from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
 from matchwell.domain.errors import MatchwellError
 from matchwell.domain.matching import MatchScorer
 from matchwell.domain.readiness import ReadinessEvaluator
+from matchwell.infrastructure.billing.stripe_gateway import build_stripe_gateway
 from matchwell.infrastructure.persistence.database import (
     DatabaseSessionFactory,
     SqlAlchemyDatabaseProbe,
@@ -27,6 +28,7 @@ from matchwell.presentation.branding import (
 )
 from matchwell.presentation.member import (
     render_assessment,
+    render_billing,
     render_consent,
     render_dashboard,
     render_introduction,
@@ -55,10 +57,19 @@ def build_service(_settings: Settings) -> PilotService:
     if _settings.auto_migrate:
         upgrade_database(database_url)
     engine = create_database_engine(database_url)
+    payment_gateway = build_stripe_gateway(
+        secret_key=_settings.reveal_stripe_secret_key(),
+        webhook_secret=_settings.reveal_stripe_webhook_secret(),
+        price_id=_settings.stripe_pilot_price_id,
+        checkout_success_url=_settings.checkout_success_url,
+        checkout_cancel_url=_settings.checkout_cancel_url,
+        billing_portal_return_url=_settings.billing_portal_return_url,
+    )
     repository = SqlAlchemyPilotRepository(
         DatabaseSessionFactory(engine),
         ReadinessEvaluator(),
         MatchScorer(),
+        payment_gateway=payment_gateway,
     )
     return PilotService(repository, _settings.normalized_admin_emails())
 
@@ -115,6 +126,12 @@ def member_pages(
                 title="Assessment",
                 icon=":material/assignment:",
                 url_path="assessment",
+            ),
+            st.Page(
+                lambda: render_billing(service, actor),
+                title="Billing",
+                icon=":material/credit_card:",
+                url_path="billing",
             ),
         ],
         "Matching": [

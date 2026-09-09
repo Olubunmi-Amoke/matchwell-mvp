@@ -651,6 +651,198 @@ class JourneyTaskCompletionRecord(Base):
     )
 
 
+class PilotPlanRecord(Base):
+    """Seeded catalog of billable pilot plans; never stores payment details."""
+
+    __tablename__ = "pilot_plans"
+    __table_args__ = (UniqueConstraint("key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    price_minor_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class BillingCustomerRecord(Base):
+    """Provider customer mapping only; no card or bank details are stored."""
+
+    __tablename__ = "billing_customers"
+    __table_args__ = (
+        UniqueConstraint("member_id"),
+        UniqueConstraint("provider", "provider_customer_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)
+    provider_customer_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class SubscriptionRecord(Base):
+    """Current entitlement projection; one authoritative row per member."""
+
+    __tablename__ = "subscriptions"
+    __table_args__ = (UniqueConstraint("member_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("pilot_plans.id"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)
+    provider_subscription_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+    current_period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_at_period_end: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    grace_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_provider_event_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reason_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class EntitlementHistoryRecord(Base):
+    """Append-only entitlement transition history; never updated or deleted."""
+
+    __tablename__ = "entitlement_history"
+    __table_args__ = (
+        Index("ix_entitlement_history_member_occurred", "member_id", "occurred_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+    )
+    from_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+    provider_event_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    safe_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT,
+        nullable=False,
+        default=dict,
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class BillingWebhookReceiptRecord(Base):
+    """Idempotency ledger of processed provider webhook event IDs."""
+
+    __tablename__ = "billing_webhook_receipts"
+    __table_args__ = (UniqueConstraint("provider", "provider_event_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Populated only while ``applied`` is False: a safe, non-sensitive code
+    # explaining why (never the raw payload or any provider secret).
+    unresolved_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class CounselorEarningRecord(Base):
+    """Append-only counselor earnings ledger; balances are always derived."""
+
+    __tablename__ = "counselor_earnings"
+    __table_args__ = (
+        Index(
+            "uq_counselor_earnings_intake_member",
+            "intake_member_id",
+            unique=True,
+            postgresql_where=text("entry_type = 'intake_credit'"),
+            sqlite_where=text("entry_type = 'intake_credit'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"),
+        nullable=False,
+        index=True,
+    )
+    counselor_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+    intake_member_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+    entry_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    amount_minor_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class JourneyCheckInRecord(Base):
     __tablename__ = "journey_check_ins"
     __table_args__ = (

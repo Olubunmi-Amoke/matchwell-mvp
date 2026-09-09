@@ -1,6 +1,133 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Validated
+> **Status:** Ready for Validation
+
+## Active Milestone: Billing, Entitlements, and Counselor Earnings
+
+**Requirement:** `MW-PRD-014`
+
+**Goal:** Let the pilot manage member subscription state as an authoritative
+entitlement and record immutable counselor earnings without automating payouts.
+
+### Planning decisions required
+
+- [x] Use Stripe test-mode Checkout with verified, idempotent webhooks.
+- [x] Offer one `Matchwell Pilot` plan at $49 USD per month.
+- [x] Grant existing members a complimentary pilot entitlement during migration.
+- [x] Require an active or grace-period entitlement for community unlock and all
+  later matching, introduction, messaging, and guided-journey access.
+- [x] Credit the assigned counselor $25 USD once for each completed intake
+  decision.
+- [x] Keep entitlement active for a seven-day payment-failure grace period, then
+  suspend it unless Stripe reports recovery.
+
+### Scope
+
+- Add a provider-neutral billing domain with subscription states, entitlement
+  views, checkout-session requests, webhook receipts, and earnings entries.
+- Add a Stripe adapter for test-mode Checkout and Billing Portal sessions.
+- Add a narrowly scoped companion FastAPI webhook service because Streamlit
+  Community Cloud cannot expose arbitrary verified POST endpoints. The service
+  shares the billing application layer and PostgreSQL database but has no member
+  or administrative UI.
+- Verify Stripe webhook signatures from the unmodified request body and process
+  each provider event ID exactly once.
+- Normalize checkout completion, subscription updates/deletion, successful
+  invoices, failed invoices, and refunds without exposing Stripe objects to
+  other domain modules.
+- Preserve access until a scheduled cancellation reaches the paid-through date.
+  A recovered payment during the seven-day grace period restores ordinary active
+  state without creating duplicate entitlement history.
+- Add a member billing workspace showing plan, normalized status, paid-through
+  date, grace deadline, and safe checkout/manage-subscription actions.
+- Add an administrator billing queue for member status, webhook failures,
+  complimentary grants, and reasoned manual corrections.
+- Add a counselor earnings view and an administrator ledger view. Ledger credits
+  and corrections are append-only; balances are derived, never overwritten.
+- Create the $25 intake credit in the same transaction as the first completed
+  counselor decision, with a unique source key preventing duplicate earnings.
+- Backfill active complimentary entitlements for existing members. New members
+  must complete Stripe test checkout before community unlock.
+- Reevaluate readiness and reconcile open introductions, conversations, and
+  guided journeys whenever entitlement becomes inactive.
+
+### Authorization and data handling
+
+- Members may read and manage only their own billing relationship.
+- Counselors may read only their own earnings ledger and derived balance.
+- Center administrators may read Center-scoped subscription operations and
+  counselor earnings, but never full payment-instrument data.
+- Store provider IDs, normalized subscription status, dates, currency, and
+  amounts only; never store card or bank details.
+- Use integer minor units for all monetary values.
+- Every complimentary grant, subscription transition, entitlement decision,
+  earnings credit, and manual adjustment is auditable with safe metadata.
+- Webhook secrets and Stripe API keys remain environment secrets and are never
+  emitted to logs, audit records, or outbox payloads.
+
+### Migration and configuration
+
+- Add the next Alembic migration after `20260904_0005`.
+- Seed the single pilot plan and add subscription entitlement as an authoritative
+  readiness requirement.
+- Add settings for Stripe test secret key, webhook secret, pilot price ID,
+  checkout return URLs, and the seven-day grace interval.
+- Keep Stripe calls behind an injected adapter so repository and service tests
+  use deterministic fakes.
+
+### Validation
+
+- Role, ownership, Center-isolation, and direct-object-reference tests.
+- Checkout ownership and redirect validation.
+- Webhook signature, replay, out-of-order event, and duplicate-event tests.
+- Active, grace, canceled-at-period-end, suspended, recovered, and complimentary
+  entitlement behavior.
+- Readiness and active-relationship reconciliation after entitlement loss.
+- Exactly-once $25 intake credits and append-only correction behavior.
+- No provider secrets, payment details, or sensitive webhook bodies in audit,
+  outbox, logs, or errors.
+- Migration upgrade/downgrade SQL, Streamlit smoke test, lint, types, tests,
+  focused review, package/container build, and CI.
+
+### Required boundaries
+
+- Billing owns provider customer/subscription mappings and normalized commercial
+  state. Other modules consume provider-neutral entitlements.
+- Payment callbacks are authenticated and idempotent.
+- Entitlement changes and earnings adjustments create safe immutable audit and
+  outbox events.
+- Counselor earnings use append-only credit and adjustment entries; automated
+  payout remains deferred.
+- Center-owned billing and ledger records carry `center_id`.
+- Safety holds continue to override relationship access regardless of payment
+  state.
+
+### Delivery boundaries
+
+- Continue using the existing Streamlit modular monolith and PostgreSQL recipe.
+- Preserve a provider adapter boundary so Stripe-specific objects do not leak
+  into readiness, matching, messaging, or guided-journey code.
+- Package the webhook receiver as an independently deployable process with a
+  health endpoint; deployment and public endpoint configuration remain separate
+  from the Streamlit Community Cloud application.
+- Add no Azure resources in this milestone.
+
+**Implementation status:** Complete. Provider-neutral billing domain,
+SQLAlchemy models, migration `20260908_0006` (seeded plan, idempotent webhook
+receipts, provider mappings, entitlement current/history projection,
+append-only counselor earnings), Stripe test-mode adapter, companion FastAPI
+webhook service with `/health` and signature-verified `/webhooks/stripe`,
+readiness wiring (`subscription` requirement, `billing` stage), reconciliation
+of open matches/introductions/messaging/guided journeys on entitlement loss,
+exactly-once $25 intake credits, and member/counselor/admin Streamlit UI are
+implemented.
+
+**Validation status:** Local validation complete: 174 tests pass with 95.47%
+coverage, Ruff lint and formatting and strict mypy pass, PostgreSQL offline
+upgrade/downgrade SQL generation passes, source and wheel packages build, both
+Streamlit and FastAPI health endpoints return HTTP 200, and three focused
+reviews have been resolved. Live PostgreSQL migration and container validation
+remain for GitHub Actions.
 
 ## Active Milestone: Guided Matched-Pair Journey
 
@@ -725,6 +852,18 @@ remain an operator concern and are not provisioned by repository automation.
   - [x] Focused privacy, authorization, and concurrency review
   - [x] GitHub Actions Docker image build
 
+### Billing, entitlements, and counselor earnings validation
+
+- [ ] All validation checks pass
+  - [x] Ruff lint and formatting
+  - [x] Strict mypy type checking
+  - [x] Complete pytest suite with coverage threshold
+  - [x] PostgreSQL offline upgrade and downgrade SQL generation
+  - [x] Python source distribution and wheel build
+  - [x] Streamlit and FastAPI health endpoint smoke verification
+  - [x] Focused Stripe, entitlement, webhook, migration, and concurrency reviews
+  - [ ] GitHub Actions PostgreSQL and container jobs
+
 ### Phase 4: Future Azure Preparation
 
 - [ ] Confirm Azure subscription and US region
@@ -786,6 +925,14 @@ remain an operator concern and are not provisioned by repository automation.
 | Guided journey Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-04 |
 | Guided journey review | Focused diff review | No significant issues found | 2026-09-04 |
 | Guided journey CI | GitHub Actions `python` and `container` jobs | Pass | 2026-09-04 |
+| Billing lint and formatting | `ruff check`; `ruff format --check` | Pass | 2026-09-08 |
+| Billing types | `uv run --no-sync mypy` | Pass | 2026-09-08 |
+| Billing tests | `uv run --no-sync pytest` | 174 passed, 95.47% coverage | 2026-09-08 |
+| Billing migration SQL | `alembic upgrade head --sql`; `alembic downgrade head:base --sql` | Pass | 2026-09-08 |
+| Billing package build | `uv build --out-dir <session-artifacts>` | Source distribution and wheel built | 2026-09-08 |
+| Billing Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-08 |
+| Billing webhook health | `GET /health` | HTTP 200 `ready` | 2026-09-08 |
+| Billing focused reviews | Three implementation and release reviews | All findings resolved | 2026-09-08 |
 
 ### Functional verification
 

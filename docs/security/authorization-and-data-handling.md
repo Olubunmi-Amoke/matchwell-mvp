@@ -36,6 +36,7 @@ endpoints.
 | Assessment answers | Store only in the assessments boundary; never log or include in general audit payloads |
 | Counseling notes | Keep separate from structured readiness decisions; restrict to counseling purpose |
 | Screening reports | Do not copy broadly into Matchwell; retain only provider reference and minimum normalized status summary |
+| Payment data | Store only provider customer/subscription IDs, normalized status, dates, currency, and integer minor-unit amounts; never store card or bank details; Stripe secret keys and webhook secrets are environment secrets, never logged, audited, or placed in outbox payloads |
 | Identity evidence | Retain only required verification outcome and metadata |
 | Messages | Encrypt in transit and at rest; exclude content from telemetry and general audit payloads |
 | Files and media | Store in private Blob containers with short-lived, purpose-bound access |
