@@ -89,6 +89,11 @@ jobs:
           python -m pip install --disable-pip-version-check uv==0.11.19
           uv sync --frozen --extra dev
 
+      - name: Install PostgreSQL 17 client tools
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --yes postgresql-client-17
+
       - name: Confirm PostgreSQL client tools are available
         run: |
           pg_dump --version
