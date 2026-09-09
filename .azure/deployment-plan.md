@@ -1,6 +1,6 @@
 # Matchwell Pilot Implementation Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 ## Active Milestone: Pilot Hardening
 
@@ -130,17 +130,15 @@ DML-only database role, and the manual keyboard/screen-reader
 accessibility pass. These require real hosting infrastructure or a human
 operator and are intentionally not fabricated here.
 
-**Validation status:** Local validation complete; GitHub validation pending.
-Locally: 242 tests pass with
+**Validation status:** Validated. Locally: 242 tests pass with
 95.44% coverage (≥90% gate), Ruff lint and formatting pass, strict mypy
 passes, offline PostgreSQL migration upgrade/downgrade/upgrade renders
 cleanly for the full history including `20260909_0007`, and the source and
 wheel packages build. The Streamlit health endpoint returns HTTP 200. Two
 focused implementation reviews and two security reviews were completed, and
-all findings were resolved. Docker was not available in this environment, so the
-container build and the GitHub Actions `backup-restore-drill` job (which
-needs a live PostgreSQL service) must be confirmed in CI. No deployment,
-commit, or push has been performed yet.
+all findings were resolved. GitHub Actions passed the Python/PostgreSQL,
+container build, and synthetic backup/restore drill jobs. No production
+deployment was performed because deployment is outside this milestone.
 
 ## Active Milestone: Billing, Entitlements, and Counselor Earnings
 
@@ -1081,6 +1079,7 @@ remain an operator concern and are not provisioned by repository automation.
 | Pilot hardening Streamlit health | `GET /_stcore/health` | HTTP 200 `ok` | 2026-09-09 |
 | Pilot hardening reviews | Focused implementation and security reviews | All findings resolved | 2026-09-09 |
 | Pilot hardening Azure RBAC review | No Azure infrastructure in this milestone | Not applicable | 2026-09-09 |
+| Pilot hardening CI | GitHub Actions `python`, `container`, and `backup-restore-drill` jobs | Pass | 2026-09-09 |
 
 ### Functional verification
 
