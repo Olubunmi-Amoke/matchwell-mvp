@@ -18,7 +18,13 @@ from matchwell.application.pilot import PilotService
 from matchwell.domain.errors import AuthenticationError, MatchwellError, ValidationError
 from matchwell.domain.system_health import HealthStatus
 from matchwell.infrastructure.billing.stripe_gateway import StripePaymentGateway
+from matchwell.infrastructure.observability.logging import (
+    OperationalEvent,
+    configure_json_logging,
+    log_event,
+)
 
+configure_json_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -81,13 +87,22 @@ def create_app(
                 event,
             )
         except MatchwellError as error:
-            logger.exception("Stripe webhook event was rejected by the domain.")
+            log_event(
+                logger,
+                OperationalEvent.BILLING_WEBHOOK_UNAPPLIED,
+                error_type=type(error).__name__,
+            )
             raise HTTPException(
                 status_code=422,
                 detail="The webhook event could not be processed.",
             ) from error
         except SQLAlchemyError as error:
-            logger.exception("Stripe webhook processing hit a database error.")
+            log_event(
+                logger,
+                OperationalEvent.BILLING_WEBHOOK_UNAPPLIED,
+                error_type=type(error).__name__,
+                transient=True,
+            )
             # 503 signals Stripe to retry; the event ID is not yet marked
             # applied so a retry safely re-attempts the same transition.
             raise HTTPException(

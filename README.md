@@ -199,6 +199,38 @@ reflection text is visible only when that member explicitly shares it.
 Individual activity completion is never exposed to the partner. Closing the
 match immediately closes journey access while retaining its audit history.
 
+### Pilot hardening: accounts, backups, observability, and analytics
+
+Administrators can immediately **disable or reactivate** any account in
+their Center from **Pilot operations → Account access**, with a
+constrained reason code and an immutable audit/outbox event. Self-disable
+and disabling the last active administrator are both prohibited. Disabled
+accounts are checked on every sign-in before an actor is ever returned,
+and admin access is reconciled against `MATCHWELL_ADMIN_EMAILS` on every
+sign-in in both directions -- removing an email revokes admin access even
+if the stored role still says admin, and reactivation of a disabled
+account always remains a separate, explicit administrator action.
+
+**Pilot operations → Dashboard** shows alert-ready aggregate metrics
+(denied sign-ins, unapplied provider events, overdue check-ins, recent
+safety activity, backup drill age) and privacy-safe funnel/conversion
+analytics with small-cell suppression for safety and provider-failure
+counts. No hosted monitoring provider is used; see
+[Monitoring and alerts](docs/runbooks/monitoring-and-alerts.md).
+
+PostgreSQL backup and restore is handled by operator scripts in
+`scripts/backup/` (`pg-dump`/`pg-restore`, PowerShell and POSIX shell) that
+refuse to overwrite the source database and restore only into a separate,
+explicitly named database, then run migrations and privacy-safe invariant
+verification. The same drill runs automatically in GitHub Actions against
+synthetic data. See
+[Backup and restore](docs/runbooks/backup-and-restore.md).
+
+Screening status changes and provider callbacks are constrained to a safe
+reason-code allow-list (never free text), with the same idempotent
+receipt-and-retry diagnostics pattern as billing; see
+[Provider failure recovery](docs/runbooks/provider-failure-recovery.md).
+
 ### Quality checks
 
 ```powershell
@@ -216,6 +248,11 @@ uv run pytest
 - [System architecture](docs/architecture/system-architecture.md)
 - [Domain boundaries](docs/architecture/domain-boundaries.md)
 - [Authorization and data handling](docs/security/authorization-and-data-handling.md)
+- [Pilot launch checklist](docs/security/pilot-launch-checklist.md)
+- [Backup and restore runbook](docs/runbooks/backup-and-restore.md)
+- [Provider failure recovery runbook](docs/runbooks/provider-failure-recovery.md)
+- [Monitoring and alerts runbook](docs/runbooks/monitoring-and-alerts.md)
+- [Accessibility checklist](docs/runbooks/accessibility-checklist.md)
 - [ADR 0001: Modular monolith](docs/decisions/0001-modular-monolith.md)
 
 ## Intended repository layout

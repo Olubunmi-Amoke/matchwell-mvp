@@ -63,6 +63,26 @@ def test_non_google_identity_is_rejected() -> None:
         )
 
 
+def test_missing_oidc_issuer_fails_closed() -> None:
+    """A missing ``iss`` claim must never fall back to a trusted issuer.
+
+    Regression test for app/main.py's ``current_identity()``, which used to
+    default a missing claim to "https://accounts.google.com" (fail open).
+    An empty issuer -- exactly what a missing claim now produces -- must be
+    rejected the same way as any other untrusted issuer.
+    """
+    with pytest.raises(AuthenticationError):
+        service().sign_in(
+            OidcIdentity(
+                issuer="",
+                subject="subject",
+                email="member@example.com",
+                email_verified=True,
+                name="Member",
+            )
+        )
+
+
 def test_member_workspace_rejects_admin() -> None:
     with pytest.raises(AuthorizationError):
         service().profile(actor(Role.ADMIN))
@@ -382,3 +402,35 @@ def test_report_context_over_limit_is_rejected() -> None:
             SafetyCategory.HARASSMENT,
             "x" * 501,
         )
+
+
+def test_disable_account_requires_admin_role() -> None:
+    from matchwell.domain.access import AccountDisableReasonCode
+
+    with pytest.raises(AuthorizationError):
+        service().disable_account(
+            actor(Role.MEMBER),
+            uuid.uuid4(),
+            AccountDisableReasonCode.SAFETY_CONCERN,
+        )
+
+
+def test_reactivate_account_requires_admin_role() -> None:
+    from matchwell.domain.access import AccountReactivateReasonCode
+
+    with pytest.raises(AuthorizationError):
+        service().reactivate_account(
+            actor(Role.COUNSELOR),
+            uuid.uuid4(),
+            AccountReactivateReasonCode.MEMBER_REQUESTED,
+        )
+
+
+def test_accounts_queue_requires_admin_role() -> None:
+    with pytest.raises(AuthorizationError):
+        service().accounts(actor(Role.MEMBER))
+
+
+def test_screening_failures_requires_admin_role() -> None:
+    with pytest.raises(AuthorizationError):
+        service().screening_failures(actor(Role.COUNSELOR))

@@ -4,8 +4,14 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 
-from matchwell.domain.access import Role
+from matchwell.domain.access import AccountStatus, Role
 from matchwell.domain.readiness import TOTAL_ORDINARY_REQUIREMENTS, ReadinessResult
+
+# A stable, non-human identity used to attribute provider-callback-driven
+# audit events, matching billing's ``BILLING_SYSTEM_ACTOR_ID`` pattern and
+# the "background jobs and provider callbacks use dedicated identities"
+# authorization principle.
+SCREENING_SYSTEM_ACTOR_ID = uuid.UUID(int=0)
 
 
 class CounselorDecisionStatus(StrEnum):
@@ -20,6 +26,79 @@ class ScreeningStatus(StrEnum):
     ELIGIBLE = "eligible"
     INELIGIBLE = "ineligible"
     FAILED = "failed"
+
+
+class ScreeningReasonCode(StrEnum):
+    """Safe, constrained screening reason/status codes.
+
+    Never free text: provider reports and free-form screening detail must
+    never enter Matchwell. Only these operationally meaningful codes may be
+    recorded, displayed, or included in audit metadata.
+    """
+
+    IDENTITY_VERIFICATION_FAILED = "identity_verification_failed"
+    PROVIDER_INELIGIBLE_RESULT = "provider_ineligible_result"
+    PROVIDER_ERROR = "provider_error"
+    PROVIDER_TIMEOUT = "provider_timeout"
+    DOCUMENT_UNREADABLE = "document_unreadable"
+    DUPLICATE_SUBMISSION = "duplicate_submission"
+    MANUAL_REVIEW_REQUIRED = "manual_review_required"
+    EXPIRED = "expired"
+    OTHER_OPERATIONAL = "other_operational"
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningProviderEvent:
+    """A normalized, provider-neutral screening callback event.
+
+    Mirrors ``BillingWebhookEvent``'s idempotent-processing shape. This pilot
+    has no live external screening provider; any future adapter verifies the
+    real provider's signature and keeps its payload behind its own boundary,
+    constructing only this safe, minimal event.
+    """
+
+    provider: str
+    provider_event_id: str
+    provider_reference: str | None
+    status: ScreeningStatus | None
+    reason_code: ScreeningReasonCode | None
+    occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningFailureView:
+    """A safe, admin-facing view of a screening receipt that never applied.
+
+    Mirrors ``WebhookFailureView`` in the billing domain. Never carries a raw
+    provider payload, screening report, or free-text detail -- only
+    identifiers and a constrained reason code needed to triage and retry.
+    """
+
+    id: uuid.UUID
+    provider: str
+    provider_event_id: str
+    event_type: str
+    member_id: uuid.UUID | None
+    unresolved_reason: str | None
+    received_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AccountRow:
+    """Admin-facing account row for the account access/security workspace.
+
+    Never includes OIDC subject, tokens, or any authentication secret.
+    """
+
+    id: uuid.UUID
+    email: str
+    display_name: str
+    role: Role
+    status: AccountStatus
+    disabled_reason_code: str | None
+    disabled_at: datetime | None
+    is_self: bool
+    counselor_needs_reassignment: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +157,8 @@ class OperationsMember:
     screening_status: ScreeningStatus
     hold_active: bool
     readiness: ReadinessResult
+    account_status: AccountStatus = AccountStatus.ACTIVE
+    counselor_needs_reassignment: bool = False
 
     @property
     def eligible(self) -> bool:

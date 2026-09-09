@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from matchwell.application.pilot import PilotService
-from matchwell.domain.access import AuthenticatedUser, OidcIdentity, Role
+from matchwell.domain.access import AccountStatus, AuthenticatedUser, OidcIdentity, Role
 from matchwell.domain.billing import (
     BillingPortalSessionView,
     BillingWebhookEvent,
@@ -30,6 +30,7 @@ from matchwell.domain.matching import (
     ProposalStatus,
 )
 from matchwell.domain.pilot import (
+    AccountRow,
     CounselorDecisionStatus,
     InvitationInput,
     ProfileInput,
@@ -1256,6 +1257,25 @@ def test_admin_webhook_failures_queue_lists_unapplied_receipts_only(
 
     applied_event = _checkout_event(member_id=member.id, occurred_at=now)
     service.process_billing_webhook_event(applied_event)
+    # A newer state is applied first, then a stale, out-of-order update for
+    # the same (resolvable) customer never regresses -- an unapplied
+    # failure this Center's admin can see because it resolves to this
+    # Center via the member.
+    service.process_billing_webhook_event(
+        _subscription_updated_event(
+            provider_customer_id="cus_1",
+            occurred_at=now + timedelta(hours=2),
+            status="active",
+        )
+    )
+    stale_event = _subscription_updated_event(
+        provider_customer_id="cus_1",
+        occurred_at=now + timedelta(hours=1),
+        status="past_due",
+    )
+    service.process_billing_webhook_event(stale_event)
+    # An event whose customer never resolves to any member has no Center to
+    # scope it to; it must never be exposed to any Center admin.
     unresolvable_event = _subscription_updated_event(
         provider_customer_id="cus_unknown",
         occurred_at=now,
@@ -1267,14 +1287,13 @@ def test_admin_webhook_failures_queue_lists_unapplied_receipts_only(
         service.billing_webhook_failures(counselor)
 
     failures = service.billing_webhook_failures(admin)
-    assert [f.provider_event_id for f in failures] == [
-        unresolvable_event.provider_event_id
-    ]
-    assert failures[0].unresolved_reason == "unresolvable_member"
-    # The successfully applied checkout event never shows up as a failure.
-    assert applied_event.provider_event_id not in [
-        f.provider_event_id for f in failures
-    ]
+    assert [f.provider_event_id for f in failures] == [stale_event.provider_event_id]
+    assert failures[0].unresolved_reason == "out_of_order_event"
+    # The successfully applied checkout event never shows up as a failure,
+    # and the unresolvable-member event is never exposed to any admin.
+    failure_ids = [f.provider_event_id for f in failures]
+    assert applied_event.provider_event_id not in failure_ids
+    assert unresolvable_event.provider_event_id not in failure_ids
 
 
 def test_webhook_refund_is_recorded_without_altering_status(pilot: Pilot) -> None:
@@ -1472,3 +1491,75 @@ def test_billing_audit_and_outbox_never_contain_secrets_or_card_data(
     haystacks = " ".join(audit_blobs + outbox_blobs).lower()
     for marker in forbidden_markers:
         assert marker.lower() not in haystacks
+
+
+def test_ledger_and_billing_queue_are_isolated_across_centers(pilot: Pilot) -> None:
+    """Cross-Center IDOR: a second Center's admin never sees this Center's
+    billing queue, counselor earnings ledger, or webhook failures, and vice
+    versa -- even though both share the same underlying database."""
+    service, sessions, _ = pilot
+    admin = service.sign_in(identity("admin@example.com", "admin-sub"))
+    assert admin is not None
+    counselor = _invite_and_sign_in(
+        service, admin, Role.COUNSELOR, "counselor@example.com", "counselor-sub"
+    )
+    member = _invite_and_sign_in(
+        service, admin, Role.MEMBER, "member@example.com", "member-sub"
+    )
+    service.grant_complimentary_entitlement(admin, member.id, "pilot-migration")
+    service.record_earnings_adjustment(admin, counselor.id, 1_000, "bonus")
+
+    with sessions.session() as session, session.begin():
+        other_center_id = uuid.uuid4()
+        session.add(
+            CenterRecord(id=other_center_id, slug="other-center", name="Other Center")
+        )
+        session.add(
+            CommunityRecord(
+                id=uuid.uuid4(),
+                center_id=other_center_id,
+                slug="other-community",
+                name="Other Community",
+            )
+        )
+        other_admin_record = UserRecord(
+            center_id=other_center_id,
+            oidc_issuer="https://accounts.google.com",
+            oidc_subject="other-admin-sub",
+            email="other-admin@example.com",
+            name="Other Admin",
+            role=Role.ADMIN.value,
+        )
+        session.add(other_admin_record)
+        session.flush()
+        other_admin_id = other_admin_record.id
+
+    other_admin = AuthenticatedUser(
+        id=other_admin_id,
+        email="other-admin@example.com",
+        name="Other Admin",
+        role=Role.ADMIN,
+        center_id=other_center_id,
+    )
+
+    assert len(service.billing_queue(admin)) > 0
+    assert len(service.billing_queue(other_admin)) == 0
+
+    assert len(service.ledger(admin)) > 0
+    assert len(service.ledger(other_admin)) == 0
+
+    assert list(service.accounts(other_admin)) == [
+        AccountRow(
+            id=other_admin_id,
+            email="other-admin@example.com",
+            display_name="Other Admin",
+            role=Role.ADMIN,
+            status=AccountStatus.ACTIVE,
+            disabled_reason_code=None,
+            disabled_at=None,
+            is_self=True,
+            counselor_needs_reassignment=False,
+        ),
+    ]
+    account_ids = {row.id for row in service.accounts(admin)}
+    assert other_admin_id not in account_ids

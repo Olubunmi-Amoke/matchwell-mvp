@@ -12,7 +12,12 @@ from matchwell.application.pilot import (
     ROLE_REASSIGNMENT_REASON_CODES,
     PilotService,
 )
-from matchwell.domain.access import AuthenticatedUser, Role
+from matchwell.domain.access import (
+    AccountDisableReasonCode,
+    AccountReactivateReasonCode,
+    AuthenticatedUser,
+    Role,
+)
 from matchwell.domain.billing import SubscriptionStatus
 from matchwell.domain.errors import MatchwellError
 from matchwell.domain.journey import ReminderState
@@ -21,6 +26,7 @@ from matchwell.domain.pilot import (
     CounselorDecisionStatus,
     InvitationInput,
     OperationsMember,
+    ScreeningReasonCode,
     ScreeningStatus,
 )
 from matchwell.domain.readiness import TOTAL_ORDINARY_REQUIREMENTS
@@ -38,28 +44,36 @@ def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Pilot operations")
     st.caption("Task-oriented queues for the pilot Center.")
     (
+        dashboard_tab,
         invitation_tab,
         members_tab,
         counselors_tab,
+        accounts_tab,
         matching_tab,
         billing_tab,
         ledger_tab,
     ) = st.tabs(
         [
+            "Dashboard",
             "Invitations",
             "Member readiness",
             "Counselors",
+            "Account access",
             "Matching",
             "Billing",
             "Ledger",
         ]
     )
+    with dashboard_tab:
+        _render_admin_dashboard(service, actor)
     with invitation_tab:
         _render_invitations(service, actor)
     with members_tab:
         _render_member_operations(service, actor)
     with counselors_tab:
         _render_counselor_operations(service, actor)
+    with accounts_tab:
+        _render_account_access(service, actor)
     with matching_tab:
         _render_admin_matching(service, actor)
     with billing_tab:
@@ -600,6 +614,10 @@ def _render_member_operations(
                 "Screening": humanize(item.screening_status.value),
                 "Hold": "Active" if item.hold_active else "None",
                 "Eligible": "Yes" if item.eligible else "No",
+                "Account": humanize(item.account_status.value),
+                "Needs reassignment": (
+                    "Yes" if item.counselor_needs_reassignment else ""
+                ),
             }
             for item in members
         ],
@@ -644,7 +662,11 @@ def _render_member_operations(
             "Provider event ID",
             value=str(uuid.uuid4()),
         )
-        reason_code = st.text_input("Reason code (optional)")
+        reason_code = st.selectbox(
+            "Reason code (optional)",
+            options=[None, *list(ScreeningReasonCode)],
+            format_func=lambda item: "None" if item is None else humanize(item.value),
+        )
         screening_submitted = st.form_submit_button("Record screening status")
     if screening_submitted:
         try:
@@ -654,7 +676,7 @@ def _render_member_operations(
                 screening_status,
                 provider_event_id,
                 provider_reference,
-                reason_code or None,
+                reason_code,
             )
         except MatchwellError as error:
             st.error(str(error))
@@ -801,6 +823,7 @@ def _render_admin_billing(service: PilotService, actor: AuthenticatedUser) -> No
                 st.rerun()
 
     _render_admin_webhook_failures(service, actor)
+    _render_admin_screening_failures(service, actor)
 
 
 def _render_admin_webhook_failures(
@@ -834,6 +857,235 @@ def _render_admin_webhook_failures(
         hide_index=True,
         use_container_width=True,
     )
+
+
+def _render_admin_screening_failures(
+    service: PilotService, actor: AuthenticatedUser
+) -> None:
+    st.subheader("Screening failures")
+    st.caption(
+        "Screening provider events that never applied. Never includes a "
+        "screening report or free text -- only identifiers and a "
+        "constrained reason code."
+    )
+    try:
+        failures = service.screening_failures(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not failures:
+        render_empty_state("No screening events are awaiting review.")
+        return
+    st.warning(f"{len(failures)} screening event(s) need review.")
+    st.dataframe(
+        [
+            {
+                "Provider": failure.provider,
+                "Event type": failure.event_type,
+                "Event ID": failure.provider_event_id,
+                "Reason": humanize(failure.unresolved_reason or "unknown"),
+                "Received": failure.received_at,
+            }
+            for failure in failures
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        "Follow docs/runbooks/provider-failure-recovery.md to triage and "
+        "record the correct screening status once the member is identified."
+    )
+
+
+def _alert_tone(status: str) -> Tone:
+    if status == "critical":
+        return "danger"
+    if status == "warning":
+        return "warning"
+    return "success"
+
+
+def _render_admin_dashboard(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.subheader("Alerts")
+    st.caption(
+        "No hosted monitoring provider is used for this pilot; these "
+        "thresholds are documented in docs/runbooks/monitoring-and-alerts.md."
+    )
+    try:
+        alerts = service.alerts(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    render_badges(
+        [(metric.name, _alert_tone(metric.status.value)) for metric in alerts.metrics]
+    )
+    for metric in alerts.metrics:
+        with st.container(border=True):
+            st.write(f"**{metric.name}**: {metric.value}")
+            st.caption(metric.threshold_description)
+            if metric.status.value != "ok":
+                st.caption(f"Action: {metric.recommended_action}")
+
+    st.divider()
+    st.subheader("Pilot funnel and safety analytics")
+    st.caption(
+        "Center-scoped aggregate counts only. Safety and provider-failure "
+        "counts below 5 are suppressed rather than shown."
+    )
+    try:
+        analytics = service.analytics(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    funnel = analytics.funnel
+    funnel_rows = [
+        ("Invitations sent", funnel.invitations_sent),
+        ("Accounts created", funnel.accounts_created),
+        ("Profile completed", funnel.profile_completed),
+        ("Consent accepted", funnel.consent_accepted),
+        ("Assessment completed", funnel.assessment_completed),
+        ("Counselor assigned", funnel.counselor_assigned),
+        ("Screening eligible", funnel.screening_eligible),
+        ("Subscription ready", funnel.subscription_ready),
+        ("Community eligible", funnel.community_eligible),
+        ("Proposals generated", funnel.proposals_generated),
+        ("Introductions awaiting response", funnel.introductions_awaiting_response),
+        ("Active matches", funnel.active_matches),
+        ("Guided journeys started", funnel.guided_journeys_started),
+        ("Check-ins submitted", funnel.checkins_submitted),
+    ]
+    st.dataframe(
+        [
+            {
+                "Stage": label,
+                "Count": count,
+                "Conversion from invitations": (
+                    f"{rate * 100:.1f}%"
+                    if (rate := funnel.conversion_rate(count, funnel.invitations_sent))
+                    is not None
+                    else "n/a"
+                ),
+            }
+            for label, count in funnel_rows
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    def _cell(value: int | None) -> str:
+        return "Suppressed (<5)" if value is None else str(value)
+
+    st.caption("Aggregate safety signals")
+    safety_columns = st.columns(3)
+    with safety_columns[0]:
+        st.metric("Blocks", _cell(analytics.safety.blocks))
+    with safety_columns[1]:
+        st.metric("Reports", _cell(analytics.safety.reports))
+    with safety_columns[2]:
+        st.metric("Active holds", _cell(analytics.safety.active_holds))
+
+    st.caption("Aggregate provider failures")
+    provider_columns = st.columns(2)
+    with provider_columns[0]:
+        st.metric(
+            "Billing webhook failures",
+            _cell(analytics.provider_failures.billing_webhook_failures),
+        )
+    with provider_columns[1]:
+        st.metric(
+            "Screening failures",
+            _cell(analytics.provider_failures.screening_failures),
+        )
+
+
+def _render_account_access(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.subheader("Account access")
+    st.caption(
+        "Immediately disable or reactivate any account in this Center with "
+        "a constrained reason code. Self-disable and disabling the last "
+        "active administrator are prohibited."
+    )
+    try:
+        accounts = service.accounts(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if not accounts:
+        render_empty_state("No accounts were found in this Center.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Name": account.display_name,
+                "Email": account.email,
+                "Role": humanize(account.role.value),
+                "Status": humanize(account.status.value),
+                "Reason": humanize(account.disabled_reason_code or ""),
+                "You": "Yes" if account.is_self else "",
+                "Needs reassignment": (
+                    "Yes" if account.counselor_needs_reassignment else ""
+                ),
+            }
+            for account in accounts
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    selectable = [account for account in accounts if not account.is_self]
+    if not selectable:
+        render_empty_state("No other accounts are available to manage.")
+        return
+    selected = st.selectbox(
+        "Account",
+        options=selectable,
+        format_func=lambda item: f"{item.display_name} ({item.email})",
+    )
+
+    if selected.status.value == "disabled":
+        st.warning(
+            f"This account is disabled ({humanize(selected.disabled_reason_code or '')})."
+        )
+        with st.form(f"reactivate-{selected.id}"):
+            reactivate_reason = st.selectbox(
+                "Reactivation reason",
+                options=list(AccountReactivateReasonCode),
+                format_func=lambda item: humanize(item.value),
+            )
+            reactivate_submitted = st.form_submit_button(
+                "Reactivate account", type="primary"
+            )
+        if reactivate_submitted:
+            try:
+                service.reactivate_account(actor, selected.id, reactivate_reason)
+            except MatchwellError as error:
+                st.error(str(error))
+            else:
+                render_success_state("Account reactivated.")
+                st.rerun()
+    else:
+        with st.form(f"disable-{selected.id}"):
+            disable_reason = st.selectbox(
+                "Disable reason",
+                options=list(AccountDisableReasonCode),
+                format_func=lambda item: humanize(item.value),
+            )
+            confirmed = st.checkbox(
+                "I understand this immediately blocks sign-in for this account."
+            )
+            disable_submitted = st.form_submit_button("Disable account")
+        if disable_submitted:
+            if not confirmed:
+                st.error("Confirm that you understand the impact.")
+            else:
+                try:
+                    service.disable_account(actor, selected.id, disable_reason)
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state("Account disabled.")
+                    st.rerun()
 
 
 def _render_admin_ledger(service: PilotService, actor: AuthenticatedUser) -> None:

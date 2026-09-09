@@ -1,3 +1,10 @@
+# Local development only. This Compose file exposes PostgreSQL on the host
+# network (port 5432) and defaults its password to a well-known development
+# value ("matchwell_dev"). Neither is a production recipe: production
+# deployments must use a managed PostgreSQL host that is not exposed on a
+# public port, with a strong, secret-managed password, TLS
+# (`sslmode=require`), `MATCHWELL_AUTO_MIGRATE=false`, and a DML-only
+# application database role. See docs/security/pilot-launch-checklist.md.
 services:
   app:
     build:

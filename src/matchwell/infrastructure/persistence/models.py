@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -24,6 +25,38 @@ from sqlalchemy.orm import Mapped, mapped_column
 from matchwell.infrastructure.persistence.database import Base
 
 JSON_DOCUMENT = JSON().with_variant(JSONB(), "postgresql")
+
+# Kept as plain string tuples (rather than importing domain enums) so the ORM
+# layer stays decoupled from the domain layer; values are mirrored exactly
+# from ``matchwell.domain.access`` and ``matchwell.domain.pilot`` and from
+# migration ``20260909_0007``.
+_ACCOUNT_STATUSES = ("active", "disabled")
+_ACCOUNT_DISABLE_REASON_CODES = (
+    "safety_concern",
+    "policy_violation",
+    "member_requested",
+    "duplicate_account",
+    "inactive_account",
+    "other_operational",
+)
+_ACCOUNT_REACTIVATE_REASON_CODES = (
+    "safety_concern_resolved",
+    "member_requested",
+    "admin_allowlist_restored",
+    "entered_in_error",
+    "other_operational",
+)
+_SCREENING_REASON_CODES = (
+    "identity_verification_failed",
+    "provider_ineligible_result",
+    "provider_error",
+    "provider_timeout",
+    "document_unreadable",
+    "duplicate_submission",
+    "manual_review_required",
+    "expired",
+    "other_operational",
+)
 
 
 class AuditEventRecord(Base):
@@ -93,6 +126,21 @@ class UserRecord(Base):
     __table_args__ = (
         UniqueConstraint("oidc_issuer", "oidc_subject"),
         UniqueConstraint("email"),
+        CheckConstraint(
+            f"status IN ({', '.join(map(repr, _ACCOUNT_STATUSES))})",
+            name="ck_users_status_allowlist",
+        ),
+        CheckConstraint(
+            "disabled_reason_code IS NULL OR disabled_reason_code IN "
+            f"({', '.join(map(repr, _ACCOUNT_DISABLE_REASON_CODES))})",
+            name="ck_users_disabled_reason_allowlist",
+        ),
+        CheckConstraint(
+            "reactivated_reason_code IS NULL OR reactivated_reason_code IN "
+            f"({', '.join(map(repr, _ACCOUNT_REACTIVATE_REASON_CODES))})",
+            name="ck_users_reactivated_reason_allowlist",
+        ),
+        Index("ix_users_status", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -106,6 +154,26 @@ class UserRecord(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     role: Mapped[str] = mapped_column(String(30), nullable=False)
+    # Explicit enabled/disabled account state, checked on every sign-in
+    # before an actor is ever returned. Never defaults to disabled so an
+    # ordinary new account can always sign in.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    disabled_reason_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    disabled_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    reactivated_reason_code: Mapped[str | None] = mapped_column(
+        String(50), nullable=True
+    )
+    reactivated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reactivated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -319,7 +387,14 @@ class CounselorDecisionRecord(Base):
 
 class ScreeningCaseRecord(Base):
     __tablename__ = "screening_cases"
-    __table_args__ = (UniqueConstraint("member_id"),)
+    __table_args__ = (
+        UniqueConstraint("member_id"),
+        CheckConstraint(
+            "reason_code IS NULL OR reason_code IN "
+            f"({', '.join(map(repr, _SCREENING_REASON_CODES))})",
+            name="ck_screening_cases_reason_allowlist",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     member_id: Mapped[uuid.UUID] = mapped_column(
@@ -343,12 +418,41 @@ class ScreeningCaseRecord(Base):
 
 
 class ScreeningEventReceiptRecord(Base):
+    """Idempotency and diagnostics ledger for screening provider callbacks.
+
+    Mirrors ``BillingWebhookReceiptRecord``'s shape so provider failures are
+    triaged the same safe way. Never stores a screening report, provider
+    payload, or free-text detail -- only identifiers and a constrained
+    reason code.
+    """
+
     __tablename__ = "screening_event_receipts"
-    __table_args__ = (UniqueConstraint("provider", "provider_event_id"),)
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id"),
+        CheckConstraint(
+            "unresolved_reason IS NULL OR unresolved_reason IN "
+            f"({', '.join(map(repr, _SCREENING_REASON_CODES))})",
+            name="ck_screening_event_receipts_reason_allowlist",
+        ),
+        Index("ix_screening_event_receipts_center_id", "center_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     provider: Mapped[str] = mapped_column(String(100), nullable=False)
     provider_event_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    member_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    center_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("centers.id"), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="status_update"
+    )
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Populated only while ``applied`` is False: a safe, constrained code
+    # explaining why (never a raw payload, screening report, or secret).
+    unresolved_reason: Mapped[str | None] = mapped_column(String(50), nullable=True)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -782,7 +886,10 @@ class BillingWebhookReceiptRecord(Base):
     """Idempotency ledger of processed provider webhook event IDs."""
 
     __tablename__ = "billing_webhook_receipts"
-    __table_args__ = (UniqueConstraint("provider", "provider_event_id"),)
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id"),
+        Index("ix_billing_webhook_receipts_center_id", "center_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     provider: Mapped[str] = mapped_column(String(30), nullable=False)
@@ -792,6 +899,13 @@ class BillingWebhookReceiptRecord(Base):
     # Populated only while ``applied`` is False: a safe, non-sensitive code
     # explaining why (never the raw payload or any provider secret).
     unresolved_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Nullable: some events (e.g. an unresolvable member/customer mapping)
+    # never resolve to a Center. Those rows are never returned to any Center
+    # admin -- see docs/runbooks/provider-failure-recovery.md for the
+    # documented operational consequence and engineering escalation path.
+    center_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("centers.id"), nullable=True
+    )
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -925,6 +1039,32 @@ class MemberReportRecord(Base):
     category: Mapped[str] = mapped_column(String(50), nullable=False)
     context: Mapped[str] = mapped_column(String(500), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class BackupDrillRunRecord(Base):
+    """Operator-recorded evidence of a completed backup/restore drill.
+
+    Populated only by a human operator running
+    ``scripts/backup/verify-restore.ps1`` (or the shell equivalent) against a
+    real backup, never by request-handling code. The admin operations
+    dashboard reads the most recent row to compute backup-drill staleness.
+    """
+
+    __tablename__ = "backup_drill_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    performed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    performed_by: Mapped[str] = mapped_column(String(320), nullable=False)
+    target_description: Mapped[str] = mapped_column(String(200), nullable=False)
+    verification_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    notes: Mapped[str] = mapped_column(String(500), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
