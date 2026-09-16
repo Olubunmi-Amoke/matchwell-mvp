@@ -92,6 +92,23 @@ be bypassed by changing Centers.
 Cross-Center matching is deferred. Any future implementation requires an
 explicit policy and consent model rather than removing Center filters.
 
+Within a Center, each member has exactly one current community assignment.
+`Community.matching_mode` is constrained to `counselor_based` or `self_paced`.
+Counselor generation/review is scoped to the former; the latter uses minimized
+suggestions and atomic reciprocal-interest activation. Database partial unique
+indexes enforce one current community assignment, one directional interest,
+one open canonical pair, and one participant claim per member.
+
+Optional IPIP answers and derived Big Five scores are isolated in dedicated
+sensitive tables. Matching may request only a neutral pair explanation from
+that boundary; no raw value enters matching, audit, outbox, analytics, or
+operational queues.
+
+The faith/community covenant is a separate global versioned definition with
+immutable, version-specific member acceptances. Readiness references only the
+definition and acceptance IDs/revision; audit carries only policy/version and
+affirmation key names. Center assignment does not change the active covenant.
+
 ## Security and privacy
 
 - Authorization is enforced at API commands, queries, and resource boundaries.
@@ -101,6 +118,9 @@ explicit policy and consent model rather than removing Center filters.
   and general-purpose exports.
 - Screening data is reduced to an eligibility summary; broad reports are not
   copied into Matchwell.
+- Sexual orientation, attitudes toward LGBT people, and proxy attributes are
+  not collected or used for eligibility or matching. Platform conduct is
+  governed by the neutral faith/community covenant instead.
 - Privileged access and eligibility decisions are auditable.
 - Production data and secrets are prohibited from coding prompts and test
   fixtures.
@@ -122,7 +142,7 @@ for mandatory controls.
 
 1. Foundation: repository, CI/CD, environments, identity, authorization, audit,
    migrations, and feature flags.
-2. Readiness: profiles, consent, assessments, stages, evidence, holds, and
+2. Readiness: profiles, consent, covenant, assessments, stages, evidence, holds, and
    progress.
 3. Trust operations: counselors, scheduling, intake, screening, membership,
    and review queues.

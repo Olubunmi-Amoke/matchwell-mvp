@@ -34,10 +34,12 @@ from matchwell.presentation.branding import (
 from matchwell.presentation.member import (
     render_assessment,
     render_billing,
+    render_community_covenant,
     render_consent,
     render_dashboard,
     render_introduction,
     render_matching,
+    render_personality,
     render_profile,
 )
 from matchwell.presentation.operations import render_admin, render_counselor
@@ -133,10 +135,22 @@ def member_pages(
                 url_path="consent",
             ),
             st.Page(
+                lambda: render_community_covenant(service, actor),
+                title="Faith & community covenant",
+                icon=":material/groups:",
+                url_path="community-covenant",
+            ),
+            st.Page(
                 lambda: render_assessment(service, actor),
                 title="Assessment",
                 icon=":material/assignment:",
                 url_path="assessment",
+            ),
+            st.Page(
+                lambda: render_personality(service, actor),
+                title="Personality Inventory",
+                icon=":material/psychology:",
+                url_path="personality",
             ),
             st.Page(
                 lambda: render_billing(service, actor),
@@ -169,7 +183,7 @@ def operations_pages(
     if actor.role is Role.ADMIN:
         page = st.Page(
             lambda: render_admin(service, actor),
-            title="Pilot operations",
+            title="Member Operations",
             icon=":material/admin_panel_settings:",
             url_path="operations",
             default=True,

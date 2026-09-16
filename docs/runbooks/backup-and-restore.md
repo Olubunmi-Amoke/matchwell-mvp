@@ -13,7 +13,7 @@ deferred target architecture.
 
   | Role | Name | Contact | Provider account |
   | --- | --- | --- | --- |
-  | Backup owner | _(fill in before launch)_ | _(fill in)_ | _(fill in)_ |
+  | Backup owner | Olubunmi Olarinde | Repository/hosting account owner | Neon Free production project |
 
 - The backup owner is responsible for: confirming managed backups are
   enabled, running the quarterly restore drill below, and keeping this
@@ -34,12 +34,16 @@ Do not claim more than is true:
   scheduled backup service -- nothing in this repository runs them on a
   timer against production.
 
-Before launch, the backup owner must record in this file:
+The selected provider is Neon Free. On 2026-09-09, the backup owner confirmed
+in the Neon Console that the production project's Instant Restore history
+window is set to **6 hours**. This is the accepted closed-pilot RPO and must be
+revisited before expanding beyond the pilot.
 
-- The selected hosting/database provider.
-- The provider's documented backup frequency and retention window.
-- Whether backups are automatic or require manual enabling, and
-  confirmation that they are enabled for this pilot's database.
+Provider evidence:
+
+- [Neon backup strategies](https://neon.com/docs/postgres/backup-restore/backups)
+- [Neon branching and history windows](https://neon.com/docs/introduction/branching)
+- [Neon security overview](https://neon.com/docs/security/security-overview)
 
 ## Encryption evidence (host responsibility)
 
@@ -59,13 +63,15 @@ evidence that:
 2. Backup artifacts (snapshots/dumps) the provider retains are also
    encrypted at rest.
 
-_(Evidence links / attachment: fill in before launch. Do not mark this
-runbook "launch ready" without them.)_
+Neon's security overview states that customer and sensitive data is encrypted
+with AES-256 at rest and that keys are managed through AWS KMS or Azure Key
+Vault. The backup documentation describes the retained history used by
+Instant Restore. These provider links are the pilot's host evidence; the
+application does not claim to add row-level encryption.
 
 ## Retention
 
-- Managed-host backups: retention window per the provider's plan (record
-  the exact number of days/backups once the provider is selected).
+- Managed-host recovery history: 6 hours on the confirmed Neon Free project.
 - Operator-run `pg_dump` archives created via `scripts/backup/pg-dump.ps1` /
   `pg-dump.sh`: treat as short-lived drill artifacts. Do not accumulate
   them anywhere reachable by the application; store at most the two most
@@ -145,12 +151,12 @@ than just verifying a drill):
 
 | Item | Status | Date | Notes |
 | --- | --- | --- | --- |
-| Managed-host automatic backups confirmed enabled | Not started | | |
-| Host encryption-at-rest evidence attached (database) | Not started | | |
-| Host encryption-at-rest evidence attached (backups) | Not started | | |
+| Managed-host automatic recovery history confirmed enabled | Complete | 2026-09-09 | Olubunmi Olarinde confirmed Neon Free Instant Restore shows a 6-hour history window. |
+| Host encryption-at-rest evidence attached (database) | Complete | 2026-09-09 | Neon security overview documents AES-256 at-rest encryption. |
+| Host encryption-at-rest evidence attached (backups/history) | Complete | 2026-09-09 | Neon backup and history-window documentation linked above. |
 | `scripts/backup/*` dump/restore/migrate/verify drill run locally | Not started | | |
-| GitHub Actions `backup-restore-drill` job passing | Not started | | See `.github/workflows/ci.yml`. Uses synthetic CI data only; this is a mechanics check, not proof of a real production restore. |
-| First real production restore drill performed and recorded in `backup_drill_runs` | Not started | | Do not claim this happened until it truthfully has. |
+| GitHub Actions `backup-restore-drill` job passing | Complete | 2026-09-09 | PR #18 passed against synthetic PostgreSQL data; this proves mechanics only. |
+| First real production restore drill performed and recorded in `backup_drill_runs` | Blocked | 2026-09-09 | Production role credential appeared in terminal scrollback and must be rotated before it is used for a drill. |
 
 **Do not mark this milestone "launch ready" in
 [the pilot launch checklist](../security/pilot-launch-checklist.md) until every

@@ -5,6 +5,10 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from covenant_helpers import (
+    accept_community_covenant,
+    seed_community_covenant,
+)
 from sqlalchemy import select
 
 from matchwell.application.pilot import PilotService
@@ -77,6 +81,7 @@ def _make_pilot(admin_emails: frozenset[str]) -> Pilot:
                 is_active=True,
             )
         )
+        seed_community_covenant(session)
         session.add(
             AssessmentDefinitionRecord(
                 id=uuid.uuid4(),
@@ -370,13 +375,13 @@ def test_disabling_a_member_closes_open_proposals(pilot: Pilot) -> None:
             birth_date=date(1990, 1, 1),
             faith_affirmed=True,
             relationship_intent="A healthy, committed Christian marriage.",
-            denomination="",
             city="Nashville",
             state="Tennessee",
         ),
     )
     consent = service.consent(member)
     service.accept_consent(member, consent.id)
+    accept_community_covenant(service, member)
     assessment = service.assessment(member)
     service.submit_assessment(
         member,

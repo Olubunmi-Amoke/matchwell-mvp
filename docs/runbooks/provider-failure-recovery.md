@@ -29,7 +29,7 @@ anything else happens:
 
 ## Triage: Billing → Webhook failures / Screening failures
 
-Sign in as an administrator and open **Pilot operations → Billing →
+Sign in as an administrator and open **Member Operations → Billing →
 Webhook failures** or **Screening failures**. Each row shows the
 provider, event type, event ID, safe reason code, and received time --
 nothing sensitive.

@@ -5,6 +5,7 @@ from matchwell.domain.matching import (
     Gender,
     MatchScorer,
 )
+from matchwell.domain.pilot import DenominationCode
 
 
 def candidate(**overrides: object) -> CandidateEvidence:
@@ -16,7 +17,7 @@ def candidate(**overrides: object) -> CandidateEvidence:
         "max_partner_age": 35,
         "city": "Nashville",
         "state": "Tennessee",
-        "denomination": "Baptist",
+        "denomination_code": DenominationCode.BAPTIST,
         "relationship_intent": "Seeking a committed Christian marriage",
     }
     values.update(overrides)
@@ -51,8 +52,8 @@ def test_asymmetric_age_window_breaks_reciprocal_compatibility() -> None:
 
 def test_scoring_is_deterministic_and_explainable() -> None:
     scorer = MatchScorer()
-    a = candidate(city="Nashville", state="Tennessee", denomination="Baptist")
-    b = candidate(city="Nashville", state="Tennessee", denomination="Baptist")
+    a = candidate(city="Nashville", state="Tennessee")
+    b = candidate(city="Nashville", state="Tennessee")
 
     first = scorer.score(a, b)
     second = scorer.score(a, b)
@@ -80,7 +81,7 @@ def test_scoring_never_reads_assessment_or_screening_fields() -> None:
         "max_partner_age",
         "city",
         "state",
-        "denomination",
+        "denomination_code",
         "relationship_intent",
     }
 

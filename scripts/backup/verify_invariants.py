@@ -39,6 +39,14 @@ DEFAULT_INVARIANT_TABLES = (
 )
 
 
+def _sqlalchemy_url(database_url: str) -> str:
+    if database_url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + database_url.removeprefix("postgresql://")
+    if database_url.startswith("postgres://"):
+        return "postgresql+psycopg://" + database_url.removeprefix("postgres://")
+    return database_url
+
+
 def _table_counts(engine: Engine) -> dict[str, int]:
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
@@ -88,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         table: 1 for table in DEFAULT_INVARIANT_TABLES
     }
 
-    restore_engine = create_engine(args.database_url)
+    restore_engine = create_engine(_sqlalchemy_url(args.database_url))
     restore_counts = _table_counts(restore_engine)
 
     print("Restore database table row counts (structure/counts only):")
@@ -106,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if args.compare_url:
-        compare_engine = create_engine(args.compare_url)
+        compare_engine = create_engine(_sqlalchemy_url(args.compare_url))
         compare_counts = _table_counts(compare_engine)
         print("Comparing restore counts against the source database ...")
         shared_tables = sorted(

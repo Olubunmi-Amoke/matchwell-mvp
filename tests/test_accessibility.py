@@ -10,11 +10,16 @@ keyboard/screen-reader pass -- see
 docs/runbooks/accessibility-checklist.md for that.
 """
 
+import re
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from covenant_helpers import (
+    accept_community_covenant,
+    seed_community_covenant,
+)
 from streamlit.testing.v1 import AppTest
 
 from matchwell.application.pilot import PilotService
@@ -75,6 +80,7 @@ def _seeded_service(database_path: str) -> PilotService:
                 is_active=True,
             )
         )
+        seed_community_covenant(session)
         session.add(
             AssessmentDefinitionRecord(
                 id=uuid.uuid4(),
@@ -159,6 +165,35 @@ def _assert_has_a_heading(app: AppTest) -> None:
         assert heading.value.strip() != "", "Heading text must not be empty."
 
 
+def _relative_luminance(color: str) -> float:
+    channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [
+        channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+        for channel in channels
+    ]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(foreground: str, background: str) -> float:
+    lighter, darker = sorted(
+        (_relative_luminance(foreground), _relative_luminance(background)),
+        reverse=True,
+    )
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_theme_text_and_badges_meet_wcag_aa_contrast() -> None:
+    from matchwell.presentation import theme
+
+    background = re.search(r"--mw-bg:\s*(#[0-9a-f]{6})", theme._CSS)
+    accent = re.search(r"--mw-accent:\s*(#[0-9a-f]{6})", theme._CSS)
+    assert background is not None and accent is not None
+    assert _contrast_ratio(accent.group(1), background.group(1)) >= 4.5
+
+    for badge_background, badge_text in theme._TONE_STYLES.values():
+        assert _contrast_ratio(badge_text, badge_background) >= 4.5
+
+
 def test_admin_dashboard_renders_with_labeled_widgets_and_headings(
     seeded_actors: tuple[PilotService, AuthenticatedUser, AuthenticatedUser],
 ) -> None:
@@ -178,6 +213,9 @@ def test_admin_dashboard_renders_with_labeled_widgets_and_headings(
     assert not app.exception, f"Admin dashboard raised: {app.exception}"
     _assert_has_a_heading(app)
     _assert_every_widget_has_a_label(app, require_interactive=True)
+    assert any(
+        "Audited rematch authorization" in heading.value for heading in app.subheader
+    )
 
 
 def test_counselor_workspace_renders_with_labeled_widgets_and_headings(
@@ -199,6 +237,7 @@ def test_counselor_workspace_renders_with_labeled_widgets_and_headings(
     assert not app.exception, f"Counselor workspace raised: {app.exception}"
     _assert_has_a_heading(app)
     _assert_every_widget_has_a_label(app)
+    assert any("Rematch authorizations" in heading.value for heading in app.subheader)
 
 
 def test_member_dashboard_renders_with_status_text_not_color_alone(
@@ -239,6 +278,40 @@ def test_member_dashboard_renders_with_status_text_not_color_alone(
     assert "Stage:" in page_html
 
 
+def test_community_covenant_has_headings_and_labeled_affirmations(
+    seeded_actors: tuple[PilotService, AuthenticatedUser, AuthenticatedUser],
+) -> None:
+    service, admin, _ = seeded_actors
+    service.create_invitation(
+        admin,
+        InvitationInput(
+            email="covenant-member@example.com",
+            role=Role.MEMBER,
+            expires_at=datetime.now(UTC) + timedelta(days=7),
+        ),
+    )
+    member = service.sign_in(
+        _identity("covenant-member@example.com", "covenant-member-sub")
+    )
+    assert member is not None
+
+    def _app(service, actor):  # type: ignore[no-untyped-def]
+        from matchwell.presentation.member import render_community_covenant
+        from matchwell.presentation.theme import inject_theme
+
+        inject_theme()
+        render_community_covenant(service, actor)
+
+    app = AppTest.from_function(_app, kwargs={"service": service, "actor": member}).run(
+        timeout=15
+    )
+    assert not app.exception, f"Covenant page raised: {app.exception}"
+    _assert_has_a_heading(app)
+    _assert_every_widget_has_a_label(app, require_interactive=True)
+    assert any("Faith & community covenant" in heading.value for heading in app.title)
+    assert len(app.checkbox) == 2
+
+
 def test_member_matching_page_labels_every_preference_control(
     seeded_actors: tuple[PilotService, AuthenticatedUser, AuthenticatedUser],
 ) -> None:
@@ -260,13 +333,13 @@ def test_member_matching_page_labels_every_preference_control(
             birth_date=date(1990, 1, 1),
             faith_affirmed=True,
             relationship_intent="A healthy, committed Christian marriage.",
-            denomination="",
             city="Nashville",
             state="Tennessee",
         ),
     )
     consent = service.consent(member)
     service.accept_consent(member, consent.id)
+    accept_community_covenant(service, member)
     assessment = service.assessment(member)
     service.submit_assessment(
         member,
@@ -298,4 +371,48 @@ def test_member_matching_page_labels_every_preference_control(
     )
 
     assert not app.exception, f"Member matching page raised: {app.exception}"
+    _assert_every_widget_has_a_label(app, require_interactive=True)
+
+
+def test_profile_uses_labeled_curated_denomination_controls(
+    seeded_actors: tuple[PilotService, AuthenticatedUser, AuthenticatedUser],
+) -> None:
+    service, admin, _ = seeded_actors
+    service.create_invitation(
+        admin,
+        InvitationInput(
+            email="profile@example.com",
+            role=Role.MEMBER,
+            expires_at=datetime.now(UTC) + timedelta(days=7),
+        ),
+    )
+    member = service.sign_in(_identity("profile@example.com", "profile-sub"))
+    assert member is not None
+
+    def _app(service, actor):  # type: ignore[no-untyped-def]
+        from matchwell.presentation.member import render_profile
+
+        render_profile(service, actor)
+
+    app = AppTest.from_function(_app, kwargs={"service": service, "actor": member}).run(
+        timeout=15
+    )
+    assert not app.exception
+    denomination = next(
+        item
+        for item in app.selectbox
+        if item.label == "Denomination or church tradition"
+    )
+    assert set(denomination.options) >= {
+        "Baptist",
+        "Catholic",
+        "Anglican/Episcopal",
+        "Other",
+        "Prefer not to say",
+    }
+    denomination.select("Other").run()
+    assert any(
+        item.label == "Other denomination or church tradition"
+        for item in app.text_input
+    )
     _assert_every_widget_has_a_label(app, require_interactive=True)

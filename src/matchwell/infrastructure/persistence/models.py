@@ -57,6 +57,46 @@ _SCREENING_REASON_CODES = (
     "expired",
     "other_operational",
 )
+_DENOMINATION_CODES = (
+    "baptist",
+    "catholic",
+    "anglican_episcopal",
+    "methodist_wesleyan",
+    "presbyterian_reformed",
+    "pentecostal_charismatic",
+    "orthodox",
+    "lutheran",
+    "seventh_day_adventist",
+    "non_denominational",
+    "other",
+    "prefer_not_to_say",
+)
+_INTRODUCTORY_SESSION_STATUSES = ("available", "scheduled", "completed", "cancelled")
+_INTRODUCTORY_SESSION_REASON_CODES = (
+    "member_requested",
+    "counselor_unavailable",
+    "operations_reschedule",
+)
+_REMATCH_REASON_CODES = (
+    "member_decline_reconsidered",
+    "counselor_decline_reconsidered",
+    "entitlement_restored",
+    "circumstances_changed",
+    "operations_correction",
+)
+_REMATCH_AUTHORIZATION_STATUSES = ("pending", "approved", "consumed", "revoked")
+_MATCHING_MODES = ("counselor_based", "self_paced")
+_COMMUNITY_ASSIGNMENT_REASON_CODES = (
+    "pilot_placement",
+    "member_request",
+    "operations_correction",
+)
+_SUGGESTION_INTEREST_STATUSES = (
+    "interested",
+    "dismissed",
+    "matched",
+    "withdrawn",
+)
 
 
 class AuditEventRecord(Base):
@@ -109,7 +149,13 @@ class CenterRecord(Base):
 
 class CommunityRecord(Base):
     __tablename__ = "communities"
-    __table_args__ = (UniqueConstraint("center_id", "slug"),)
+    __table_args__ = (
+        UniqueConstraint("center_id", "slug"),
+        CheckConstraint(
+            f"matching_mode IN ({', '.join(map(repr, _MATCHING_MODES))})",
+            name="ck_communities_matching_mode",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     center_id: Mapped[uuid.UUID] = mapped_column(
@@ -119,6 +165,45 @@ class CommunityRecord(Base):
     )
     slug: Mapped[str] = mapped_column(String(100), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    matching_mode: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="counselor_based"
+    )
+
+
+class MemberCommunityAssignmentRecord(Base):
+    __tablename__ = "member_community_assignments"
+    __table_args__ = (
+        CheckConstraint(
+            "reason_code IN "
+            f"({', '.join(map(repr, _COMMUNITY_ASSIGNMENT_REASON_CODES))})",
+            name="ck_member_community_assignments_reason",
+        ),
+        Index("ix_member_community_assignments_member", "member_id", "ended_at"),
+        Index(
+            "uq_member_community_assignments_current",
+            "member_id",
+            unique=True,
+            postgresql_where=text("ended_at IS NULL"),
+            sqlite_where=text("ended_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"), nullable=False
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    community_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("communities.id"), nullable=False
+    )
+    assigned_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    reason_code: Mapped[str] = mapped_column(String(40), nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class UserRecord(Base):
@@ -225,6 +310,9 @@ class ConsentVersionRecord(Base):
     version: Mapped[str] = mapped_column(String(50), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     body_markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    required_acknowledgements: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON_DOCUMENT, nullable=False, default=list
+    )
     effective_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -251,10 +339,85 @@ class ConsentAcceptanceRecord(Base):
         nullable=False,
         server_default=func.now(),
     )
+    accepted_acknowledgement_keys: Mapped[list[str]] = mapped_column(
+        JSON_DOCUMENT, nullable=False, default=list
+    )
+
+
+class CommunityCovenantDefinitionRecord(Base):
+    __tablename__ = "community_covenant_definitions"
+    __table_args__ = (
+        UniqueConstraint(
+            "policy_key",
+            "revision",
+            name="uq_community_covenant_policy_revision",
+        ),
+        CheckConstraint(
+            "revision > 0",
+            name="ck_community_covenant_positive_revision",
+        ),
+        Index(
+            "uq_community_covenant_one_active",
+            "policy_key",
+            unique=True,
+            postgresql_where=text("is_active"),
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    policy_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    display_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body_markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    required_affirmations: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON_DOCUMENT, nullable=False
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class CommunityCovenantAcceptanceRecord(Base):
+    __tablename__ = "community_covenant_acceptances"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "covenant_definition_id",
+            name="uq_community_covenant_acceptance_user_version",
+        ),
+        Index("ix_community_covenant_acceptances_user", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    covenant_definition_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("community_covenant_definitions.id"), nullable=False
+    )
+    accepted_affirmation_keys: Mapped[list[str]] = mapped_column(
+        JSON_DOCUMENT, nullable=False
+    )
+    accepted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class MemberProfileRecord(Base):
     __tablename__ = "member_profiles"
+    __table_args__ = (
+        CheckConstraint(
+            f"denomination_code IN ({', '.join(map(repr, _DENOMINATION_CODES))})",
+            name="ck_member_profiles_denomination_code_allowlist",
+        ),
+        CheckConstraint(
+            "(denomination_code = 'other' AND denomination_other IS NOT NULL "
+            "AND trim(denomination_other) <> '') OR "
+            "(denomination_code <> 'other' AND denomination_other IS NULL)",
+            name="ck_member_profiles_denomination_other",
+        ),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id"),
@@ -264,11 +427,53 @@ class MemberProfileRecord(Base):
     birth_date: Mapped[date] = mapped_column(Date, nullable=False)
     faith_affirmed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     relationship_intent: Mapped[str] = mapped_column(String(300), nullable=False)
-    denomination: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    denomination_code: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="prefer_not_to_say"
+    )
+    denomination_other: Mapped[str | None] = mapped_column(String(100), nullable=True)
     city: Mapped[str] = mapped_column(String(100), nullable=False)
     state: Mapped[str] = mapped_column(String(100), nullable=False)
     completed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+
+
+class IntroductorySessionBenefitRecord(Base):
+    __tablename__ = "introductory_session_benefits"
+    __table_args__ = (
+        UniqueConstraint("member_id"),
+        CheckConstraint(
+            f"status IN ({', '.join(map(repr, _INTRODUCTORY_SESSION_STATUSES))})",
+            name="ck_introductory_session_benefits_status",
+        ),
+        CheckConstraint(
+            "reason_code IS NULL OR reason_code IN "
+            f"({', '.join(map(repr, _INTRODUCTORY_SESSION_REASON_CODES))})",
+            name="ck_introductory_session_benefits_reason",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"), nullable=False
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    counselor_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="available")
+    scheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reason_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -318,6 +523,69 @@ class AssessmentAssignmentRecord(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+
+class PersonalityInventoryDefinitionRecord(Base):
+    __tablename__ = "personality_inventory_definitions"
+    __table_args__ = (UniqueConstraint("key", "version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(String(100), nullable=False)
+    version: Mapped[str] = mapped_column(String(50), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    provenance: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class PersonalityInventoryAssignmentRecord(Base):
+    __tablename__ = "personality_inventory_assignments"
+    __table_args__ = (
+        Index(
+            "ix_personality_inventory_assignments_member",
+            "member_id",
+            "assigned_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    member_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    definition_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("personality_inventory_definitions.id"), nullable=False
+    )
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PersonalityInventoryResponseRecord(Base):
+    """Sensitive raw inventory responses; never join into broad operational views."""
+
+    __tablename__ = "personality_inventory_responses"
+
+    assignment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("personality_inventory_assignments.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    answers: Mapped[dict[str, int]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class PersonalityInventoryScoreRecord(Base):
+    """Sensitive derived scores, exposed only through neutral pair explanations."""
+
+    __tablename__ = "personality_inventory_scores"
+
+    assignment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("personality_inventory_assignments.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    scores: Mapped[dict[str, float]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    scored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class CounselorAssignmentRecord(Base):
@@ -547,7 +815,27 @@ class MemberMatchPreferencesRecord(Base):
 class MatchProposalRecord(Base):
     __tablename__ = "match_proposals"
     __table_args__ = (
-        UniqueConstraint("member_a_id", "member_b_id"),
+        CheckConstraint(
+            "member_a_id <> member_b_id",
+            name="ck_match_proposals_distinct_members",
+        ),
+        Index(
+            "ix_match_proposals_center_pair",
+            "center_id",
+            "member_a_id",
+            "member_b_id",
+        ),
+        Index(
+            "uq_match_proposals_open_pair",
+            "center_id",
+            "member_a_id",
+            "member_b_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending_review', 'introduced', 'active')"
+            ),
+            sqlite_where=text("status IN ('pending_review', 'introduced', 'active')"),
+        ),
         Index("ix_match_proposals_community_status", "community_id", "status"),
         Index("ix_match_proposals_counselor_a", "counselor_a_id", "status"),
         Index("ix_match_proposals_counselor_b", "counselor_b_id", "status"),
@@ -621,6 +909,166 @@ class MatchProposalRecord(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+
+class MatchProposalParticipantClaimRecord(Base):
+    __tablename__ = "match_proposal_participant_claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "member_id", name="uq_match_proposal_participant_claims_member_id"
+        ),
+    )
+
+    proposal_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("match_proposals.id", ondelete="CASCADE"), primary_key=True
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), primary_key=True
+    )
+
+
+class SelfPacedSuggestionInterestRecord(Base):
+    __tablename__ = "self_paced_suggestion_interests"
+    __table_args__ = (
+        CheckConstraint(
+            "member_id <> candidate_member_id",
+            name="ck_self_paced_interests_distinct_members",
+        ),
+        CheckConstraint(
+            f"status IN ({', '.join(map(repr, _SUGGESTION_INTEREST_STATUSES))})",
+            name="ck_self_paced_interests_status",
+        ),
+        UniqueConstraint("member_id", "candidate_member_id"),
+        Index(
+            "ix_self_paced_interests_candidate_status",
+            "candidate_member_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"), nullable=False
+    )
+    community_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("communities.id"), nullable=False
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    candidate_member_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("match_proposals.id"), nullable=True
+    )
+
+
+class RematchAuthorizationRecord(Base):
+    __tablename__ = "rematch_authorizations"
+    __table_args__ = (
+        CheckConstraint(
+            "member_a_id <> member_b_id",
+            name="ck_rematch_authorizations_distinct_members",
+        ),
+        CheckConstraint(
+            "counselor_a_id <> counselor_b_id",
+            name="ck_rematch_authorizations_distinct_counselors",
+        ),
+        CheckConstraint(
+            "counselor_a_approved_by_id IS NULL "
+            "OR counselor_b_approved_by_id IS NULL "
+            "OR counselor_a_approved_by_id <> counselor_b_approved_by_id",
+            name="ck_rematch_authorizations_distinct_approvers",
+        ),
+        CheckConstraint(
+            f"reason_code IN ({', '.join(map(repr, _REMATCH_REASON_CODES))})",
+            name="ck_rematch_authorizations_reason",
+        ),
+        CheckConstraint(
+            f"status IN ({', '.join(map(repr, _REMATCH_AUTHORIZATION_STATUSES))})",
+            name="ck_rematch_authorizations_status",
+        ),
+        CheckConstraint(
+            "revocation_reason_code IS NULL "
+            "OR revocation_reason_code = 'assignment_changed'",
+            name="ck_rematch_authorizations_revocation_reason",
+        ),
+        Index(
+            "ix_rematch_authorizations_center_pair_status",
+            "center_id",
+            "member_a_id",
+            "member_b_id",
+            "status",
+        ),
+        Index(
+            "uq_rematch_authorizations_live_pair",
+            "center_id",
+            "member_a_id",
+            "member_b_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'approved')"),
+            sqlite_where=text("status IN ('pending', 'approved')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    center_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("centers.id"), nullable=False
+    )
+    community_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("communities.id"), nullable=False
+    )
+    member_a_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    member_b_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    requested_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    reason_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    counselor_a_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    counselor_assignment_a_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("counselor_assignments.id"), nullable=False
+    )
+    counselor_b_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+    counselor_assignment_b_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("counselor_assignments.id"), nullable=False
+    )
+    counselor_a_approved_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id")
+    )
+    counselor_a_approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    counselor_b_approved_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id")
+    )
+    counselor_b_approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consumed_proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("match_proposals.id")
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    revocation_reason_code: Mapped[str | None] = mapped_column(String(50))
 
 
 class MatchedPairMessageRecord(Base):

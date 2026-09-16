@@ -3,6 +3,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from covenant_helpers import (
+    accept_community_covenant,
+    seed_community_covenant,
+)
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -92,6 +96,7 @@ def _seed_pilot_center(session: Session) -> None:
             is_active=True,
         )
     )
+    seed_community_covenant(session)
     session.add(
         AssessmentDefinitionRecord(
             id=uuid.uuid4(),
@@ -507,13 +512,13 @@ def _ready_member(
             birth_date=date(1990, 1, 1),
             faith_affirmed=True,
             relationship_intent="A healthy Christian marriage.",
-            denomination="",
             city="Nashville",
             state="Tennessee",
         ),
     )
     consent = service.consent(member)
     service.accept_consent(member, consent.id)
+    accept_community_covenant(service, member)
     assessment = service.assessment(member)
     service.submit_assessment(
         member,

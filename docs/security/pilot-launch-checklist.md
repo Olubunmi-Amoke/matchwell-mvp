@@ -38,6 +38,15 @@ completing this checklist.
 | `_matching_pair_sets` scopes proposal history per Center while keeping block/report safety restrictions global | Automated | `test_matching_pair_sets_scope_proposals_by_center_but_not_safety_restrictions` |
 | Billing webhook and screening event receipts carry `center_id`; unresolved/unattributable events are never shown to any Center admin | Automated | migration `20260909_0007`, `test_admin_webhook_failures_queue_lists_unapplied_receipts_only`, `test_process_screening_provider_event_is_idempotent_and_scoped` |
 
+## Faith and community covenant
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Global versioned covenant has exactly one active revision and immutable per-member/version acceptance | Automated | migration `20260916_0011`; `tests/test_community_covenant.py` |
+| Exact current affirmation keys are enforced at the application and repository boundaries; stale versions fail and exact retries are idempotent | Automated | `test_exact_current_affirmations_are_required_at_application_boundary`, `test_acceptance_is_idempotent_and_audit_contains_keys_not_labels` |
+| New revision revokes current readiness until re-affirmed; holds still take precedence | Automated | `test_new_active_revision_revokes_readiness_and_requires_reaffirmation`, `test_global_definition_applies_across_centers_and_holds_still_win` |
+| No sexual-orientation or LGBT-attitude field/proxy is collected, displayed, audited, or matched | Policy + automated guard | [Authorization and data handling](authorization-and-data-handling.md#protected-and-sensitive-attitude-policy-guard); `test_domain_models_and_member_ui_have_no_disallowed_attitude_fields` |
+
 ## Backup and restore
 
 | Item | Status | Evidence |
@@ -79,7 +88,7 @@ completing this checklist.
 
 | Item | Status | Evidence |
 | --- | --- | --- |
-| Automated semantic/label/heading checks for critical Streamlit surfaces | Automated | `tests/test_accessibility.py` |
+| Automated semantic/label/heading checks for critical Streamlit surfaces, including the covenant page and its separate required checkboxes | Automated | `tests/test_accessibility.py` |
 | Manual keyboard-only and screen-reader checklist, with contrast, zoom/reflow, error, and focus checks | Operator | [Accessibility checklist](../runbooks/accessibility-checklist.md) -- not yet performed |
 
 ## Security, configuration, and dependencies

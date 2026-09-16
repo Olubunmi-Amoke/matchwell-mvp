@@ -13,12 +13,14 @@ safety criteria, the product may expand to a one-region private beta for
 An invited member can:
 
 1. Create and verify an adult Christian account.
-2. Accept the current versions of required policies and consent.
+2. Accept the current consent and separately affirm the current global faith
+   and community covenant.
 3. Complete a profile and configured readiness assessments.
 4. Complete counselor intake and receive a counselor decision.
 5. Receive an eligibility status from a background-screening provider.
 6. Unlock an eligible community when every requirement is satisfied.
-7. Receive an explainable, counselor-approved introduction.
+7. Receive an explainable counselor-reviewed candidate or browse a privacy-
+   minimized self-paced suggestion, according to the assigned community mode.
 8. Mutually accept or decline the introduction.
 9. Complete guided curriculum and 30-, 60-, and 90-day check-ins.
 10. Block or report another member.
@@ -27,14 +29,14 @@ An invited member can:
 
 | ID | Capability | Minimum acceptance criteria |
 | --- | --- | --- |
-| MW-PRD-001 | Identity and consent | Invited adults can authenticate, verify required account attributes, pass an age gate, and accept versioned consent. |
+| MW-PRD-001 | Identity, consent, and covenant | Invited adults can authenticate, verify required account attributes, pass an age gate, accept versioned consent, and separately affirm the current global faith/community covenant. |
 | MW-PRD-002 | Profile and preferences | Members can maintain the profile and partner preferences required for readiness and matching. |
 | MW-PRD-003 | Configurable assessments | Authorized staff can configure assessment versions; members can complete the version assigned to them. |
 | MW-PRD-004 | Counselor operations | Authorized staff can approve counselors, assign members, schedule intake, and record structured intake decisions. |
 | MW-PRD-005 | Screening | A provider adapter submits eligible members, processes idempotent status updates, and stores only the minimum status summary. |
 | MW-PRD-006 | Readiness stages | The API evaluates configured requirements, evidence, expiry, holds, and unlock decisions. |
-| MW-PRD-007 | Centers and communities | The pilot supports one Center and one Matchwell community while preserving Center-scoped data boundaries. |
-| MW-PRD-008 | Matching | Eligible members can be scored with explainable weighted rules and placed in a counselor review queue. |
+| MW-PRD-007 | Centers and communities | The pilot supports one Center, explicit operator-managed current community assignment, and constrained `counselor_based` / `self_paced` modes while preserving Center boundaries. |
+| MW-PRD-008 | Matching | Eligible members receive the same deterministic scoring in either mode; counselor-based candidates enter review and self-paced candidates enter a privacy-minimized suggestion view. |
 | MW-PRD-009 | Introductions | A counselor-approved introduction is disclosed only as configured and becomes active only after mutual acceptance. |
 | MW-PRD-010 | Messaging | Members in an eligible relationship context can exchange basic secure messages subject to block and safety rules. |
 | MW-PRD-011 | Guided journey | Staff can configure curriculum; members can complete tasks and 30-, 60-, and 90-day check-ins. |
@@ -54,10 +56,16 @@ All P0 capabilities must satisfy these rules:
   decisions, and safety actions are auditable.
 - Screening webhooks, payment webhooks, and background jobs are idempotent.
 - Sensitive values are minimized in storage, logs, test fixtures, and events.
+- Optional IPIP personality answers/scores are sensitive, non-diagnostic, and
+  cannot affect readiness, eligibility, score, rank, or rejection.
+- No field or decision may collect, infer, audit, display, or match on sexual
+  orientation, attitudes toward LGBT people, or proxy attributes. The covenant
+  replaces the proposed LGBT-friendliness criterion with conduct-based
+  participation commitments.
 - Safety holds override every unlock, introduction, message entitlement, and
   relationship-stage transition.
-- Requirement configuration and consent are versioned so historical decisions
-  remain explainable.
+- Requirement configuration, consent, and the global covenant are versioned so
+  historical decisions remain explainable.
 - Accessibility and authorization behavior are testable acceptance criteria,
   not pilot-hardening afterthoughts.
 
@@ -86,7 +94,8 @@ external provider boundaries and established domain seams.
 ### Closed pilot
 
 - 30-50 invited users
-- One region, one Center, and one community
+- One region and one Center, with the counselor-based and self-paced pilot
+  communities
 - Human-operated counselor, screening, matching, and safety queues
 - The first engineering milestone is complete and tested before matching or
   payments begin

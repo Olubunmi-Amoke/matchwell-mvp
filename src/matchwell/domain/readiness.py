@@ -5,6 +5,7 @@ from enum import StrEnum
 class RequirementCode(StrEnum):
     ADULT_AND_FAITH = "adult_and_faith"
     CONSENT = "consent"
+    COMMUNITY_COVENANT = "community_covenant"
     PROFILE = "profile"
     ASSESSMENT = "assessment"
     COUNSELOR = "counselor"
@@ -26,6 +27,7 @@ class ReadinessStage(StrEnum):
 REQUIREMENT_LABELS: dict[RequirementCode, str] = {
     RequirementCode.ADULT_AND_FAITH: "Confirm adult eligibility and Christian faith",
     RequirementCode.CONSENT: "Accept the current participation consent",
+    RequirementCode.COMMUNITY_COVENANT: "Affirm the current faith and community covenant",
     RequirementCode.PROFILE: "Complete the readiness profile",
     RequirementCode.ASSESSMENT: "Complete the readiness assessment",
     RequirementCode.COUNSELOR: "Receive counselor intake approval",
@@ -34,13 +36,14 @@ REQUIREMENT_LABELS: dict[RequirementCode, str] = {
     RequirementCode.NO_ACTIVE_HOLD: "Resolve the active account hold",
 }
 
-TOTAL_ORDINARY_REQUIREMENTS = 8
+TOTAL_ORDINARY_REQUIREMENTS = 9
 
 
 @dataclass(frozen=True, slots=True)
 class ReadinessEvidence:
     adult_and_faith_complete: bool
     consent_complete: bool
+    community_covenant_complete: bool
     profile_complete: bool
     assessment_complete: bool
     counselor_approved: bool
@@ -55,6 +58,17 @@ class ReadinessResult:
     unmet_requirements: tuple[RequirementCode, ...]
 
     @property
+    def completed_ordinary_requirement_count(self) -> int:
+        missing = sum(
+            2 if code is RequirementCode.ADULT_AND_FAITH else 1
+            for code in self.unmet_requirements
+            if code is not RequirementCode.NO_ACTIVE_HOLD
+        )
+        return max(
+            0, min(TOTAL_ORDINARY_REQUIREMENTS, TOTAL_ORDINARY_REQUIREMENTS - missing)
+        )
+
+    @property
     def explanations(self) -> tuple[str, ...]:
         return tuple(REQUIREMENT_LABELS[code] for code in self.unmet_requirements)
 
@@ -67,6 +81,7 @@ class ReadinessResult:
             for requirement in (
                 RequirementCode.ADULT_AND_FAITH,
                 RequirementCode.CONSENT,
+                RequirementCode.COMMUNITY_COVENANT,
                 RequirementCode.PROFILE,
             )
         ):
@@ -86,6 +101,7 @@ class ReadinessEvaluator:
     _ordered_checks = (
         (RequirementCode.ADULT_AND_FAITH, "adult_and_faith_complete"),
         (RequirementCode.CONSENT, "consent_complete"),
+        (RequirementCode.COMMUNITY_COVENANT, "community_covenant_complete"),
         (RequirementCode.PROFILE, "profile_complete"),
         (RequirementCode.ASSESSMENT, "assessment_complete"),
         (RequirementCode.COUNSELOR, "counselor_approved"),

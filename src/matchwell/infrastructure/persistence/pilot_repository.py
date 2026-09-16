@@ -1,9 +1,12 @@
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -77,6 +80,7 @@ from matchwell.domain.matching import (
     CounselorConversationStatus,
     CounselorReviewDecision,
     Gender,
+    HistoricalRematchPair,
     IntroductionView,
     MatchedPairView,
     MatchPreferencesInput,
@@ -85,18 +89,44 @@ from matchwell.domain.matching import (
     MemberResponseDecision,
     MessageView,
     ProposalStatus,
+    RematchAuthorizationStatus,
+    RematchAuthorizationView,
+    RematchReasonCode,
     ReportInput,
+    SelfPacedSuggestion,
+    SuggestionInterestStatus,
+)
+from matchwell.domain.personality import (
+    BigFiveTrait,
+    PersonalityAnswers,
+    PersonalityInventoryView,
+    PersonalityItem,
+    PersonalityScores,
+    PersonalityStatus,
+    compatibility_explanation,
+    score_inventory,
 )
 from matchwell.domain.pilot import (
+    DENOMINATION_LABELS,
     SCREENING_SYSTEM_ACTOR_ID,
     AccountRow,
     AssessmentAnswers,
     AssessmentQuestion,
     AssessmentView,
+    CommunityAssignmentReasonCode,
+    CommunityCovenantView,
+    CommunityView,
+    ConsentAcknowledgement,
     ConsentView,
     CounselorDecisionStatus,
+    CovenantAffirmation,
+    DenominationCode,
+    IntroductorySessionReasonCode,
+    IntroductorySessionStatus,
+    IntroductorySessionView,
     InvitationInput,
     InvitationView,
+    MatchingMode,
     MemberProgress,
     OperationsMember,
     ProfileInput,
@@ -119,6 +149,8 @@ from matchwell.infrastructure.persistence.models import (
     BillingCustomerRecord,
     BillingWebhookReceiptRecord,
     CenterRecord,
+    CommunityCovenantAcceptanceRecord,
+    CommunityCovenantDefinitionRecord,
     CommunityRecord,
     ConsentAcceptanceRecord,
     ConsentVersionRecord,
@@ -127,34 +159,52 @@ from matchwell.infrastructure.persistence.models import (
     CounselorEarningRecord,
     EntitlementHistoryRecord,
     HoldRecord,
+    IntroductorySessionBenefitRecord,
     InvitationRecord,
     JourneyCheckInRecord,
     JourneyTaskCompletionRecord,
     JourneyTemplateRecord,
     JourneyTemplateTaskRecord,
     MatchedPairMessageRecord,
+    MatchProposalParticipantClaimRecord,
     MatchProposalRecord,
     MemberBlockRecord,
+    MemberCommunityAssignmentRecord,
     MemberMatchPreferencesRecord,
     MemberProfileRecord,
     MemberReportRecord,
     OutboxMessageRecord,
     PairJourneyRecord,
+    PersonalityInventoryAssignmentRecord,
+    PersonalityInventoryDefinitionRecord,
+    PersonalityInventoryResponseRecord,
+    PersonalityInventoryScoreRecord,
     PilotPlanRecord,
     ReadinessDecisionRecord,
+    RematchAuthorizationRecord,
     ScreeningCaseRecord,
     ScreeningEventReceiptRecord,
+    SelfPacedSuggestionInterestRecord,
     SubscriptionRecord,
     UserRecord,
 )
 
 PILOT_CENTER_SLUG = "matchwell-pilot"
-READINESS_CONFIGURATION_VERSION = "pilot-v1"
+READINESS_CONFIGURATION_VERSION = "pilot-v2-community-covenant"
+COMMUNITY_COVENANT_POLICY_KEY = "matchwell-faith-community-covenant"
 DEFAULT_GRACE_PERIOD = timedelta(days=7)
 _OPEN_PROPOSAL_STATUSES = (
     ProposalStatus.PENDING_REVIEW.value,
     ProposalStatus.INTRODUCED.value,
     ProposalStatus.ACTIVE.value,
+)
+_SAFETY_CLOSURE_REASONS = (
+    "member_block",
+    "member_report",
+    "safety_hold",
+    "hold_applied",
+    "readiness_lost",
+    "account_disabled",
 )
 
 
@@ -254,6 +304,17 @@ class SqlAlchemyPilotRepository:
                         definition_id=definition.id,
                         assigned_at=now,
                         expires_at=now + timedelta(days=90),
+                    )
+                )
+                community = self._default_member_community(session, center.id)
+                session.add(
+                    MemberCommunityAssignmentRecord(
+                        center_id=center.id,
+                        member_id=user.id,
+                        community_id=community.id,
+                        assigned_by_id=user.id,
+                        reason_code=CommunityAssignmentReasonCode.PILOT_PLACEMENT.value,
+                        assigned_at=now,
                     )
                 )
 
@@ -385,6 +446,13 @@ class SqlAlchemyPilotRepository:
                     actor.id,
                     "account_disabled",
                 )
+                self._revoke_live_rematch_authorizations_for_member(
+                    session, target.id, actor.id
+                )
+            elif target.role == Role.COUNSELOR.value:
+                self._revoke_live_rematch_authorizations_for_counselor(
+                    session, target.id, actor.id
+                )
             self._audit(
                 session,
                 actor_id=actor.id,
@@ -512,6 +580,10 @@ class SqlAlchemyPilotRepository:
                 title=consent.title,
                 version=consent.version,
                 body_markdown=consent.body_markdown,
+                required_acknowledgements=tuple(
+                    ConsentAcknowledgement(key=item["key"], label=item["label"])
+                    for item in consent.required_acknowledgements
+                ),
                 accepted=accepted is not None,
             )
 
@@ -519,11 +591,15 @@ class SqlAlchemyPilotRepository:
         self,
         member_id: uuid.UUID,
         consent_version_id: uuid.UUID,
+        acknowledgement_keys: frozenset[str],
     ) -> None:
         with self._sessions.session() as session, session.begin():
             consent = self._active_consent(session)
             if consent.id != consent_version_id:
                 raise ValidationError("The consent version is no longer current.")
+            required = {item["key"] for item in consent.required_acknowledgements}
+            if acknowledgement_keys != required:
+                raise ValidationError("Accept every required acknowledgement exactly.")
             existing = session.scalar(
                 select(ConsentAcceptanceRecord.id).where(
                     ConsentAcceptanceRecord.user_id == member_id,
@@ -536,6 +612,7 @@ class SqlAlchemyPilotRepository:
                 ConsentAcceptanceRecord(
                     user_id=member_id,
                     consent_version_id=consent.id,
+                    accepted_acknowledgement_keys=sorted(acknowledgement_keys),
                 )
             )
             self._audit(
@@ -544,7 +621,139 @@ class SqlAlchemyPilotRepository:
                 action="consent.accepted",
                 subject_id=member_id,
                 center_id=self._member_center_id(session, member_id),
-                metadata={"policy_key": consent.policy_key, "version": consent.version},
+                metadata={
+                    "policy_key": consent.policy_key,
+                    "version": consent.version,
+                    "acknowledgement_keys": sorted(acknowledgement_keys),
+                },
+            )
+            session.flush()
+            self._reevaluate(session, member_id, member_id)
+
+    def get_current_community_covenant(
+        self, member_id: uuid.UUID
+    ) -> CommunityCovenantView:
+        with self._sessions.session() as session:
+            self._member(session, member_id)
+            covenant = self._active_community_covenant(session)
+            acceptance = session.scalar(
+                select(CommunityCovenantAcceptanceRecord).where(
+                    CommunityCovenantAcceptanceRecord.user_id == member_id,
+                    CommunityCovenantAcceptanceRecord.covenant_definition_id
+                    == covenant.id,
+                )
+            )
+            required = {str(item["key"]) for item in covenant.required_affirmations}
+            return CommunityCovenantView(
+                id=covenant.id,
+                policy_key=covenant.policy_key,
+                display_version=covenant.display_version,
+                revision=covenant.revision,
+                effective_at=covenant.effective_at,
+                title=covenant.title,
+                body_markdown=covenant.body_markdown,
+                required_affirmations=tuple(
+                    CovenantAffirmation(
+                        key=str(item["key"]),
+                        label=str(item["label"]),
+                    )
+                    for item in covenant.required_affirmations
+                ),
+                accepted=(
+                    acceptance is not None
+                    and set(acceptance.accepted_affirmation_keys) == required
+                    and len(acceptance.accepted_affirmation_keys) == len(required)
+                ),
+            )
+
+    def accept_community_covenant(
+        self,
+        member_id: uuid.UUID,
+        covenant_definition_id: uuid.UUID,
+        affirmation_keys: frozenset[str],
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            member = self._member(session, member_id, for_update=True)
+            covenant = self._active_community_covenant(session)
+            if covenant.id != covenant_definition_id:
+                raise ValidationError("The covenant version is no longer current.")
+            required = {str(item["key"]) for item in covenant.required_affirmations}
+            if affirmation_keys != required:
+                raise ValidationError("Affirm every required commitment exactly.")
+            existing = session.scalar(
+                select(CommunityCovenantAcceptanceRecord).where(
+                    CommunityCovenantAcceptanceRecord.user_id == member_id,
+                    CommunityCovenantAcceptanceRecord.covenant_definition_id
+                    == covenant.id,
+                )
+            )
+            if existing is not None:
+                if set(existing.accepted_affirmation_keys) != required or len(
+                    existing.accepted_affirmation_keys
+                ) != len(required):
+                    raise ConflictError(
+                        "The covenant definition changed after acceptance; "
+                        "publish a new revision before collecting re-consent."
+                    )
+                return
+            acceptance_id = uuid.uuid4()
+            values = {
+                "id": acceptance_id,
+                "user_id": member_id,
+                "covenant_definition_id": covenant.id,
+                "accepted_affirmation_keys": sorted(affirmation_keys),
+                "accepted_at": self._now(),
+            }
+            dialect_name = session.get_bind().dialect.name
+            if dialect_name == "postgresql":
+                inserted = session.execute(
+                    postgresql_insert(CommunityCovenantAcceptanceRecord)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=["user_id", "covenant_definition_id"]
+                    )
+                )
+            elif dialect_name == "sqlite":
+                inserted = session.execute(
+                    sqlite_insert(CommunityCovenantAcceptanceRecord)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=["user_id", "covenant_definition_id"]
+                    )
+                )
+            else:
+                raise RuntimeError(
+                    "Community covenant acceptance requires PostgreSQL or SQLite."
+                )
+            if cast(CursorResult[Any], inserted).rowcount == 0:
+                concurrent = session.scalar(
+                    select(CommunityCovenantAcceptanceRecord).where(
+                        CommunityCovenantAcceptanceRecord.user_id == member_id,
+                        CommunityCovenantAcceptanceRecord.covenant_definition_id
+                        == covenant.id,
+                    )
+                )
+                if (
+                    concurrent is None
+                    or set(concurrent.accepted_affirmation_keys) != required
+                    or len(concurrent.accepted_affirmation_keys) != len(required)
+                ):
+                    raise ConflictError(
+                        "The covenant acceptance conflicts with the current definition."
+                    )
+                return
+            self._audit(
+                session,
+                actor_id=member_id,
+                action="community_covenant.accepted",
+                subject_id=member_id,
+                center_id=member.center_id,
+                metadata={
+                    "policy_key": covenant.policy_key,
+                    "display_version": covenant.display_version,
+                    "revision": covenant.revision,
+                    "affirmation_keys": sorted(affirmation_keys),
+                },
             )
             session.flush()
             self._reevaluate(session, member_id, member_id)
@@ -559,7 +768,8 @@ class SqlAlchemyPilotRepository:
                 birth_date=profile.birth_date,
                 faith_affirmed=profile.faith_affirmed,
                 relationship_intent=profile.relationship_intent,
-                denomination=profile.denomination,
+                denomination_code=DenominationCode(profile.denomination_code),
+                denomination_other=profile.denomination_other,
                 city=profile.city,
                 state=profile.state,
             )
@@ -573,7 +783,12 @@ class SqlAlchemyPilotRepository:
                 "birth_date": profile.birth_date,
                 "faith_affirmed": profile.faith_affirmed,
                 "relationship_intent": profile.relationship_intent.strip(),
-                "denomination": profile.denomination.strip(),
+                "denomination_code": profile.denomination_code.value,
+                "denomination_other": (
+                    profile.denomination_other.strip()
+                    if profile.denomination_other is not None
+                    else None
+                ),
                 "city": profile.city.strip(),
                 "state": profile.state.strip(),
                 "completed_at": self._now(),
@@ -593,6 +808,114 @@ class SqlAlchemyPilotRepository:
             )
             session.flush()
             self._reevaluate(session, member_id, member_id)
+
+    def introductory_session(
+        self,
+        member_id: uuid.UUID,
+        center_id: uuid.UUID | None = None,
+    ) -> IntroductorySessionView:
+        with self._sessions.session() as session, session.begin():
+            member = self._member(session, member_id, center_id)
+            benefit = self._ensure_introductory_session(session, member)
+            return self._introductory_session_view(session, benefit)
+
+    def schedule_introductory_session(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        counselor_id: uuid.UUID,
+        scheduled_at: datetime,
+    ) -> IntroductorySessionView:
+        with self._sessions.session() as session, session.begin():
+            member = self._member(session, member_id, actor.center_id, for_update=True)
+            if member.status != AccountStatus.ACTIVE.value:
+                raise ConflictError("The member account must be active.")
+            counselor = self._role_user(
+                session, counselor_id, Role.COUNSELOR, actor.center_id
+            )
+            if counselor.status != AccountStatus.ACTIVE.value:
+                raise ConflictError("The counselor account must be active.")
+            assignment = session.scalar(
+                select(CounselorAssignmentRecord.id).where(
+                    CounselorAssignmentRecord.member_id == member_id,
+                    CounselorAssignmentRecord.counselor_id == counselor_id,
+                    CounselorAssignmentRecord.center_id == actor.center_id,
+                    CounselorAssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if assignment is None:
+                raise ConflictError("Assign this counselor to the member first.")
+            benefit = self._ensure_introductory_session(session, member)
+            if benefit.status == IntroductorySessionStatus.COMPLETED.value:
+                raise ConflictError("The introductory session is already complete.")
+            previous = benefit.status
+            benefit.status = IntroductorySessionStatus.SCHEDULED.value
+            benefit.counselor_id = counselor_id
+            benefit.scheduled_at = scheduled_at
+            benefit.completed_at = None
+            benefit.reason_code = None
+            benefit.updated_at = self._now()
+            self._record_introductory_transition(session, actor, benefit, previous)
+            return self._introductory_session_view(session, benefit)
+
+    def cancel_introductory_session(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: IntroductorySessionReasonCode,
+    ) -> IntroductorySessionView:
+        with self._sessions.session() as session, session.begin():
+            member = self._member(session, member_id, actor.center_id, for_update=True)
+            if member.status != AccountStatus.ACTIVE.value:
+                raise ConflictError("The member account must be active.")
+            benefit = self._ensure_introductory_session(session, member)
+            if benefit.status != IntroductorySessionStatus.SCHEDULED.value:
+                raise ConflictError("Only a scheduled session can be cancelled.")
+            previous = benefit.status
+            benefit.status = IntroductorySessionStatus.CANCELLED.value
+            benefit.reason_code = reason_code.value
+            benefit.updated_at = self._now()
+            self._record_introductory_transition(session, actor, benefit, previous)
+            return self._introductory_session_view(session, benefit)
+
+    def complete_introductory_session(
+        self, counselor: AuthenticatedUser, member_id: uuid.UUID
+    ) -> IntroductorySessionView:
+        with self._sessions.session() as session, session.begin():
+            member = self._member(
+                session, member_id, counselor.center_id, for_update=True
+            )
+            if member.status != AccountStatus.ACTIVE.value:
+                raise ConflictError("The member account must be active.")
+            benefit = self._ensure_introductory_session(session, member)
+            if (
+                benefit.status != IntroductorySessionStatus.SCHEDULED.value
+                or benefit.counselor_id != counselor.id
+            ):
+                raise ConflictError(
+                    "Only the assigned counselor can complete a scheduled session."
+                )
+            counselor_record = self._role_user(
+                session, counselor.id, Role.COUNSELOR, counselor.center_id
+            )
+            if counselor_record.status != AccountStatus.ACTIVE.value:
+                raise ConflictError("The counselor account must be active.")
+            active_assignment = session.scalar(
+                select(CounselorAssignmentRecord.id).where(
+                    CounselorAssignmentRecord.member_id == member_id,
+                    CounselorAssignmentRecord.counselor_id == counselor.id,
+                    CounselorAssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if active_assignment is None:
+                raise ConflictError("The counselor assignment is no longer active.")
+            previous = benefit.status
+            benefit.status = IntroductorySessionStatus.COMPLETED.value
+            benefit.completed_at = self._now()
+            benefit.reason_code = None
+            benefit.updated_at = benefit.completed_at
+            self._record_introductory_transition(session, counselor, benefit, previous)
+            return self._introductory_session_view(session, benefit)
 
     def get_assessment(self, member_id: uuid.UUID) -> AssessmentView:
         with self._sessions.session() as session, session.begin():
@@ -646,6 +969,88 @@ class SqlAlchemyPilotRepository:
             session.flush()
             self._reevaluate(session, member_id, member_id)
 
+    def get_personality_inventory(
+        self, member_id: uuid.UUID
+    ) -> PersonalityInventoryView:
+        with self._sessions.session() as session, session.begin():
+            self._member(session, member_id)
+            assignment, definition = self._ensure_personality_assignment(
+                session, member_id
+            )
+            return PersonalityInventoryView(
+                assignment_id=assignment.id,
+                version=definition.version,
+                title=definition.title,
+                description=definition.description,
+                items=self._personality_items(definition),
+                completed_at=assignment.completed_at,
+            )
+
+    def submit_personality_inventory(
+        self,
+        member_id: uuid.UUID,
+        assignment_id: uuid.UUID,
+        answers: PersonalityAnswers,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            assignment, definition = self._ensure_personality_assignment(
+                session, member_id
+            )
+            if assignment.id != assignment_id:
+                raise ValidationError(
+                    "The personality inventory assignment is no longer current."
+                )
+            try:
+                scores = score_inventory(self._personality_items(definition), answers)
+            except ValueError as error:
+                raise ValidationError(str(error)) from error
+            now = self._now()
+            response = session.get(PersonalityInventoryResponseRecord, assignment.id)
+            if response is None:
+                session.add(
+                    PersonalityInventoryResponseRecord(
+                        assignment_id=assignment.id,
+                        answers=dict(answers),
+                        updated_at=now,
+                    )
+                )
+            else:
+                response.answers = dict(answers)
+                response.updated_at = now
+            score = session.get(PersonalityInventoryScoreRecord, assignment.id)
+            safe_scores = {trait.value: value for trait, value in scores.items()}
+            if score is None:
+                session.add(
+                    PersonalityInventoryScoreRecord(
+                        assignment_id=assignment.id,
+                        scores=safe_scores,
+                        scored_at=now,
+                    )
+                )
+            else:
+                score.scores = safe_scores
+                score.scored_at = now
+            assignment.completed_at = now
+            # Only assignment/version metadata crosses the sensitive boundary.
+            self._audit(
+                session,
+                actor_id=member_id,
+                action="personality_inventory.completed",
+                subject_id=assignment.id,
+                center_id=self._member_center_id(session, member_id),
+                metadata={"version": definition.version},
+            )
+
+    def personality_status(self, member_id: uuid.UUID) -> PersonalityStatus:
+        with self._sessions.session() as session, session.begin():
+            assignment, definition = self._ensure_personality_assignment(
+                session, member_id
+            )
+            return PersonalityStatus(
+                version=definition.version,
+                completed_at=assignment.completed_at,
+            )
+
     def get_progress(self, member_id: uuid.UUID) -> MemberProgress:
         with self._sessions.session() as session, session.begin():
             member = self._member(session, member_id)
@@ -657,7 +1062,7 @@ class SqlAlchemyPilotRepository:
             )
             counselor_status = self._counselor_status(session, member_id)
             screening_status = self._screening_status(session, member_id)
-            community = self._community(session, member.center_id)
+            community = self._assigned_community(session, member.id)
             profile = session.get(MemberProfileRecord, member_id)
             return MemberProgress(
                 member_id=member_id,
@@ -668,6 +1073,7 @@ class SqlAlchemyPilotRepository:
                 counselor_status=counselor_status,
                 screening_status=screening_status,
                 community_name=community.name,
+                matching_mode=MatchingMode(community.matching_mode),
             )
 
     def create_invitation(
@@ -765,6 +1171,147 @@ class SqlAlchemyPilotRepository:
             ).all()
             return tuple(self._user(record) for record in records)
 
+    def list_communities(self, actor: AuthenticatedUser) -> Sequence[CommunityView]:
+        with self._sessions.session() as session:
+            communities = session.scalars(
+                select(CommunityRecord)
+                .where(CommunityRecord.center_id == actor.center_id)
+                .order_by(CommunityRecord.name)
+            ).all()
+            return tuple(
+                CommunityView(
+                    id=community.id,
+                    name=community.name,
+                    matching_mode=MatchingMode(community.matching_mode),
+                )
+                for community in communities
+            )
+
+    def assign_community(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        community_id: uuid.UUID,
+        reason_code: CommunityAssignmentReasonCode,
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            member = self._member(session, member_id, actor.center_id, for_update=True)
+            target = session.scalar(
+                select(CommunityRecord)
+                .where(
+                    CommunityRecord.id == community_id,
+                    CommunityRecord.center_id == actor.center_id,
+                )
+                .with_for_update()
+            )
+            if target is None:
+                raise NotFoundError("The community was not found in this Center.")
+            current_assignment = self._current_community_assignment(
+                session, member.id, for_update=True
+            )
+            if (
+                current_assignment is not None
+                and current_assignment.community_id == target.id
+            ):
+                return
+            incompatible = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.status.in_(
+                        (
+                            ProposalStatus.INTRODUCED.value,
+                            ProposalStatus.ACTIVE.value,
+                        )
+                    ),
+                    or_(
+                        MatchProposalRecord.member_a_id == member.id,
+                        MatchProposalRecord.member_b_id == member.id,
+                    ),
+                )
+                .with_for_update()
+            ).all()
+            if incompatible:
+                raise ConflictError(
+                    "Community assignment cannot change while the member has an "
+                    "introduced or active pair."
+                )
+            pending = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.status == ProposalStatus.PENDING_REVIEW.value,
+                    or_(
+                        MatchProposalRecord.member_a_id == member.id,
+                        MatchProposalRecord.member_b_id == member.id,
+                    ),
+                )
+                .with_for_update()
+            ).all()
+            for proposal in pending:
+                self._close_proposal(
+                    session, actor.id, proposal, "community_reassigned"
+                )
+            now = self._now()
+            if current_assignment is not None:
+                current_assignment.ended_at = now
+            session.add(
+                MemberCommunityAssignmentRecord(
+                    center_id=actor.center_id,
+                    member_id=member.id,
+                    community_id=target.id,
+                    assigned_by_id=actor.id,
+                    reason_code=reason_code.value,
+                    assigned_at=now,
+                )
+            )
+            interests = session.scalars(
+                select(SelfPacedSuggestionInterestRecord).where(
+                    or_(
+                        SelfPacedSuggestionInterestRecord.member_id == member.id,
+                        SelfPacedSuggestionInterestRecord.candidate_member_id
+                        == member.id,
+                    ),
+                    SelfPacedSuggestionInterestRecord.status.in_(
+                        (
+                            SuggestionInterestStatus.INTERESTED.value,
+                            SuggestionInterestStatus.DISMISSED.value,
+                        )
+                    ),
+                )
+            ).all()
+            for interest in interests:
+                interest.status = SuggestionInterestStatus.WITHDRAWN.value
+                interest.updated_at = now
+            authorizations = session.scalars(
+                select(RematchAuthorizationRecord).where(
+                    RematchAuthorizationRecord.status.in_(
+                        (
+                            RematchAuthorizationStatus.PENDING.value,
+                            RematchAuthorizationStatus.APPROVED.value,
+                        )
+                    ),
+                    or_(
+                        RematchAuthorizationRecord.member_a_id == member.id,
+                        RematchAuthorizationRecord.member_b_id == member.id,
+                    ),
+                )
+            ).all()
+            for authorization in authorizations:
+                self._revoke_rematch_authorization(session, actor.id, authorization)
+            session.flush()
+            self._reevaluate(session, member.id, actor.id)
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="community.assignment_changed",
+                subject_id=member.id,
+                center_id=actor.center_id,
+                metadata={
+                    "community_id": str(target.id),
+                    "matching_mode": target.matching_mode,
+                    "reason_code": reason_code.value,
+                },
+            )
+
     def assign_counselor(
         self,
         actor: AuthenticatedUser,
@@ -795,6 +1342,9 @@ class SqlAlchemyPilotRepository:
                 ).all()
                 if any(item.counselor_id == counselor.id for item in active):
                     return
+                self._revoke_live_rematch_authorizations_for_member(
+                    session, member.id, actor.id
+                )
                 for assignment in active:
                     assignment.ended_at = now
                 session.add(
@@ -848,6 +1398,9 @@ class SqlAlchemyPilotRepository:
             now = self._now()
             active_assignment = self._active_counselor_assignment(session, member.id)
             if active_assignment is not None:
+                self._revoke_live_rematch_authorizations_for_member(
+                    session, member.id, actor.id
+                )
                 active_assignment.ended_at = now
             self._close_open_proposals_for_member(
                 session,
@@ -1806,15 +2359,592 @@ class SqlAlchemyPilotRepository:
             )
             session.flush()
 
+    def list_self_paced_suggestions(
+        self, member: AuthenticatedUser
+    ) -> Sequence[SelfPacedSuggestion]:
+        with self._sessions.session() as session, session.begin():
+            current = self._member(
+                session, member.id, member.center_id, for_update=True
+            )
+            community = self._assigned_community(session, current.id)
+            if community.matching_mode != MatchingMode.SELF_PACED.value:
+                raise ConflictError(
+                    "Suggestions are available only in an assigned self-paced community."
+                )
+            current_evidence, reasons = self._matching_member_evidence(
+                session, current, member.id
+            )
+            if current_evidence is None or reasons:
+                return ()
+            candidates = session.scalars(
+                select(UserRecord)
+                .join(
+                    MemberCommunityAssignmentRecord,
+                    MemberCommunityAssignmentRecord.member_id == UserRecord.id,
+                )
+                .where(
+                    UserRecord.id != member.id,
+                    UserRecord.center_id == member.center_id,
+                    UserRecord.role == Role.MEMBER.value,
+                    UserRecord.status == AccountStatus.ACTIVE.value,
+                    MemberCommunityAssignmentRecord.community_id == community.id,
+                    MemberCommunityAssignmentRecord.ended_at.is_(None),
+                )
+                .order_by(UserRecord.id)
+            ).all()
+            existing_pairs, restricted_pairs = self._matching_pair_sets(
+                session, member.center_id
+            )
+            authorizations = self._rematch_authorization_states(
+                session, member.center_id
+            )
+            suggestions: list[SelfPacedSuggestion] = []
+            for candidate in candidates:
+                evidence, candidate_reasons = self._matching_member_evidence(
+                    session, candidate, member.id
+                )
+                if evidence is None or candidate_reasons:
+                    continue
+                pair = self._pair_key(member.id, candidate.id)
+                if self._candidate_pair_exclusion_reasons(
+                    current_evidence,
+                    evidence,
+                    pair,
+                    existing_pairs,
+                    restricted_pairs,
+                    authorizations,
+                ):
+                    continue
+                score = self._scorer.score(current_evidence, evidence)
+                profile = session.get(MemberProfileRecord, candidate.id)
+                if profile is None:
+                    continue
+                interest = session.scalar(
+                    select(SelfPacedSuggestionInterestRecord).where(
+                        SelfPacedSuggestionInterestRecord.member_id == member.id,
+                        SelfPacedSuggestionInterestRecord.candidate_member_id
+                        == candidate.id,
+                    )
+                )
+                incoming_interest = (
+                    session.scalar(
+                        select(SelfPacedSuggestionInterestRecord.id).where(
+                            SelfPacedSuggestionInterestRecord.member_id == candidate.id,
+                            SelfPacedSuggestionInterestRecord.candidate_member_id
+                            == member.id,
+                            SelfPacedSuggestionInterestRecord.status
+                            == SuggestionInterestStatus.INTERESTED.value,
+                        )
+                    )
+                    is not None
+                )
+                age = self._age_on(profile.birth_date, self._now().date())
+                lower = (age // 5) * 5
+                denomination = (
+                    None
+                    if profile.denomination_code
+                    == DenominationCode.PREFER_NOT_TO_SAY.value
+                    else (
+                        profile.denomination_other or "Other"
+                        if profile.denomination_code == DenominationCode.OTHER.value
+                        else DENOMINATION_LABELS[
+                            DenominationCode(profile.denomination_code)
+                        ]
+                    )
+                )
+                suggestions.append(
+                    SelfPacedSuggestion(
+                        member_id=candidate.id,
+                        display_name=profile.display_name,
+                        age_band=f"{lower}–{lower + 4}",
+                        general_location=", ".join(
+                            value for value in (profile.city, profile.state) if value
+                        ),
+                        denomination=denomination,
+                        relationship_intent=profile.relationship_intent,
+                        score=score.total,
+                        explanations=score.explanations,
+                        personality_explanation=self._personality_compatibility(
+                            session, member.id, candidate.id
+                        ),
+                        interest_status=(
+                            SuggestionInterestStatus(interest.status)
+                            if interest is not None
+                            else None
+                        ),
+                        incoming_interest=incoming_interest,
+                    )
+                )
+            return tuple(
+                sorted(
+                    suggestions,
+                    key=lambda item: (-item.score, str(item.member_id)),
+                )
+            )
+
+    def set_suggestion_interest(
+        self,
+        member: AuthenticatedUser,
+        candidate_member_id: uuid.UUID,
+        status: SuggestionInterestStatus,
+    ) -> uuid.UUID | None:
+        try:
+            return self._set_suggestion_interest_once(
+                member, candidate_member_id, status
+            )
+        except IntegrityError as error:
+            # A concurrent reciprocal action may win either the open-pair or
+            # participant-claim uniqueness race. The losing transaction is
+            # fully rolled back before this fresh idempotency read.
+            with self._sessions.session() as session:
+                interest = session.scalar(
+                    select(SelfPacedSuggestionInterestRecord).where(
+                        SelfPacedSuggestionInterestRecord.member_id == member.id,
+                        SelfPacedSuggestionInterestRecord.candidate_member_id
+                        == candidate_member_id,
+                    )
+                )
+                if interest is not None and (
+                    interest.status == status.value
+                    or interest.status == SuggestionInterestStatus.MATCHED.value
+                ):
+                    return interest.proposal_id
+            raise ConflictError(
+                "That suggestion changed while interest was being saved. Refresh "
+                "and try again."
+            ) from error
+
+    def _set_suggestion_interest_once(
+        self,
+        member: AuthenticatedUser,
+        candidate_member_id: uuid.UUID,
+        status: SuggestionInterestStatus,
+    ) -> uuid.UUID | None:
+        with self._sessions.session() as session, session.begin():
+            pair = self._pair_key(member.id, candidate_member_id)
+            locked_members = {
+                member_id: self._member(
+                    session,
+                    member_id,
+                    member.center_id,
+                    for_update=True,
+                )
+                for member_id in pair
+            }
+            current = locked_members[member.id]
+            candidate = locked_members[candidate_member_id]
+            if current.id == candidate.id:
+                raise ValidationError("You cannot select yourself.")
+            community = self._assigned_community(session, current.id)
+            candidate_community = self._assigned_community(session, candidate.id)
+            if (
+                community.id != candidate_community.id
+                or community.matching_mode != MatchingMode.SELF_PACED.value
+            ):
+                raise NotFoundError("That suggestion is not available.")
+            existing = session.scalar(
+                select(SelfPacedSuggestionInterestRecord)
+                .where(
+                    SelfPacedSuggestionInterestRecord.member_id == member.id,
+                    SelfPacedSuggestionInterestRecord.candidate_member_id
+                    == candidate.id,
+                )
+                .with_for_update()
+            )
+            if existing is not None and existing.status == status.value:
+                return existing.proposal_id
+            if existing is not None and existing.status in {
+                SuggestionInterestStatus.MATCHED.value,
+                SuggestionInterestStatus.WITHDRAWN.value,
+            }:
+                return existing.proposal_id
+            current_evidence, current_reasons = self._matching_member_evidence(
+                session, current, member.id
+            )
+            candidate_evidence, candidate_reasons = self._matching_member_evidence(
+                session, candidate, member.id
+            )
+            if (
+                current_evidence is None
+                or candidate_evidence is None
+                or current_reasons
+                or candidate_reasons
+            ):
+                raise ConflictError("That suggestion is no longer available.")
+            existing_pairs, restricted_pairs = self._matching_pair_sets(
+                session, member.center_id
+            )
+            authorization_records = self._approved_rematch_authorizations(
+                session, member.center_id
+            )
+            if self._candidate_pair_exclusion_reasons(
+                current_evidence,
+                candidate_evidence,
+                pair,
+                existing_pairs,
+                restricted_pairs,
+                authorization_records,
+            ):
+                raise ConflictError("That suggestion is no longer available.")
+            now = self._now()
+            if existing is None:
+                existing = SelfPacedSuggestionInterestRecord(
+                    center_id=member.center_id,
+                    community_id=community.id,
+                    member_id=member.id,
+                    candidate_member_id=candidate.id,
+                    status=status.value,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(existing)
+                session.flush()
+            else:
+                existing.status = status.value
+                existing.updated_at = now
+            if status is SuggestionInterestStatus.DISMISSED:
+                return None
+            reciprocal = session.scalar(
+                select(SelfPacedSuggestionInterestRecord)
+                .where(
+                    SelfPacedSuggestionInterestRecord.member_id == candidate.id,
+                    SelfPacedSuggestionInterestRecord.candidate_member_id == member.id,
+                    SelfPacedSuggestionInterestRecord.status
+                    == SuggestionInterestStatus.INTERESTED.value,
+                )
+                .with_for_update()
+            )
+            if reciprocal is None:
+                return None
+            score = self._scorer.score(current_evidence, candidate_evidence)
+            member_a_id, member_b_id = pair
+            proposal = MatchProposalRecord(
+                id=uuid.uuid4(),
+                center_id=member.center_id,
+                community_id=community.id,
+                member_a_id=member_a_id,
+                member_b_id=member_b_id,
+                status=ProposalStatus.ACTIVE.value,
+                score=score.total,
+                score_breakdown=[
+                    {
+                        "label": contribution.label,
+                        "weight": contribution.weight,
+                        "points": contribution.points,
+                    }
+                    for contribution in score.contributions
+                ],
+                counselor_a_id=None,
+                counselor_a_decision=CounselorReviewDecision.APPROVED.value,
+                counselor_b_id=None,
+                counselor_b_decision=CounselorReviewDecision.APPROVED.value,
+                introduced_at=now,
+                member_a_response=MemberResponseDecision.ACCEPTED.value,
+                member_a_responded_at=now,
+                member_b_response=MemberResponseDecision.ACCEPTED.value,
+                member_b_responded_at=now,
+                activated_at=now,
+            )
+            session.add(proposal)
+            self._claim_proposal_participants(session, proposal)
+            if pair in existing_pairs:
+                authorization = authorization_records.get(pair)
+                if authorization is None:
+                    raise ConflictError(
+                        "An approved rematch authorization is required."
+                    )
+                actor = AuthenticatedUser(
+                    id=member.id,
+                    email=member.email,
+                    name=member.name,
+                    role=Role.MEMBER,
+                    center_id=member.center_id,
+                )
+                self._consume_rematch_authorization(
+                    session, actor, authorization, proposal
+                )
+            existing.status = SuggestionInterestStatus.MATCHED.value
+            existing.proposal_id = proposal.id
+            existing.updated_at = now
+            reciprocal.status = SuggestionInterestStatus.MATCHED.value
+            reciprocal.proposal_id = proposal.id
+            reciprocal.updated_at = now
+            self._audit(
+                session,
+                actor_id=member.id,
+                action="matching.self_paced_activated",
+                subject_id=proposal.id,
+                center_id=member.center_id,
+                metadata={"community_id": str(community.id)},
+            )
+            session.flush()
+            return proposal.id
+
+    def list_historical_rematch_pairs(
+        self, actor: AuthenticatedUser
+    ) -> Sequence[HistoricalRematchPair]:
+        with self._sessions.session() as session:
+            proposals = session.scalars(
+                select(MatchProposalRecord)
+                .where(
+                    MatchProposalRecord.center_id == actor.center_id,
+                    MatchProposalRecord.status == ProposalStatus.CLOSED.value,
+                )
+                .order_by(MatchProposalRecord.created_at.desc())
+            ).all()
+            seen: set[tuple[uuid.UUID, uuid.UUID]] = set()
+            result: list[HistoricalRematchPair] = []
+            for proposal in proposals:
+                pair = self._pair_key(proposal.member_a_id, proposal.member_b_id)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                result.append(
+                    HistoricalRematchPair(
+                        member_a_id=pair[0],
+                        member_a_display_name=self._display_name(session, pair[0]),
+                        member_b_id=pair[1],
+                        member_b_display_name=self._display_name(session, pair[1]),
+                        latest_closed_reason=proposal.closed_reason,
+                    )
+                )
+            return result
+
+    def request_rematch_authorization(
+        self,
+        actor: AuthenticatedUser,
+        member_a_id: uuid.UUID,
+        member_b_id: uuid.UUID,
+        reason_code: RematchReasonCode,
+    ) -> uuid.UUID:
+        try:
+            with self._sessions.session() as session, session.begin():
+                pair = self._pair_key(member_a_id, member_b_id)
+                counselor_a, counselor_b, community = self._validate_rematch_pair(
+                    session, actor.center_id, pair, actor.id, require_history=True
+                )
+                self._revoke_stale_pair_authorizations(
+                    session, pair, counselor_a, counselor_b, actor.id
+                )
+                existing = session.scalar(
+                    select(RematchAuthorizationRecord.id).where(
+                        RematchAuthorizationRecord.center_id == actor.center_id,
+                        RematchAuthorizationRecord.member_a_id == pair[0],
+                        RematchAuthorizationRecord.member_b_id == pair[1],
+                        RematchAuthorizationRecord.status.in_(
+                            (
+                                RematchAuthorizationStatus.PENDING.value,
+                                RematchAuthorizationStatus.APPROVED.value,
+                            )
+                        ),
+                    )
+                )
+                if existing is not None:
+                    raise ConflictError(
+                        "This pair already has a pending or approved authorization."
+                    )
+                authorization = RematchAuthorizationRecord(
+                    id=uuid.uuid4(),
+                    center_id=actor.center_id,
+                    community_id=community.id,
+                    member_a_id=pair[0],
+                    member_b_id=pair[1],
+                    requested_by_id=actor.id,
+                    reason_code=reason_code.value,
+                    requested_at=self._now(),
+                    counselor_a_id=counselor_a.counselor_id,
+                    counselor_assignment_a_id=counselor_a.id,
+                    counselor_b_id=counselor_b.counselor_id,
+                    counselor_assignment_b_id=counselor_b.id,
+                    status=RematchAuthorizationStatus.PENDING.value,
+                )
+                session.add(authorization)
+                self._rematch_event(
+                    session,
+                    actor.id,
+                    authorization,
+                    "matching.rematch_authorization_requested",
+                    {"reason_code": reason_code.value},
+                )
+                session.flush()
+                return authorization.id
+        except IntegrityError as error:
+            raise ConflictError(
+                "This pair already has a pending or approved authorization."
+            ) from error
+
+    def list_rematch_authorizations(
+        self, actor: AuthenticatedUser
+    ) -> Sequence[RematchAuthorizationView]:
+        with self._sessions.session() as session:
+            statement = select(RematchAuthorizationRecord).where(
+                RematchAuthorizationRecord.center_id == actor.center_id
+            )
+            if actor.role is Role.COUNSELOR:
+                assigned_ids = select(CounselorAssignmentRecord.member_id).where(
+                    CounselorAssignmentRecord.counselor_id == actor.id,
+                    CounselorAssignmentRecord.ended_at.is_(None),
+                )
+                statement = statement.where(
+                    or_(
+                        RematchAuthorizationRecord.member_a_id.in_(assigned_ids),
+                        RematchAuthorizationRecord.member_b_id.in_(assigned_ids),
+                    )
+                )
+            records = session.scalars(
+                statement.order_by(RematchAuthorizationRecord.requested_at.desc())
+            ).all()
+            views: list[RematchAuthorizationView] = []
+            for record in records:
+                assignment_a = self._active_counselor_assignment(
+                    session, record.member_a_id
+                )
+                assignment_b = self._active_counselor_assignment(
+                    session, record.member_b_id
+                )
+                can_approve = (
+                    actor.role is Role.COUNSELOR
+                    and record.status == RematchAuthorizationStatus.PENDING.value
+                    and (
+                        (
+                            assignment_a is not None
+                            and assignment_a.counselor_id == actor.id
+                            and record.counselor_a_id == actor.id
+                            and record.counselor_assignment_a_id == assignment_a.id
+                            and record.counselor_a_approved_at is None
+                        )
+                        or (
+                            assignment_b is not None
+                            and assignment_b.counselor_id == actor.id
+                            and record.counselor_b_id == actor.id
+                            and record.counselor_assignment_b_id == assignment_b.id
+                            and record.counselor_b_approved_at is None
+                        )
+                    )
+                )
+                views.append(
+                    RematchAuthorizationView(
+                        id=record.id,
+                        member_a_id=record.member_a_id,
+                        member_a_display_name=self._display_name(
+                            session, record.member_a_id
+                        ),
+                        member_b_id=record.member_b_id,
+                        member_b_display_name=self._display_name(
+                            session, record.member_b_id
+                        ),
+                        reason_code=RematchReasonCode(record.reason_code),
+                        status=RematchAuthorizationStatus(record.status),
+                        counselor_a_approved=record.counselor_a_approved_at is not None,
+                        counselor_b_approved=record.counselor_b_approved_at is not None,
+                        requested_at=record.requested_at,
+                        can_approve=can_approve,
+                    )
+                )
+            return views
+
+    def approve_rematch_authorization(
+        self, actor: AuthenticatedUser, authorization_id: uuid.UUID
+    ) -> None:
+        with self._sessions.session() as session, session.begin():
+            authorization = session.scalar(
+                select(RematchAuthorizationRecord)
+                .where(
+                    RematchAuthorizationRecord.id == authorization_id,
+                    RematchAuthorizationRecord.center_id == actor.center_id,
+                )
+                .with_for_update()
+            )
+            if authorization is None:
+                raise NotFoundError("The rematch authorization was not found.")
+            if authorization.status != RematchAuthorizationStatus.PENDING.value:
+                raise ConflictError("This rematch authorization is no longer pending.")
+            pair = (authorization.member_a_id, authorization.member_b_id)
+            current_assignment_a = self._active_counselor_assignment(session, pair[0])
+            current_assignment_b = self._active_counselor_assignment(session, pair[1])
+            if (
+                current_assignment_a is None
+                or current_assignment_b is None
+                or current_assignment_a.id != authorization.counselor_assignment_a_id
+                or current_assignment_b.id != authorization.counselor_assignment_b_id
+                or current_assignment_a.counselor_id != authorization.counselor_a_id
+                or current_assignment_b.counselor_id != authorization.counselor_b_id
+            ):
+                self._revoke_rematch_authorization(session, actor.id, authorization)
+                session.commit()
+                raise ConflictError(
+                    "Counselor assignments changed; Member Operations must request "
+                    "a new authorization."
+                )
+            counselor_a, counselor_b, _ = self._validate_rematch_pair(
+                session, actor.center_id, pair, actor.id, require_history=True
+            )
+            current_ids = (counselor_a.counselor_id, counselor_b.counselor_id)
+            current_assignment_ids = (counselor_a.id, counselor_b.id)
+            if current_ids != (
+                authorization.counselor_a_id,
+                authorization.counselor_b_id,
+            ) or current_assignment_ids != (
+                authorization.counselor_assignment_a_id,
+                authorization.counselor_assignment_b_id,
+            ):
+                self._revoke_rematch_authorization(session, actor.id, authorization)
+                session.commit()
+                raise ConflictError(
+                    "Counselor assignments changed; Member Operations must request "
+                    "a new authorization."
+                )
+            now = self._now()
+            if (
+                actor.id == authorization.counselor_a_id
+                and authorization.counselor_a_approved_at is None
+            ):
+                authorization.counselor_a_approved_by_id = actor.id
+                authorization.counselor_a_approved_at = now
+                side = "member_a"
+            elif (
+                actor.id == authorization.counselor_b_id
+                and authorization.counselor_b_approved_at is None
+            ):
+                authorization.counselor_b_approved_by_id = actor.id
+                authorization.counselor_b_approved_at = now
+                side = "member_b"
+            elif actor.id in (
+                authorization.counselor_a_id,
+                authorization.counselor_b_id,
+            ):
+                raise ConflictError("You already approved your assigned member's side.")
+            else:
+                raise NotFoundError("The rematch authorization was not found.")
+            if (
+                authorization.counselor_a_approved_at is not None
+                and authorization.counselor_b_approved_at is not None
+            ):
+                authorization.status = RematchAuthorizationStatus.APPROVED.value
+            self._rematch_event(
+                session,
+                actor.id,
+                authorization,
+                "matching.rematch_authorization_counselor_approved",
+                {"side": side, "status": authorization.status},
+            )
+            session.flush()
+
     def generate_candidates(self, actor: AuthenticatedUser) -> int:
         with self._sessions.session() as session, session.begin():
-            community = self._community(session, actor.center_id)
+            community = self._counselor_matching_community(session, actor.center_id)
             members = session.scalars(
                 select(UserRecord)
+                .join(
+                    MemberCommunityAssignmentRecord,
+                    MemberCommunityAssignmentRecord.member_id == UserRecord.id,
+                )
                 .where(
                     UserRecord.center_id == actor.center_id,
                     UserRecord.role == Role.MEMBER.value,
                     UserRecord.status == AccountStatus.ACTIVE.value,
+                    MemberCommunityAssignmentRecord.community_id == community.id,
+                    MemberCommunityAssignmentRecord.ended_at.is_(None),
                 )
                 .with_for_update()
             ).all()
@@ -1830,6 +2960,9 @@ class SqlAlchemyPilotRepository:
             existing_pairs, restricted_pairs = self._matching_pair_sets(
                 session, actor.center_id
             )
+            authorizations = self._approved_rematch_authorizations(
+                session, actor.center_id
+            )
             scored_pairs: list[tuple[float, CandidateEvidence, CandidateEvidence]] = []
             for index, candidate_a in enumerate(evidences):
                 for candidate_b in evidences[index + 1 :]:
@@ -1840,6 +2973,7 @@ class SqlAlchemyPilotRepository:
                         pair,
                         existing_pairs,
                         restricted_pairs,
+                        authorizations,
                     ):
                         continue
                     score = self._scorer.score(candidate_a, candidate_b)
@@ -1865,36 +2999,40 @@ class SqlAlchemyPilotRepository:
                 member_a_id, member_b_id = pair
                 counselor_a = self._active_counselor_assignment(session, member_a_id)
                 counselor_b = self._active_counselor_assignment(session, member_b_id)
-                session.add(
-                    MatchProposalRecord(
-                        center_id=actor.center_id,
-                        community_id=community.id,
-                        member_a_id=member_a_id,
-                        member_b_id=member_b_id,
-                        status=ProposalStatus.PENDING_REVIEW.value,
-                        score=score.total,
-                        score_breakdown=[
-                            {
-                                "label": item.label,
-                                "weight": item.weight,
-                                "points": item.points,
-                            }
-                            for item in score.contributions
-                        ],
-                        counselor_a_id=(
-                            counselor_a.counselor_id
-                            if counselor_a is not None
-                            else None
-                        ),
-                        counselor_a_decision=CounselorReviewDecision.PENDING.value,
-                        counselor_b_id=(
-                            counselor_b.counselor_id
-                            if counselor_b is not None
-                            else None
-                        ),
-                        counselor_b_decision=CounselorReviewDecision.PENDING.value,
-                    )
+                authorization = authorizations.get(pair)
+                proposal = MatchProposalRecord(
+                    id=uuid.uuid4(),
+                    center_id=actor.center_id,
+                    community_id=community.id,
+                    member_a_id=member_a_id,
+                    member_b_id=member_b_id,
+                    status=ProposalStatus.PENDING_REVIEW.value,
+                    score=score.total,
+                    score_breakdown=[
+                        {
+                            "label": item.label,
+                            "weight": item.weight,
+                            "points": item.points,
+                        }
+                        for item in score.contributions
+                    ],
+                    counselor_a_id=(
+                        counselor_a.counselor_id if counselor_a is not None else None
+                    ),
+                    counselor_a_decision=CounselorReviewDecision.PENDING.value,
+                    counselor_b_id=(
+                        counselor_b.counselor_id if counselor_b is not None else None
+                    ),
+                    counselor_b_decision=CounselorReviewDecision.PENDING.value,
                 )
+                session.add(proposal)
+                self._claim_proposal_participants(session, proposal)
+                if pair in existing_pairs:
+                    if authorization is None:
+                        continue
+                    self._consume_rematch_authorization(
+                        session, actor, authorization, proposal
+                    )
                 existing_pairs.add(pair)
                 matched_members.update(pair)
                 created += 1
@@ -1915,12 +3053,19 @@ class SqlAlchemyPilotRepository:
         actor: AuthenticatedUser,
     ) -> CandidateGenerationDiagnostics:
         with self._sessions.session() as session, session.begin():
+            community = self._counselor_matching_community(session, actor.center_id)
             members = session.scalars(
                 select(UserRecord)
+                .join(
+                    MemberCommunityAssignmentRecord,
+                    MemberCommunityAssignmentRecord.member_id == UserRecord.id,
+                )
                 .where(
                     UserRecord.center_id == actor.center_id,
                     UserRecord.role == Role.MEMBER.value,
                     UserRecord.status == AccountStatus.ACTIVE.value,
+                    MemberCommunityAssignmentRecord.community_id == community.id,
+                    MemberCommunityAssignmentRecord.ended_at.is_(None),
                 )
                 .order_by(UserRecord.name)
             ).all()
@@ -1953,6 +3098,9 @@ class SqlAlchemyPilotRepository:
             existing_pairs, restricted_pairs = self._matching_pair_sets(
                 session, actor.center_id
             )
+            authorizations = self._rematch_authorization_states(
+                session, actor.center_id
+            )
             evidences = tuple(evidence_by_member.values())
             pair_diagnostics: list[CandidatePairDiagnostic] = []
             for index, candidate_a in enumerate(evidences):
@@ -1967,6 +3115,7 @@ class SqlAlchemyPilotRepository:
                         pair,
                         existing_pairs,
                         restricted_pairs,
+                        authorizations,
                     )
                     pair_diagnostics.append(
                         CandidatePairDiagnostic(
@@ -1976,6 +3125,7 @@ class SqlAlchemyPilotRepository:
                             member_b_display_name=names[candidate_b.member_id],
                             eligible=not reasons,
                             reasons=reasons,
+                            rematch_authorization_status=authorizations.get(pair),
                         )
                     )
 
@@ -2052,7 +3202,7 @@ class SqlAlchemyPilotRepository:
                 max_partner_age=preferences.max_partner_age,
                 city=profile.city,
                 state=profile.state,
-                denomination=profile.denomination,
+                denomination_code=DenominationCode(profile.denomination_code),
                 relationship_intent=profile.relationship_intent,
             ),
             (),
@@ -2093,7 +3243,350 @@ class SqlAlchemyPilotRepository:
                 )
             )
         }
+        restricted_pairs |= {
+            self._pair_key(row[0], row[1])
+            for row in session.execute(
+                select(
+                    MatchProposalRecord.member_a_id,
+                    MatchProposalRecord.member_b_id,
+                ).where(MatchProposalRecord.closed_reason.in_(_SAFETY_CLOSURE_REASONS))
+            )
+        }
         return existing_pairs, restricted_pairs
+
+    def _validate_rematch_pair(
+        self,
+        session: Session,
+        center_id: uuid.UUID,
+        pair: tuple[uuid.UUID, uuid.UUID],
+        actor_id: uuid.UUID,
+        *,
+        require_history: bool,
+    ) -> tuple[
+        CounselorAssignmentRecord,
+        CounselorAssignmentRecord,
+        CommunityRecord,
+    ]:
+        members = session.scalars(
+            select(UserRecord)
+            .where(
+                UserRecord.id.in_(pair),
+                UserRecord.center_id == center_id,
+                UserRecord.role == Role.MEMBER.value,
+                UserRecord.status == AccountStatus.ACTIVE.value,
+            )
+            .with_for_update()
+        ).all()
+        if len(members) != 2:
+            raise NotFoundError("Both members must be active members in this Center.")
+        history_exists = session.scalar(
+            select(MatchProposalRecord.id).where(
+                MatchProposalRecord.center_id == center_id,
+                MatchProposalRecord.member_a_id == pair[0],
+                MatchProposalRecord.member_b_id == pair[1],
+            )
+        )
+        if require_history and history_exists is None:
+            raise ConflictError(
+                "A rematch authorization requires proposal history in this Center."
+            )
+        if self._has_open_proposal(session, pair[0]) or self._has_open_proposal(
+            session, pair[1]
+        ):
+            raise ConflictError(
+                "An existing candidate, introduction, or matched pair is still open."
+            )
+        if self._pair_has_safety_history(session, pair):
+            raise ConflictError(
+                "Safety history permanently prevents rematch authorization."
+            )
+        counselor_a = self._active_counselor_assignment(session, pair[0])
+        counselor_b = self._active_counselor_assignment(session, pair[1])
+        if counselor_a is None or counselor_b is None:
+            raise ConflictError("Both members require a current counselor assignment.")
+        if counselor_a.counselor_id == counselor_b.counselor_id:
+            raise ConflictError(
+                "Rematch authorization requires separate approvals by two distinct "
+                "current counselors; assign a second counselor before requesting it."
+            )
+        by_id = {member.id: member for member in members}
+        for member_id in pair:
+            evidence, reasons = self._matching_member_evidence(
+                session, by_id[member_id], actor_id
+            )
+            if evidence is None or reasons:
+                raise ConflictError(
+                    "Both members must remain active, ready, and eligible."
+                )
+        for assignment in (counselor_a, counselor_b):
+            counselor = session.get(UserRecord, assignment.counselor_id)
+            if (
+                counselor is None
+                or counselor.center_id != center_id
+                or counselor.role != Role.COUNSELOR.value
+                or counselor.status != AccountStatus.ACTIVE.value
+            ):
+                raise ConflictError(
+                    "Both members require an active counselor in this Center."
+                )
+        community_a = self._assigned_community(session, pair[0])
+        community_b = self._assigned_community(session, pair[1])
+        if community_a.id != community_b.id:
+            raise ConflictError("Both members must be assigned to the same community.")
+        return counselor_a, counselor_b, community_a
+
+    def _pair_has_safety_history(
+        self, session: Session, pair: tuple[uuid.UUID, uuid.UUID]
+    ) -> bool:
+        pair_filter = or_(
+            and_(
+                MemberBlockRecord.blocker_id == pair[0],
+                MemberBlockRecord.blocked_id == pair[1],
+            ),
+            and_(
+                MemberBlockRecord.blocker_id == pair[1],
+                MemberBlockRecord.blocked_id == pair[0],
+            ),
+        )
+        if session.scalar(select(MemberBlockRecord.id).where(pair_filter)) is not None:
+            return True
+        report_filter = or_(
+            and_(
+                MemberReportRecord.reporter_id == pair[0],
+                MemberReportRecord.reported_id == pair[1],
+            ),
+            and_(
+                MemberReportRecord.reporter_id == pair[1],
+                MemberReportRecord.reported_id == pair[0],
+            ),
+        )
+        if (
+            session.scalar(select(MemberReportRecord.id).where(report_filter))
+            is not None
+        ):
+            return True
+        return (
+            session.scalar(
+                select(MatchProposalRecord.id).where(
+                    MatchProposalRecord.member_a_id == pair[0],
+                    MatchProposalRecord.member_b_id == pair[1],
+                    MatchProposalRecord.closed_reason.in_(_SAFETY_CLOSURE_REASONS),
+                )
+            )
+            is not None
+        )
+
+    def _approved_rematch_authorizations(
+        self, session: Session, center_id: uuid.UUID
+    ) -> dict[tuple[uuid.UUID, uuid.UUID], RematchAuthorizationRecord]:
+        records = session.scalars(
+            select(RematchAuthorizationRecord)
+            .where(
+                RematchAuthorizationRecord.center_id == center_id,
+                RematchAuthorizationRecord.status
+                == RematchAuthorizationStatus.APPROVED.value,
+                RematchAuthorizationRecord.consumed_proposal_id.is_(None),
+            )
+            .with_for_update()
+        ).all()
+        result: dict[tuple[uuid.UUID, uuid.UUID], RematchAuthorizationRecord] = {}
+        for record in records:
+            assignment_a = self._active_counselor_assignment(
+                session, record.member_a_id
+            )
+            assignment_b = self._active_counselor_assignment(
+                session, record.member_b_id
+            )
+            if (
+                assignment_a is not None
+                and assignment_b is not None
+                and assignment_a.counselor_id == record.counselor_a_id
+                and assignment_b.counselor_id == record.counselor_b_id
+                and assignment_a.id == record.counselor_assignment_a_id
+                and assignment_b.id == record.counselor_assignment_b_id
+                and record.counselor_a_approved_by_id == record.counselor_a_id
+                and record.counselor_b_approved_by_id == record.counselor_b_id
+                and self._active_counselor_in_center(
+                    session, record.counselor_a_id, center_id
+                )
+                and self._active_counselor_in_center(
+                    session, record.counselor_b_id, center_id
+                )
+            ):
+                result[(record.member_a_id, record.member_b_id)] = record
+            else:
+                self._revoke_rematch_authorization(
+                    session, record.requested_by_id, record
+                )
+        return result
+
+    def _rematch_authorization_states(
+        self, session: Session, center_id: uuid.UUID
+    ) -> dict[tuple[uuid.UUID, uuid.UUID], RematchAuthorizationStatus]:
+        records = session.scalars(
+            select(RematchAuthorizationRecord).where(
+                RematchAuthorizationRecord.center_id == center_id,
+                RematchAuthorizationRecord.status.in_(
+                    (
+                        RematchAuthorizationStatus.PENDING.value,
+                        RematchAuthorizationStatus.APPROVED.value,
+                    )
+                ),
+            )
+        ).all()
+        approved = self._approved_rematch_authorizations(session, center_id)
+        return {
+            (record.member_a_id, record.member_b_id): (
+                RematchAuthorizationStatus.APPROVED
+                if (record.member_a_id, record.member_b_id) in approved
+                else RematchAuthorizationStatus.PENDING
+            )
+            for record in records
+        }
+
+    def _consume_rematch_authorization(
+        self,
+        session: Session,
+        actor: AuthenticatedUser,
+        authorization: RematchAuthorizationRecord,
+        proposal: MatchProposalRecord,
+    ) -> None:
+        authorization.status = RematchAuthorizationStatus.CONSUMED.value
+        authorization.consumed_at = self._now()
+        authorization.consumed_proposal_id = proposal.id
+        self._rematch_event(
+            session,
+            actor.id,
+            authorization,
+            "matching.rematch_authorization_consumed",
+            {"proposal_id": str(proposal.id)},
+        )
+
+    def _revoke_live_rematch_authorizations_for_member(
+        self, session: Session, member_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> None:
+        records = session.scalars(
+            select(RematchAuthorizationRecord)
+            .where(
+                RematchAuthorizationRecord.status.in_(
+                    (
+                        RematchAuthorizationStatus.PENDING.value,
+                        RematchAuthorizationStatus.APPROVED.value,
+                    )
+                ),
+                or_(
+                    RematchAuthorizationRecord.member_a_id == member_id,
+                    RematchAuthorizationRecord.member_b_id == member_id,
+                ),
+            )
+            .with_for_update()
+        ).all()
+        for record in records:
+            self._revoke_rematch_authorization(session, actor_id, record)
+
+    def _revoke_live_rematch_authorizations_for_counselor(
+        self, session: Session, counselor_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> None:
+        records = session.scalars(
+            select(RematchAuthorizationRecord)
+            .where(
+                RematchAuthorizationRecord.status.in_(
+                    (
+                        RematchAuthorizationStatus.PENDING.value,
+                        RematchAuthorizationStatus.APPROVED.value,
+                    )
+                ),
+                or_(
+                    RematchAuthorizationRecord.counselor_a_id == counselor_id,
+                    RematchAuthorizationRecord.counselor_b_id == counselor_id,
+                ),
+            )
+            .with_for_update()
+        ).all()
+        for record in records:
+            self._revoke_rematch_authorization(session, actor_id, record)
+
+    def _revoke_stale_pair_authorizations(
+        self,
+        session: Session,
+        pair: tuple[uuid.UUID, uuid.UUID],
+        assignment_a: CounselorAssignmentRecord,
+        assignment_b: CounselorAssignmentRecord,
+        actor_id: uuid.UUID,
+    ) -> None:
+        records = session.scalars(
+            select(RematchAuthorizationRecord)
+            .where(
+                RematchAuthorizationRecord.member_a_id == pair[0],
+                RematchAuthorizationRecord.member_b_id == pair[1],
+                RematchAuthorizationRecord.status.in_(
+                    (
+                        RematchAuthorizationStatus.PENDING.value,
+                        RematchAuthorizationStatus.APPROVED.value,
+                    )
+                ),
+            )
+            .with_for_update()
+        ).all()
+        for record in records:
+            if (
+                record.counselor_assignment_a_id != assignment_a.id
+                or record.counselor_assignment_b_id != assignment_b.id
+                or record.counselor_a_id != assignment_a.counselor_id
+                or record.counselor_b_id != assignment_b.counselor_id
+            ):
+                self._revoke_rematch_authorization(session, actor_id, record)
+
+    def _revoke_rematch_authorization(
+        self,
+        session: Session,
+        actor_id: uuid.UUID,
+        authorization: RematchAuthorizationRecord,
+    ) -> None:
+        if authorization.status not in (
+            RematchAuthorizationStatus.PENDING.value,
+            RematchAuthorizationStatus.APPROVED.value,
+        ):
+            return
+        authorization.status = RematchAuthorizationStatus.REVOKED.value
+        authorization.revoked_at = self._now()
+        authorization.revoked_by_id = actor_id
+        authorization.revocation_reason_code = "assignment_changed"
+        self._rematch_event(
+            session,
+            actor_id,
+            authorization,
+            "matching.rematch_authorization_revoked",
+            {"reason_code": "assignment_changed"},
+        )
+
+    def _rematch_event(
+        self,
+        session: Session,
+        actor_id: uuid.UUID,
+        authorization: RematchAuthorizationRecord,
+        action: str,
+        metadata: dict[str, object],
+    ) -> None:
+        safe_metadata = {"status": authorization.status, **metadata}
+        self._audit(
+            session,
+            actor_id=actor_id,
+            action=action,
+            subject_id=authorization.id,
+            center_id=authorization.center_id,
+            metadata=safe_metadata,
+        )
+        session.add(
+            OutboxMessageRecord(
+                event_type=action,
+                payload={
+                    "authorization_id": str(authorization.id),
+                    "center_id": str(authorization.center_id),
+                    **safe_metadata,
+                },
+            )
+        )
 
     def _candidate_pair_exclusion_reasons(
         self,
@@ -2102,6 +3595,10 @@ class SqlAlchemyPilotRepository:
         pair: tuple[uuid.UUID, uuid.UUID],
         existing_pairs: set[tuple[uuid.UUID, uuid.UUID]],
         restricted_pairs: set[tuple[uuid.UUID, uuid.UUID]],
+        authorizations: Mapping[
+            tuple[uuid.UUID, uuid.UUID],
+            RematchAuthorizationRecord | RematchAuthorizationStatus,
+        ],
     ) -> tuple[str, ...]:
         reasons: list[str] = []
         if {candidate_a.gender, candidate_b.gender} != {
@@ -2114,10 +3611,30 @@ class SqlAlchemyPilotRepository:
         if pair in restricted_pairs:
             reasons.append("A safety restriction prevents this pair from matching.")
         if pair in existing_pairs:
-            reasons.append(
-                "This pair already has proposal history and cannot be generated again."
+            authorization = authorizations.get(pair)
+            status = (
+                authorization
+                if isinstance(authorization, RematchAuthorizationStatus)
+                else (
+                    RematchAuthorizationStatus(authorization.status)
+                    if authorization is not None
+                    else None
+                )
             )
-        return tuple(reasons)
+            if status is RematchAuthorizationStatus.APPROVED:
+                reasons.append("An approved rematch authorization is ready to use.")
+            elif status is RematchAuthorizationStatus.PENDING:
+                reasons.append("Rematch authorization is awaiting counselor approvals.")
+            else:
+                reasons.append(
+                    "This pair has ordinary proposal history and requires a "
+                    "rematch authorization."
+                )
+        return tuple(
+            reason
+            for reason in reasons
+            if reason != "An approved rematch authorization is ready to use."
+        )
 
     def candidate_queue(
         self,
@@ -2126,9 +3643,14 @@ class SqlAlchemyPilotRepository:
         with self._sessions.session() as session, session.begin():
             rows = session.scalars(
                 select(MatchProposalRecord)
+                .join(
+                    CommunityRecord,
+                    CommunityRecord.id == MatchProposalRecord.community_id,
+                )
                 .where(
                     MatchProposalRecord.center_id == counselor.center_id,
                     MatchProposalRecord.status == ProposalStatus.PENDING_REVIEW.value,
+                    CommunityRecord.matching_mode == MatchingMode.COUNSELOR_BASED.value,
                     or_(
                         and_(
                             MatchProposalRecord.counselor_a_id == counselor.id,
@@ -2189,7 +3711,15 @@ class SqlAlchemyPilotRepository:
                 raise NotFoundError("Candidate proposal was not found.")
             if proposal.status != ProposalStatus.PENDING_REVIEW.value:
                 raise ConflictError("This candidate is no longer pending review.")
-            if not self._pair_entitled(session, proposal):
+            community = session.get(CommunityRecord, proposal.community_id)
+            if (
+                community is None
+                or community.matching_mode != MatchingMode.COUNSELOR_BASED.value
+            ):
+                raise ConflictError(
+                    "Self-paced suggestions do not enter counselor review."
+                )
+            if not self._pair_ready(session, proposal):
                 self._reconcile_entitlement_lapse(session, proposal)
                 raise ConflictError("This candidate is no longer pending review.")
             is_counselor_a = proposal.counselor_a_id == counselor.id
@@ -2233,11 +3763,8 @@ class SqlAlchemyPilotRepository:
                 == CounselorReviewDecision.APPROVED.value
             )
             if decision is CounselorReviewDecision.DECLINED:
-                proposal.status = ProposalStatus.CLOSED.value
-                proposal.closed_at = now
-                proposal.closed_reason = "counselor_declined"
-                self._close_proposal_audit(
-                    session, counselor.id, proposal, "counselor_declined"
+                self._close_proposal(
+                    session, counselor.id, proposal, "counselor_declined", now=now
                 )
             elif both_approved:
                 if self._has_other_open_proposal(
@@ -2284,7 +3811,7 @@ class SqlAlchemyPilotRepository:
             )
             if proposal is None:
                 return None
-            if not self._pair_entitled(session, proposal):
+            if not self._pair_ready(session, proposal):
                 self._reconcile_entitlement_lapse(session, proposal)
                 return None
             return self._introduction_view(session, proposal, member_id)
@@ -2313,7 +3840,7 @@ class SqlAlchemyPilotRepository:
                 raise ConflictError(
                     "This introduction is no longer awaiting a response."
                 )
-            if not self._pair_entitled(session, proposal):
+            if not self._pair_ready(session, proposal):
                 self._reconcile_entitlement_lapse(session, proposal)
                 raise ConflictError(
                     "This introduction is no longer awaiting a response."
@@ -2345,11 +3872,8 @@ class SqlAlchemyPilotRepository:
                 decision is MemberResponseDecision.DECLINED
                 or other_response == MemberResponseDecision.DECLINED.value
             ):
-                proposal.status = ProposalStatus.CLOSED.value
-                proposal.closed_at = now
-                proposal.closed_reason = "member_declined"
-                self._close_proposal_audit(
-                    session, member_id, proposal, "member_declined"
+                self._close_proposal(
+                    session, member_id, proposal, "member_declined", now=now
                 )
             elif other_response == MemberResponseDecision.ACCEPTED.value:
                 if self._has_other_open_proposal(
@@ -2396,7 +3920,7 @@ class SqlAlchemyPilotRepository:
             )
             if proposal is None or proposal.activated_at is None:
                 return None
-            if not self._pair_entitled(session, proposal):
+            if not self._pair_ready(session, proposal):
                 self._reconcile_entitlement_lapse(session, proposal)
                 return None
             partner_id = (
@@ -2554,7 +4078,7 @@ class SqlAlchemyPilotRepository:
             ).all()
             statuses: list[CounselorConversationStatus] = []
             for proposal in proposals:
-                if not self._pair_entitled(session, proposal):
+                if not self._pair_ready(session, proposal):
                     self._reconcile_entitlement_lapse(
                         session,
                         proposal,
@@ -2843,7 +4367,7 @@ class SqlAlchemyPilotRepository:
             ).all()
             views: list[CounselorJourneyView] = []
             for proposal in proposals:
-                if not self._pair_entitled(session, proposal):
+                if not self._pair_ready(session, proposal):
                     self._reconcile_entitlement_lapse(
                         session,
                         proposal,
@@ -2906,10 +4430,7 @@ class SqlAlchemyPilotRepository:
                 },
             )
             if proposal.status in _OPEN_PROPOSAL_STATUSES:
-                proposal.status = ProposalStatus.CLOSED.value
-                proposal.closed_at = self._now()
-                proposal.closed_reason = "member_block"
-                self._close_proposal_audit(session, actor.id, proposal, "member_block")
+                self._close_proposal(session, actor.id, proposal, "member_block")
             session.flush()
 
     def report_member(
@@ -2947,10 +4468,7 @@ class SqlAlchemyPilotRepository:
                 },
             )
             if proposal.status in _OPEN_PROPOSAL_STATUSES:
-                proposal.status = ProposalStatus.CLOSED.value
-                proposal.closed_at = self._now()
-                proposal.closed_reason = "member_report"
-                self._close_proposal_audit(session, actor.id, proposal, "member_report")
+                self._close_proposal(session, actor.id, proposal, "member_report")
             session.flush()
 
     def billing_status(self, member_id: uuid.UUID) -> EntitlementView:
@@ -3687,13 +5205,18 @@ class SqlAlchemyPilotRepository:
         )
 
     def _pair_entitled(self, session: Session, proposal: MatchProposalRecord) -> bool:
-        """Both participants of a matched pair must hold active entitlement.
+        return self._pair_has_active_entitlement(session, proposal)
 
-        This is evaluated fresh on every access so a time-based grace or
-        current-period expiry blocks direct operations immediately, without
-        waiting for a webhook, admin action, or ``progress()`` call to
-        reconcile it.
-        """
+    def _pair_ready(self, session: Session, proposal: MatchProposalRecord) -> bool:
+        """Both participants must satisfy fresh, complete readiness."""
+        return all(
+            self._evaluator.evaluate(self._evidence(session, member_id)).eligible
+            for member_id in (proposal.member_a_id, proposal.member_b_id)
+        )
+
+    def _pair_has_active_entitlement(
+        self, session: Session, proposal: MatchProposalRecord
+    ) -> bool:
         return self._billing_evidence(
             session, proposal.member_a_id
         ) and self._billing_evidence(session, proposal.member_b_id)
@@ -3705,7 +5228,7 @@ class SqlAlchemyPilotRepository:
         *,
         commit_immediately: bool = True,
     ) -> None:
-        """Safely close a matched pair whose entitlement has lapsed.
+        """Safely close a matched pair whose current readiness has lapsed.
 
         History is retained (the proposal row and its audit trail are never
         deleted); only its status transitions to closed so the pair loses
@@ -3718,12 +5241,28 @@ class SqlAlchemyPilotRepository:
         """
         if proposal.status not in _OPEN_PROPOSAL_STATUSES:
             return
-        proposal.status = ProposalStatus.CLOSED.value
-        proposal.closed_at = self._now()
-        proposal.closed_reason = "entitlement_lapsed"
-        self._close_proposal_audit(
-            session, BILLING_SYSTEM_ACTOR_ID, proposal, "entitlement_lapsed"
-        )
+        if not self._pair_has_active_entitlement(session, proposal):
+            self._close_proposal(
+                session,
+                BILLING_SYSTEM_ACTOR_ID,
+                proposal,
+                "entitlement_lapsed",
+            )
+        else:
+            for member_id in (proposal.member_a_id, proposal.member_b_id):
+                self._reevaluate(
+                    session,
+                    member_id,
+                    uuid.UUID(int=0),
+                    only_if_changed=True,
+                )
+            if proposal.status in _OPEN_PROPOSAL_STATUSES:
+                self._close_proposal(
+                    session,
+                    uuid.UUID(int=0),
+                    proposal,
+                    "readiness_lost",
+                )
         if commit_immediately:
             session.commit()
 
@@ -3824,6 +5363,9 @@ class SqlAlchemyPilotRepository:
             my_decision=my_decision,
             partner_counselor_decision=partner_decision,
             created_at=proposal.created_at,
+            personality_explanation=self._personality_compatibility(
+                session, member_id, partner_id
+            ),
         )
 
     def _introduction_view(
@@ -3846,7 +5388,15 @@ class SqlAlchemyPilotRepository:
             partner_city=partner_profile.city if partner_profile is not None else "",
             partner_state=partner_profile.state if partner_profile is not None else "",
             partner_denomination=(
-                partner_profile.denomination if partner_profile is not None else ""
+                (
+                    partner_profile.denomination_other or "Other"
+                    if partner_profile.denomination_code == DenominationCode.OTHER.value
+                    else DENOMINATION_LABELS[
+                        DenominationCode(partner_profile.denomination_code)
+                    ]
+                )
+                if partner_profile is not None
+                else ""
             ),
             partner_relationship_intent=(
                 partner_profile.relationship_intent
@@ -3868,11 +5418,29 @@ class SqlAlchemyPilotRepository:
     ) -> MatchProposalRecord | None:
         member_a_id, member_b_id = self._pair_key(member_id, other_member_id)
         return session.scalar(
-            select(MatchProposalRecord).where(
+            select(MatchProposalRecord)
+            .where(
                 MatchProposalRecord.member_a_id == member_a_id,
                 MatchProposalRecord.member_b_id == member_b_id,
                 MatchProposalRecord.introduced_at.is_not(None),
             )
+            .order_by(MatchProposalRecord.created_at.desc())
+        )
+
+    @staticmethod
+    def _active_counselor_in_center(
+        session: Session, counselor_id: uuid.UUID, center_id: uuid.UUID
+    ) -> bool:
+        return (
+            session.scalar(
+                select(UserRecord.id).where(
+                    UserRecord.id == counselor_id,
+                    UserRecord.center_id == center_id,
+                    UserRecord.role == Role.COUNSELOR.value,
+                    UserRecord.status == AccountStatus.ACTIVE.value,
+                )
+            )
+            is not None
         )
 
     def _has_open_proposal(self, session: Session, member_id: uuid.UUID) -> bool:
@@ -3927,10 +5495,69 @@ class SqlAlchemyPilotRepository:
         ).all()
         now = self._now()
         for proposal in proposals:
-            proposal.status = ProposalStatus.CLOSED.value
-            proposal.closed_at = now
-            proposal.closed_reason = reason
-            self._close_proposal_audit(session, actor_id, proposal, reason)
+            self._close_proposal(session, actor_id, proposal, reason, now=now)
+        self._withdraw_self_paced_interests(session, member_id, now)
+
+    @staticmethod
+    def _withdraw_self_paced_interests(
+        session: Session, member_id: uuid.UUID, now: datetime
+    ) -> None:
+        interests = session.scalars(
+            select(SelfPacedSuggestionInterestRecord).where(
+                or_(
+                    SelfPacedSuggestionInterestRecord.member_id == member_id,
+                    SelfPacedSuggestionInterestRecord.candidate_member_id == member_id,
+                ),
+                SelfPacedSuggestionInterestRecord.status.in_(
+                    (
+                        SuggestionInterestStatus.INTERESTED.value,
+                        SuggestionInterestStatus.DISMISSED.value,
+                    )
+                ),
+            )
+        ).all()
+        for interest in interests:
+            interest.status = SuggestionInterestStatus.WITHDRAWN.value
+            interest.updated_at = now
+
+    def _claim_proposal_participants(
+        self, session: Session, proposal: MatchProposalRecord
+    ) -> None:
+        session.add_all(
+            (
+                MatchProposalParticipantClaimRecord(
+                    proposal_id=proposal.id, member_id=proposal.member_a_id
+                ),
+                MatchProposalParticipantClaimRecord(
+                    proposal_id=proposal.id, member_id=proposal.member_b_id
+                ),
+            )
+        )
+
+    @staticmethod
+    def _release_proposal_participants(
+        session: Session, proposal_id: uuid.UUID
+    ) -> None:
+        session.execute(
+            delete(MatchProposalParticipantClaimRecord).where(
+                MatchProposalParticipantClaimRecord.proposal_id == proposal_id
+            )
+        )
+
+    def _close_proposal(
+        self,
+        session: Session,
+        actor_id: uuid.UUID,
+        proposal: MatchProposalRecord,
+        reason: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        proposal.status = ProposalStatus.CLOSED.value
+        proposal.closed_at = now or self._now()
+        proposal.closed_reason = reason
+        self._release_proposal_participants(session, proposal.id)
+        self._close_proposal_audit(session, actor_id, proposal, reason)
 
     def _close_proposal_audit(
         self,
@@ -3986,7 +5613,7 @@ class SqlAlchemyPilotRepository:
         only_if_changed: bool = False,
     ) -> ReadinessResult:
         member = self._member(session, member_id)
-        community = self._community(session, member.center_id)
+        community = self._assigned_community(session, member.id)
         evidence = self._evidence(session, member_id)
         result = self._evaluator.evaluate(evidence)
         if not result.eligible:
@@ -4083,6 +5710,23 @@ class SqlAlchemyPilotRepository:
             )
             is not None
         )
+        covenant = self._active_community_covenant(session)
+        covenant_acceptance = session.scalar(
+            select(CommunityCovenantAcceptanceRecord).where(
+                CommunityCovenantAcceptanceRecord.user_id == member_id,
+                CommunityCovenantAcceptanceRecord.covenant_definition_id == covenant.id,
+            )
+        )
+        required_affirmation_keys = {
+            str(item["key"]) for item in covenant.required_affirmations
+        }
+        community_covenant_complete = (
+            covenant_acceptance is not None
+            and set(covenant_acceptance.accepted_affirmation_keys)
+            == required_affirmation_keys
+            and len(covenant_acceptance.accepted_affirmation_keys)
+            == len(required_affirmation_keys)
+        )
         assignment: AssessmentAssignmentRecord | None
         if ensure_assessment:
             assignment, _ = self._ensure_current_assessment(session, member_id)
@@ -4104,6 +5748,7 @@ class SqlAlchemyPilotRepository:
         return ReadinessEvidence(
             adult_and_faith_complete=adult_and_faith,
             consent_complete=consent_complete,
+            community_covenant_complete=community_covenant_complete,
             profile_complete=profile_complete,
             assessment_complete=assessment_complete,
             counselor_approved=(
@@ -4138,6 +5783,25 @@ class SqlAlchemyPilotRepository:
             )
         )
         profile = session.get(MemberProfileRecord, member_id)
+        covenant = self._active_community_covenant(session)
+        covenant_acceptance = session.scalar(
+            select(CommunityCovenantAcceptanceRecord).where(
+                CommunityCovenantAcceptanceRecord.user_id == member_id,
+                CommunityCovenantAcceptanceRecord.covenant_definition_id == covenant.id,
+            )
+        )
+        required_affirmation_keys = {
+            str(item["key"]) for item in covenant.required_affirmations
+        }
+        covenant_acceptance_id = (
+            covenant_acceptance.id
+            if covenant_acceptance is not None
+            and set(covenant_acceptance.accepted_affirmation_keys)
+            == required_affirmation_keys
+            and len(covenant_acceptance.accepted_affirmation_keys)
+            == len(required_affirmation_keys)
+            else None
+        )
         assignment, assessment = self._ensure_current_assessment(session, member_id)
         counselor_assignment = self._active_counselor_assignment(session, member_id)
         counselor_decision = (
@@ -4166,6 +5830,9 @@ class SqlAlchemyPilotRepository:
         return {
             "consent_version": consent.version,
             "consent_acceptance_id": str(acceptance_id or "none"),
+            "community_covenant_definition_id": str(covenant.id),
+            "community_covenant_revision": str(covenant.revision),
+            "community_covenant_acceptance_id": str(covenant_acceptance_id or "none"),
             "profile_completed_at": (
                 profile.completed_at.isoformat() if profile is not None else "none"
             ),
@@ -4219,6 +5886,7 @@ class SqlAlchemyPilotRepository:
                 )
             )
             counselor_disabled = counselor_status == AccountStatus.DISABLED.value
+        community = self._assigned_community(session, member.id)
         return OperationsMember(
             id=member.id,
             email=member.email,
@@ -4231,6 +5899,9 @@ class SqlAlchemyPilotRepository:
             readiness=readiness,
             account_status=AccountStatus(member.status),
             counselor_needs_reassignment=counselor_disabled,
+            community_id=community.id,
+            community_name=community.name,
+            matching_mode=MatchingMode(community.matching_mode),
         )
 
     def _counselor_status(
@@ -4326,7 +5997,7 @@ class SqlAlchemyPilotRepository:
             raise NotFoundError("Matched-pair conversation was not found.")
         if proposal.status != ProposalStatus.ACTIVE.value:
             raise ConflictError("This matched-pair conversation is no longer active.")
-        if not self._pair_entitled(session, proposal):
+        if not self._pair_ready(session, proposal):
             self._reconcile_entitlement_lapse(session, proposal)
             raise ConflictError("This matched-pair conversation is no longer active.")
         return proposal
@@ -4387,7 +6058,7 @@ class SqlAlchemyPilotRepository:
             raise NotFoundError("Matched pair was not found.")
         if proposal.status != ProposalStatus.ACTIVE.value:
             raise ConflictError("This matched pair is no longer active.")
-        if not self._pair_entitled(session, proposal):
+        if not self._pair_ready(session, proposal):
             self._reconcile_entitlement_lapse(session, proposal)
             raise ConflictError("This matched pair is no longer active.")
         return proposal
@@ -4681,6 +6352,112 @@ class SqlAlchemyPilotRepository:
             - ((on_date.month, on_date.day) < (birth_date.month, birth_date.day))
         )
 
+    def _ensure_introductory_session(
+        self, session: Session, member: UserRecord
+    ) -> IntroductorySessionBenefitRecord:
+        benefit = session.scalar(
+            select(IntroductorySessionBenefitRecord)
+            .where(IntroductorySessionBenefitRecord.member_id == member.id)
+            .with_for_update()
+        )
+        if benefit is not None:
+            return benefit
+        benefit = IntroductorySessionBenefitRecord(
+            id=uuid.uuid4(),
+            center_id=member.center_id,
+            member_id=member.id,
+            status=IntroductorySessionStatus.AVAILABLE.value,
+            created_at=self._now(),
+            updated_at=self._now(),
+        )
+        session.add(benefit)
+        try:
+            session.flush()
+        except IntegrityError as error:
+            raise ConflictError(
+                "The introductory session benefit already exists."
+            ) from error
+        self._audit(
+            session,
+            actor_id=member.id,
+            action="introductory_session.created",
+            subject_id=member.id,
+            center_id=member.center_id,
+            metadata={"status": IntroductorySessionStatus.AVAILABLE.value},
+        )
+        session.add(
+            OutboxMessageRecord(
+                event_type="introductory_session.status_changed",
+                payload={
+                    "benefit_id": str(benefit.id),
+                    "member_id": str(member.id),
+                    "center_id": str(member.center_id),
+                    "previous_status": None,
+                    "status": IntroductorySessionStatus.AVAILABLE.value,
+                },
+            )
+        )
+        return benefit
+
+    def _introductory_session_view(
+        self, session: Session, benefit: IntroductorySessionBenefitRecord
+    ) -> IntroductorySessionView:
+        counselor_name = None
+        if benefit.counselor_id is not None:
+            counselor_name = session.scalar(
+                select(UserRecord.name).where(UserRecord.id == benefit.counselor_id)
+            )
+        return IntroductorySessionView(
+            id=benefit.id,
+            member_id=benefit.member_id,
+            status=IntroductorySessionStatus(benefit.status),
+            counselor_id=benefit.counselor_id,
+            counselor_name=counselor_name,
+            scheduled_at=benefit.scheduled_at,
+            completed_at=benefit.completed_at,
+            reason_code=(
+                IntroductorySessionReasonCode(benefit.reason_code)
+                if benefit.reason_code is not None
+                else None
+            ),
+            created_at=benefit.created_at,
+            updated_at=benefit.updated_at,
+        )
+
+    def _record_introductory_transition(
+        self,
+        session: Session,
+        actor: AuthenticatedUser,
+        benefit: IntroductorySessionBenefitRecord,
+        previous_status: str,
+    ) -> None:
+        metadata: dict[str, Any] = {
+            "previous_status": previous_status,
+            "status": benefit.status,
+        }
+        if benefit.reason_code is not None:
+            metadata["reason_code"] = benefit.reason_code
+        self._audit(
+            session,
+            actor_id=actor.id,
+            action="introductory_session.transitioned",
+            subject_id=benefit.member_id,
+            center_id=benefit.center_id,
+            metadata=metadata,
+        )
+        session.add(
+            OutboxMessageRecord(
+                event_type="introductory_session.status_changed",
+                payload={
+                    "benefit_id": str(benefit.id),
+                    "member_id": str(benefit.member_id),
+                    "center_id": str(benefit.center_id),
+                    "previous_status": previous_status,
+                    "status": benefit.status,
+                },
+            )
+        )
+
     @classmethod
     def _is_expired(cls, value: datetime | None) -> bool:
         if value is None:
@@ -4708,6 +6485,85 @@ class SqlAlchemyPilotRepository:
         return community
 
     @staticmethod
+    def _default_member_community(
+        session: Session, center_id: uuid.UUID
+    ) -> CommunityRecord:
+        community = session.scalar(
+            select(CommunityRecord)
+            .where(
+                CommunityRecord.center_id == center_id,
+                CommunityRecord.matching_mode == MatchingMode.COUNSELOR_BASED.value,
+            )
+            .order_by(
+                (CommunityRecord.slug == "intentional-relationships").desc(),
+                CommunityRecord.slug,
+            )
+        )
+        if community is None:
+            raise NotFoundError(
+                "A counselor-based pilot community has not been configured."
+            )
+        return community
+
+    @staticmethod
+    def _current_community_assignment(
+        session: Session,
+        member_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> MemberCommunityAssignmentRecord | None:
+        statement = select(MemberCommunityAssignmentRecord).where(
+            MemberCommunityAssignmentRecord.member_id == member_id,
+            MemberCommunityAssignmentRecord.ended_at.is_(None),
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return session.scalar(statement)
+
+    def _assigned_community(
+        self, session: Session, member_id: uuid.UUID
+    ) -> CommunityRecord:
+        assignment = self._current_community_assignment(session, member_id)
+        if assignment is None:
+            member = self._member(session, member_id)
+            community = self._default_member_community(session, member.center_id)
+            assignment = MemberCommunityAssignmentRecord(
+                center_id=member.center_id,
+                member_id=member.id,
+                community_id=community.id,
+                assigned_by_id=member.id,
+                reason_code=CommunityAssignmentReasonCode.PILOT_PLACEMENT.value,
+                assigned_at=self._now(),
+            )
+            session.add(assignment)
+            session.flush()
+            return community
+        assigned_community = session.get(CommunityRecord, assignment.community_id)
+        if assigned_community is None:
+            raise NotFoundError("The member's assigned community was not found.")
+        return assigned_community
+
+    @staticmethod
+    def _counselor_matching_community(
+        session: Session, center_id: uuid.UUID
+    ) -> CommunityRecord:
+        communities = session.scalars(
+            select(CommunityRecord).where(
+                CommunityRecord.center_id == center_id,
+                CommunityRecord.matching_mode == MatchingMode.COUNSELOR_BASED.value,
+            )
+        ).all()
+        if not communities:
+            raise ConflictError(
+                "Candidate generation requires a counselor-based community."
+            )
+        if len(communities) > 1:
+            raise ConflictError(
+                "Select a counselor-based target before generating candidates."
+            )
+        return communities[0]
+
+    @staticmethod
     def _active_consent(session: Session) -> ConsentVersionRecord:
         consent = session.scalar(
             select(ConsentVersionRecord)
@@ -4717,6 +6573,25 @@ class SqlAlchemyPilotRepository:
         if consent is None:
             raise NotFoundError("No active consent version is configured.")
         return consent
+
+    @staticmethod
+    def _active_community_covenant(
+        session: Session,
+    ) -> CommunityCovenantDefinitionRecord:
+        definitions = session.scalars(
+            select(CommunityCovenantDefinitionRecord).where(
+                CommunityCovenantDefinitionRecord.policy_key
+                == COMMUNITY_COVENANT_POLICY_KEY,
+                CommunityCovenantDefinitionRecord.is_active.is_(True),
+            )
+        ).all()
+        if not definitions:
+            raise NotFoundError("No active faith and community covenant is configured.")
+        if len(definitions) != 1:
+            raise ConflictError(
+                "The faith and community covenant configuration is invalid."
+            )
+        return definitions[0]
 
     @staticmethod
     def _active_assessment_definition(
@@ -4730,6 +6605,92 @@ class SqlAlchemyPilotRepository:
         if definition is None:
             raise NotFoundError("No active readiness assessment is configured.")
         return definition
+
+    @staticmethod
+    def _active_personality_definition(
+        session: Session,
+    ) -> PersonalityInventoryDefinitionRecord:
+        definition = session.scalar(
+            select(PersonalityInventoryDefinitionRecord)
+            .where(PersonalityInventoryDefinitionRecord.is_active.is_(True))
+            .order_by(PersonalityInventoryDefinitionRecord.version.desc())
+        )
+        if definition is None:
+            raise NotFoundError("No active personality inventory is configured.")
+        return definition
+
+    def _ensure_personality_assignment(
+        self, session: Session, member_id: uuid.UUID
+    ) -> tuple[
+        PersonalityInventoryAssignmentRecord,
+        PersonalityInventoryDefinitionRecord,
+    ]:
+        definition = self._active_personality_definition(session)
+        assignment = session.scalar(
+            select(PersonalityInventoryAssignmentRecord)
+            .where(
+                PersonalityInventoryAssignmentRecord.member_id == member_id,
+                PersonalityInventoryAssignmentRecord.definition_id == definition.id,
+            )
+            .order_by(PersonalityInventoryAssignmentRecord.assigned_at.desc())
+        )
+        if assignment is None:
+            assignment = PersonalityInventoryAssignmentRecord(
+                member_id=member_id,
+                definition_id=definition.id,
+                assigned_at=self._now(),
+            )
+            session.add(assignment)
+            session.flush()
+        return assignment, definition
+
+    @staticmethod
+    def _personality_items(
+        definition: PersonalityInventoryDefinitionRecord,
+    ) -> tuple[PersonalityItem, ...]:
+        return tuple(
+            PersonalityItem(
+                id=str(item["id"]),
+                prompt=str(item["prompt"]),
+                trait=BigFiveTrait(str(item["trait"])),
+                reverse_keyed=bool(item["reverse_keyed"]),
+            )
+            for item in definition.items
+        )
+
+    def _personality_scores(
+        self, session: Session, member_id: uuid.UUID
+    ) -> PersonalityScores | None:
+        definition = session.scalar(
+            select(PersonalityInventoryDefinitionRecord)
+            .where(PersonalityInventoryDefinitionRecord.is_active.is_(True))
+            .order_by(PersonalityInventoryDefinitionRecord.version.desc())
+        )
+        if definition is None:
+            return None
+        assignment = session.scalar(
+            select(PersonalityInventoryAssignmentRecord)
+            .where(
+                PersonalityInventoryAssignmentRecord.member_id == member_id,
+                PersonalityInventoryAssignmentRecord.definition_id == definition.id,
+                PersonalityInventoryAssignmentRecord.completed_at.is_not(None),
+            )
+            .order_by(PersonalityInventoryAssignmentRecord.assigned_at.desc())
+        )
+        if assignment is None:
+            return None
+        record = session.get(PersonalityInventoryScoreRecord, assignment.id)
+        if record is None:
+            return None
+        return {trait: float(record.scores[trait.value]) for trait in BigFiveTrait}
+
+    def _personality_compatibility(
+        self, session: Session, first_id: uuid.UUID, second_id: uuid.UUID
+    ) -> str:
+        return compatibility_explanation(
+            self._personality_scores(session, first_id),
+            self._personality_scores(session, second_id),
+        )
 
     def _ensure_current_assessment(
         self,

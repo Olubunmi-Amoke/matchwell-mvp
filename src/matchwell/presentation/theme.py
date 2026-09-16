@@ -16,7 +16,7 @@ Tone = Literal["success", "info", "warning", "danger", "neutral"]
 _TONE_STYLES: dict[Tone, tuple[str, str]] = {
     "success": ("#eaf6ef", "#1f7a4d"),
     "info": ("#eaf1fb", "#2a5c9a"),
-    "warning": ("#fdf3e0", "#9a6a1f"),
+    "warning": ("#fdf3e0", "#865716"),
     "danger": ("#fbeaea", "#a3312c"),
     "neutral": ("#f2f1ee", "#5a5750"),
 }
@@ -27,7 +27,7 @@ _CSS = """
     --mw-bg: #fbf8f3;
     --mw-ink: #33302b;
     --mw-muted: #786f63;
-    --mw-accent: #b6784f;
+    --mw-accent: #9a603d;
     --mw-border: #e7e0d4;
 }
 .stApp { background-color: var(--mw-bg); }

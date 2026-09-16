@@ -105,12 +105,12 @@ payment instruments, or raw webhook bodies.
 Members manage only their own subscription from **Billing**: plan, normalized
 status, paid-through date, grace deadline, and safe checkout or
 manage-subscription actions. Administrators get a Center-scoped billing queue
-under **Pilot operations → Billing** for status review and reasoned
+under **Member Operations → Billing** for status review and reasoned
 complimentary grants or manual suspensions. The assigned counselor receives
 exactly one immutable $25 USD credit for a member's first completed intake
 decision; counselors review their own balance under **Earnings**, and
 administrators review every counselor's append-only ledger and record
-reasoned manual adjustments under **Pilot operations → Ledger**. Automated
+reasoned manual adjustments under **Member Operations → Ledger**. Automated
 payout remains deferred for the pilot.
 
 ## Pilot sign-in and first-run setup
@@ -135,18 +135,34 @@ eligibility.
 Do not commit `.streamlit/secrets.toml`. It is ignored by both Git and the
 Docker build context.
 
-After the administrator signs in, use **Pilot operations** to invite members
+After the administrator signs in, use **Member Operations** to invite members
 and counselors. Invitees must sign in with the exact Google email address used
 in their active invitation.
 
+Every member must separately affirm the current versioned **Faith & community
+covenant** after participation consent. The covenant covers Christian identity,
+intent to pursue a committed Christian marriage, truthful and respectful
+participation, non-harassment/non-discrimination in platform conduct, and
+compliance with safety, boundaries, reporting, counselor, and Member Operations
+decisions. A newly activated revision makes every prior acceptance non-current
+until the member re-affirms it. This is a participation commitment, not a
+theological or mental-health diagnosis.
+
+This covenant replaces the proposed LGBT-friendliness eligibility criterion.
+Matchwell does not collect, infer, audit, display, or match on sexual
+orientation, attitudes toward LGBT people, or proxy attributes. The configured
+Christian covenant and reciprocal Man/Woman matching scope remain unchanged;
+neither permits protected or sensitive attitude screening, harassment, or
+mistreatment.
+
 Administrators can convert an existing member account to a counselor from
-**Pilot operations → Member readiness → Role management**. The action requires
+**Member Operations → Member readiness → Role management**. The action requires
 the member's exact email and an operational reason. It preserves historical
 readiness and safety records, ends the member's active counselor assignment,
 and closes any open introduction or matched-pair access. The reassigned user
 must sign out and back in to load the counselor workspace.
 
-The reverse transition is available from **Pilot operations → Counselors**.
+The reverse transition is available from **Member Operations → Counselors**.
 Before converting a counselor to a member, reassign all of their active members
 and resolve any open match reviews. The transition preserves counseling
 history, expires prior screening eligibility, and creates a fresh readiness
@@ -154,7 +170,15 @@ assessment. The user must sign out and back in to load the member workspace.
 
 ### Community matching and introductions
 
-Once a member reaches 8/8 readiness (including an active or grace-period
+Every member has one explicit, Center-scoped community assignment managed only
+by **Member Operations**. Existing members and **Intentional Relationships**
+remain `counselor_based`; migration `20260916_0010` also seeds the
+`self_paced` pilot community. A change reevaluates readiness, closes a
+pending-review candidate, withdraws incompatible interests and rematch
+authorization, and is rejected while an introduced or active pair exists.
+
+Once a member reaches 9/9 readiness (including current covenant affirmation
+and an active or grace-period
 subscription entitlement), they can complete matching preferences
 (gender identity and acceptable partner age range) on the **Matching** page.
 Existing hosted members are never silently matching-eligible: preferences live
@@ -162,7 +186,7 @@ in a separate, opt-in table, so nothing changes for a member until they submit
 this step themselves.
 
 An administrator generates deterministic, explainable candidate proposals from
-**Pilot operations → Matching**. Candidates require reciprocal Man/Woman and
+**Member Operations → Matching**. Candidates require reciprocal Man/Woman and
 age-range compatibility, and score on location, denomination, age preference,
 and relationship-intent alignment only -- never assessment answers, screening
 details, counselor notes, exact birth dates, or contact details. Both
@@ -180,6 +204,39 @@ open proposals, incompatible gender or age rules, safety restrictions, and
 prior proposal history.
 Holds, blocks, reports, and lost readiness all reconcile and close any open
 proposal or introduction.
+
+Self-paced members satisfy the same consent, covenant, profile, assessment, counselor
+intake, screening, entitlement, hold, and preference rules. Their
+**Suggestions** view contains only normally eligible members in the same Center
+and assigned community and shows display name, five-year age band, general
+location, disclosed denomination, intent, deterministic score/explanations,
+and a neutral personality explanation. Exact birth date and
+`prefer_not_to_say` denomination are hidden. Interest is private and never
+makes an otherwise hidden candidate visible. Reciprocal interest atomically
+creates an active ordinary match, participant claims, and accepted member
+responses; duplicate actions are idempotent. Safety history still prevents the
+pair, and ordinary history still requires a current approved rematch
+authorization that is consumed in the same transaction.
+
+Members may optionally complete the versioned 20-item **Personality
+Inventory**, with four keyed/reverse-keyed items for each IPIP Big Five trait.
+The items are adapted from the public-domain
+[International Personality Item Pool](https://ipip.ori.org/). This is a
+non-diagnostic pilot aid, not psychological advice or evaluation. Raw answers
+and scores remain in dedicated sensitive tables and never affect readiness,
+eligibility, numeric matching score, rank, or automatic rejection. Members and
+authorized counselors see only neutral pair compatibility language, never
+another member's answers or scores.
+
+Closed proposal history is immutable and blocks an ordinary repeat proposal.
+Member Operations may request a repeat only by selecting the historical pair
+and an allow-listed operational reason. Both members' **current** assigned
+counselors must approve their own side before candidate generation can
+atomically consume the Center-scoped authorization and create one new proposal.
+There is no cooldown. Any current or historical block/report, or a prior
+safety/readiness-enforcement closure, permanently prevents authorization;
+ordinary declines and entitlement lapses may be reconsidered. Members see no
+rematch status before a normal introduction.
 
 Once both members accept, the matched-pair workspace provides private,
 plain-text messaging. Messages are immutable, limited to 1,000 characters, and
@@ -202,7 +259,7 @@ match immediately closes journey access while retaining its audit history.
 ### Pilot hardening: accounts, backups, observability, and analytics
 
 Administrators can immediately **disable or reactivate** any account in
-their Center from **Pilot operations → Account access**, with a
+their Center from **Member Operations → Account access**, with a
 constrained reason code and an immutable audit/outbox event. Self-disable
 and disabling the last active administrator are both prohibited. Disabled
 accounts are checked on every sign-in before an actor is ever returned,
@@ -211,7 +268,7 @@ sign-in in both directions -- removing an email revokes admin access even
 if the stored role still says admin, and reactivation of a disabled
 account always remains a separate, explicit administrator action.
 
-**Pilot operations → Dashboard** shows alert-ready aggregate metrics
+**Member Operations → Dashboard** shows alert-ready aggregate metrics
 (denied sign-ins, unapplied provider events, overdue check-ins, recent
 safety activity, backup drill age) and privacy-safe funnel/conversion
 analytics with small-cell suppression for safety and provider-failure

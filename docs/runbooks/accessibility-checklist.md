@@ -10,8 +10,9 @@ specific date.
 ## What is automated today
 
 `tests/test_accessibility.py` uses Streamlit's own `AppTest` harness to
-render the admin dashboard, counselor workspace, member dashboard, and
-member matching page against a real, seeded database, and asserts:
+render the admin dashboard, counselor workspace, member dashboard, faith and
+community covenant, and member matching page against a real, seeded database,
+and asserts:
 
 - Every `st.button`, `st.text_input`, `st.selectbox`, `st.checkbox`, and
   `st.number_input` has an explicit, non-empty label (Streamlit requires a
@@ -35,15 +36,15 @@ focus order, contrast, zoom/reflow, or real screen-reader output.
 
 | # | Item | Status | Completed by | Date | Notes |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Keyboard-only: complete Google sign-in, accept consent, complete the assessment, save match preferences, and send a matched-pair message using only Tab/Shift+Tab/Enter/Space -- no mouse. | Not started | | | |
-| 2 | Keyboard-only: as an administrator, invite a member, disable an account, and reactivate it using only the keyboard. | Not started | | | |
-| 3 | Screen reader (NVDA or VoiceOver): navigate the member dashboard, matching page, and a guided-journey check-in form; confirm headings, labels, and status text are announced correctly. | Not started | | | |
-| 4 | Screen reader: navigate the admin Dashboard tab (alerts + funnel analytics) and confirm suppressed ("Suppressed (<5)") safety/provider-failure values are announced as text, not silently skipped. | Not started | | | |
-| 5 | Zoom/reflow: verify the member and admin pages remain usable at 200% browser zoom and at a narrow (mobile-width) viewport, with no horizontal scrolling required to reach primary actions. | Not started | | | |
-| 6 | Contrast: verify the Matchwell theme's text/background and badge color pairs meet WCAG AA (4.5:1 for normal text, 3:1 for large text/UI components) using a contrast checker against `src/matchwell/presentation/theme.py`'s `_TONE_STYLES` and CSS variables. | Not started | | | |
-| 7 | Errors: trigger a validation error (e.g. an invalid profile field, a disallowed role transition) and confirm the error text is specific, visible without color alone, and announced by a screen reader. | Not started | | | |
-| 8 | Focus: confirm focus moves sensibly after a form submission (e.g. after "Disable account", focus does not silently vanish or jump to an unrelated element). | Not started | | | |
-| 9 | Link/button text: spot-check that button labels describe their action out of context (e.g. "Disable account", not just "Submit") across the admin and member pages. | Not started | | | |
+| 1 | Keyboard-only: complete Google sign-in, accept consent, affirm every covenant checkbox, complete the assessment, save match preferences, and send a matched-pair message using only Tab/Shift+Tab/Enter/Space -- no mouse. | Pending covenant re-check | | | The prior flow passed on 2026-09-09; repeat the new covenant step before release. |
+| 2 | Keyboard-only: as an administrator, invite a member, disable an account, and reactivate it using only the keyboard. | Complete | Olubunmi Olarinde | 2026-09-09 | Disabled and reactivated a test account; controls and feedback were usable. |
+| 3 | Screen reader (NVDA or VoiceOver): navigate the member dashboard, matching page, and a guided-journey check-in form; confirm headings, labels, and status text are announced correctly. | Complete | Olubunmi Olarinde | 2026-09-09 | Passed with VoiceOver on iPhone. |
+| 4 | Screen reader: navigate the admin Dashboard tab (alerts + funnel analytics) and confirm suppressed ("Suppressed (<5)") safety/provider-failure values are announced as text, not silently skipped. | Complete | Olubunmi Olarinde | 2026-09-09 | Passed with VoiceOver on iPhone. |
+| 5 | Zoom/reflow: verify the member and admin pages remain usable at 200% browser zoom and at a narrow (mobile-width) viewport, with no horizontal scrolling required to reach primary actions. | Complete | Olubunmi Olarinde | 2026-09-09 | Passed at 200% desktop zoom and iPhone width. |
+| 6 | Contrast: verify the Matchwell theme's text/background and badge color pairs meet WCAG AA (4.5:1 for normal text, 3:1 for large text/UI components) using a contrast checker against `src/matchwell/presentation/theme.py`'s `_TONE_STYLES` and CSS variables. | Complete | Copilot calculation + automated test | 2026-09-09 | Found and corrected accent (3.42:1) and warning (4.28:1) failures. All current text pairs are at least 4.5:1. |
+| 7 | Errors: trigger a validation error (e.g. an invalid profile field, a disallowed role transition) and confirm the error text is specific, visible without color alone, and announced by a screen reader. | Complete | Olubunmi Olarinde | 2026-09-09 | Passed with VoiceOver. |
+| 8 | Focus: confirm focus moves sensibly after a form submission (e.g. after "Disable account", focus does not silently vanish or jump to an unrelated element). | Complete | Olubunmi Olarinde | 2026-09-09 | Passed during disable/reactivate flow. |
+| 9 | Link/button text: spot-check that button labels describe their action out of context (e.g. "Disable account", not just "Submit") across the admin and member pages. | Complete | Olubunmi Olarinde | 2026-09-09 | Passed with keyboard and VoiceOver. |
 
 ## Known accessibility limitations to track
 
@@ -63,3 +64,5 @@ focus order, contrast, zoom/reflow, or real screen-reader output.
 Do not mark this milestone accessibility-ready until every "Manual
 release-gate checklist" row above has a real completed-by name and date.
 A row is not truthfully complete just because the automated suite passes.
+
+**Accessibility sign-off:** Complete — Olubunmi Olarinde, 2026-09-09.

@@ -17,6 +17,7 @@ more versioned requirements. A requirement may be:
 The initial requirement types are:
 
 - Current consent accepted
+- Current global faith and community covenant affirmed
 - Required profile fields complete
 - Assessment complete and current
 - Counselor decision approved and current
@@ -27,10 +28,16 @@ The initial requirement types are:
 Requirement definitions contain no member data. Requirement evidence references
 the authoritative domain record that satisfies the definition.
 
+The covenant requirement is global rather than Center-specific. Evidence is
+valid only when the member accepted the exact active definition revision and
+the exact required affirmation-key set. Activating a new revision invalidates
+all earlier acceptances for current-readiness purposes without rewriting their
+immutable history. Acceptance triggers immediate deterministic re-evaluation.
+
 ## Evaluation rules
 
 1. Resolve the active journey and requirement configuration for the member's
-   Center and segment.
+   Center and explicitly assigned current community/segment.
 2. Resolve authoritative evidence from the owning domains.
 3. Treat missing, incomplete, failed, revoked, or expired evidence as unmet.
 4. Apply safety and administrative holds after evaluating ordinary
@@ -40,6 +47,15 @@ the authoritative domain record that satisfies the definition.
 
 Evaluations must be deterministic for the same configuration versions, evidence
 versions, and evaluation time.
+
+The optional personality inventory is never readiness evidence. Completion,
+answers, scores, compatibility language, retakes, and definition version
+changes cannot satisfy or invalidate a requirement.
+
+Eligibility and matching must never collect or use an `LGBT friendly` field,
+sexual orientation, attitudes toward LGBT people, or any proxy for those
+attributes. The faith/community covenant is a neutral participation commitment,
+not protected-attribute or attitude screening.
 
 ## API behavior
 
@@ -62,8 +78,10 @@ The engine re-evaluates when:
 
 - Relevant evidence is created, updated, revoked, or expires
 - A requirement or journey version becomes active
+- A community covenant revision becomes active or is accepted
 - A hold is applied or released
 - Center or segment membership changes
+- Member Operations changes the member's community assignment
 - An authorized operator requests reconciliation
 
 Scheduled reconciliation detects missed events and time-based expiry. It is a
