@@ -196,7 +196,10 @@ def _revoke_existing_eligibility() -> None:
         "WHERE rd.eligible = true"
     )
     if dialect == "sqlite":
-        new_id = "lower(hex(randomblob(16)))"
+
+        def new_id_for(_alias: str) -> str:
+            return "lower(hex(randomblob(16)))"
+
         covenant_id = COVENANT_ID.hex
         evidence_versions = (
             "json_set(COALESCE(rd.evidence_versions, '{}'), "
@@ -219,7 +222,10 @@ def _revoke_existing_eligibility() -> None:
             "json_object('proposal_id', p.id, 'reason', 'readiness_lost')"
         )
     else:
-        new_id = "md5(rd.id::text || random()::text)::uuid"
+
+        def new_id_for(alias: str) -> str:
+            return f"md5({alias}.id::text || random()::text)::uuid"
+
         covenant_id = str(COVENANT_ID)
         evidence_versions = (
             "COALESCE(rd.evidence_versions, '{}'::jsonb) || "
@@ -254,10 +260,12 @@ def _revoke_existing_eligibility() -> None:
         "INSERT INTO audit_events "
         "(id, actor_id, action, subject_id, center_id, correlation_id, "
         "safe_metadata, occurred_at) "
-        f"SELECT {new_id}, '00000000-0000-0000-0000-000000000000', "
+        f"SELECT {new_id_for('p')}, "
+        "'00000000-0000-0000-0000-000000000000', "
         "'matching.closed', "
         + ("p.id" if dialect == "sqlite" else "p.id::text")
-        + f", p.center_id, {new_id}, {matching_metadata}, CURRENT_TIMESTAMP "
+        + f", p.center_id, {new_id_for('p')}, "
+        f"{matching_metadata}, CURRENT_TIMESTAMP "
         "FROM match_proposals p WHERE "
         "p.status IN ('pending_review', 'introduced', 'active') AND "
         f"(p.member_a_id IN ({affected_members}) "
@@ -266,7 +274,7 @@ def _revoke_existing_eligibility() -> None:
     op.execute(
         "INSERT INTO outbox_messages "
         "(id, event_type, payload, occurred_at, attempts) "
-        f"SELECT {new_id}, 'matching.closed', {matching_payload}, "
+        f"SELECT {new_id_for('p')}, 'matching.closed', {matching_payload}, "
         "CURRENT_TIMESTAMP, 0 FROM match_proposals p WHERE "
         "p.status IN ('pending_review', 'introduced', 'active') AND "
         f"(p.member_a_id IN ({affected_members}) "
@@ -293,23 +301,25 @@ def _revoke_existing_eligibility() -> None:
         "INSERT INTO audit_events "
         "(id, actor_id, action, subject_id, center_id, correlation_id, "
         "safe_metadata, occurred_at) "
-        f"SELECT {new_id}, '00000000-0000-0000-0000-000000000000', "
+        f"SELECT {new_id_for('rd')}, "
+        "'00000000-0000-0000-0000-000000000000', "
         "'readiness.evaluated', "
         + ("rd.member_id" if dialect == "sqlite" else "rd.member_id::text")
-        + f", u.center_id, {new_id}, {metadata}, CURRENT_TIMESTAMP "
+        + f", u.center_id, {new_id_for('rd')}, {metadata}, CURRENT_TIMESTAMP "
         + latest_eligible
     )
     op.execute(
         "INSERT INTO outbox_messages "
         "(id, event_type, payload, occurred_at, attempts) "
-        f"SELECT {new_id}, 'readiness.eligibility_changed', {payload}, "
+        f"SELECT {new_id_for('rd')}, "
+        f"'readiness.eligibility_changed', {payload}, "
         f"CURRENT_TIMESTAMP, 0 {latest_eligible}"
     )
     op.execute(
         "INSERT INTO readiness_decisions "
         "(id, member_id, community_id, eligible, unmet_requirements, "
         "evidence_versions, configuration_version, evaluated_at) "
-        f"SELECT {new_id}, rd.member_id, rd.community_id, false, "
+        f"SELECT {new_id_for('rd')}, rd.member_id, rd.community_id, false, "
         + (
             "json_array('community_covenant')"
             if dialect == "sqlite"
