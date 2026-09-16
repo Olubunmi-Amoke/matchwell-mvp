@@ -10,14 +10,16 @@ outbox events.
 | Module | Owns | Key outbound facts |
 | --- | --- | --- |
 | Identity and consent | User identity links, invitations, age verification state, consent versions and acceptance | User verified, consent accepted or superseded |
+| Faith and community covenant | Global immutable covenant definitions, structured affirmation keys, version-specific member acceptance | Current covenant accepted |
 | Profiles and media | Member profile, preferences, private media references | Profile completed or changed |
-| Assessments | Definitions, versions, assignments, responses, completion evidence | Assessment completed, revoked, or expired |
+| Assessments | Readiness definitions, versions, assignments, responses, completion evidence | Assessment completed, revoked, or expired |
+| Personality reflection | Versioned public-domain IPIP definitions, assignments, sensitive responses and scores | Completion metadata only; raw values never leave this boundary |
 | Readiness stages | Journey definitions, requirements, evidence references, holds, decisions, unlocks | Stage or eligibility changed |
 | Counselor operations | Counselor approval, assignments, availability, appointments, structured intake decisions | Counselor assigned, intake decision changed |
 | Screening | Provider requests, callback receipts, normalized status summaries | Screening status changed |
 | Centers | Centers, staff membership, Center policy references | Center membership changed |
-| Communities | Community definitions, eligibility policy, membership | Community membership changed |
-| Matching and introductions | Candidate filters, scores, explanations, counselor review, introductions, responses | Introduction approved, accepted, declined, or closed |
+| Communities | Community definitions, constrained matching mode, explicit current assignment history | Community assignment changed |
+| Matching and introductions | Candidate filters, scores, explanations, counselor review, minimized self-paced suggestions/interests, introductions, responses and participant claims | Introduction approved, reciprocal interest activated, accepted, declined, or closed |
 | Guided programs and check-ins | Curriculum templates, assignments, task completion, relationship stage, check-ins | Task or check-in completed, stage changed |
 | Messaging and notifications | Conversation entitlement, messages, delivery requests and results | Message sent, notification delivery changed |
 | Safety and moderation | Blocks, reports, safety cases, restrictions | Block or safety hold changed |
@@ -29,6 +31,7 @@ outbox events.
 ### Global records
 
 - Users and identity links
+- Faith and community covenant definitions and version-specific acceptances
 - Blocks and reports
 - Safety cases and restrictions
 - Immutable audit events
@@ -49,16 +52,26 @@ Center as context but are not owned by one.
 ### Readiness evaluation
 
 The readiness module reads stable evidence contracts from consent, profile,
-assessment, counselor, screening, billing, and guided-program modules. It does
+the global covenant, assessment, counselor, screening, billing, and
+guided-program modules. It does
 not copy sensitive source data. The safety module supplies overriding hold
 state.
 
 ### Matching
 
-Matching considers only readiness-authorized candidates from the same eligible
-Center and community. It stores rule contributions and safe explanation text,
-not assessment answers or counseling notes. A counselor decision is required
-before an introduction is offered.
+Matching considers only readiness-authorized candidates from the same Center
+and current community. Counselor-based proposals require counselor review.
+Self-paced suggestions disclose a minimized projection and reciprocal interest
+activates the normal proposal directly. Both modes use identical eligibility,
+reciprocal gender/age rules, deterministic score/rank, safety history,
+proposal-history/rematch, and participant-claim controls. Personality adds
+neutral explanation text only; it never changes the score/order. Matching
+stores no assessment answers, personality answers/scores, or counseling notes.
+
+Eligibility and matching do not collect, infer, display, audit, or use sexual
+orientation, attitudes toward LGBT people, or proxy attributes. The Christian
+covenant and reciprocal Man/Woman matching scope do not authorize protected or
+sensitive attitude screening.
 
 ### Safety
 

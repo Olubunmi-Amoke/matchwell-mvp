@@ -1,6 +1,6 @@
 import uuid
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from typing import Protocol
 
 from matchwell.domain.access import (
@@ -42,21 +42,37 @@ from matchwell.domain.matching import (
     CandidateReviewItem,
     CounselorConversationStatus,
     CounselorReviewDecision,
+    HistoricalRematchPair,
     IntroductionView,
     MatchedPairView,
     MatchPreferencesInput,
     MatchPreferencesView,
     MemberResponseDecision,
     MessageView,
+    RematchAuthorizationView,
+    RematchReasonCode,
     ReportInput,
     SafetyCategory,
+    SelfPacedSuggestion,
+    SuggestionInterestStatus,
+)
+from matchwell.domain.personality import (
+    PersonalityAnswers,
+    PersonalityInventoryView,
+    PersonalityStatus,
 )
 from matchwell.domain.pilot import (
     AccountRow,
     AssessmentAnswers,
     AssessmentView,
+    CommunityAssignmentReasonCode,
+    CommunityCovenantView,
+    CommunityView,
     ConsentView,
     CounselorDecisionStatus,
+    DenominationCode,
+    IntroductorySessionReasonCode,
+    IntroductorySessionView,
     InvitationInput,
     InvitationView,
     MemberProgress,
@@ -123,11 +139,48 @@ class PilotRepository(Protocol):
         self,
         member_id: uuid.UUID,
         consent_version_id: uuid.UUID,
+        acknowledgement_keys: frozenset[str],
+    ) -> None: ...
+
+    def get_current_community_covenant(
+        self, member_id: uuid.UUID
+    ) -> CommunityCovenantView: ...
+
+    def accept_community_covenant(
+        self,
+        member_id: uuid.UUID,
+        covenant_definition_id: uuid.UUID,
+        affirmation_keys: frozenset[str],
     ) -> None: ...
 
     def get_profile(self, member_id: uuid.UUID) -> ProfileInput | None: ...
 
     def save_profile(self, member_id: uuid.UUID, profile: ProfileInput) -> None: ...
+
+    def introductory_session(
+        self,
+        member_id: uuid.UUID,
+        center_id: uuid.UUID | None = None,
+    ) -> IntroductorySessionView: ...
+
+    def schedule_introductory_session(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        counselor_id: uuid.UUID,
+        scheduled_at: datetime,
+    ) -> IntroductorySessionView: ...
+
+    def cancel_introductory_session(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: IntroductorySessionReasonCode,
+    ) -> IntroductorySessionView: ...
+
+    def complete_introductory_session(
+        self, counselor: AuthenticatedUser, member_id: uuid.UUID
+    ) -> IntroductorySessionView: ...
 
     def get_assessment(self, member_id: uuid.UUID) -> AssessmentView: ...
 
@@ -137,6 +190,19 @@ class PilotRepository(Protocol):
         assignment_id: uuid.UUID,
         answers: AssessmentAnswers,
     ) -> None: ...
+
+    def get_personality_inventory(
+        self, member_id: uuid.UUID
+    ) -> PersonalityInventoryView: ...
+
+    def submit_personality_inventory(
+        self,
+        member_id: uuid.UUID,
+        assignment_id: uuid.UUID,
+        answers: PersonalityAnswers,
+    ) -> None: ...
+
+    def personality_status(self, member_id: uuid.UUID) -> PersonalityStatus: ...
 
     def get_progress(self, member_id: uuid.UUID) -> MemberProgress: ...
 
@@ -166,6 +232,16 @@ class PilotRepository(Protocol):
         actor: AuthenticatedUser,
         member_id: uuid.UUID,
         counselor_id: uuid.UUID,
+    ) -> None: ...
+
+    def list_communities(self, actor: AuthenticatedUser) -> Sequence[CommunityView]: ...
+
+    def assign_community(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        community_id: uuid.UUID,
+        reason_code: CommunityAssignmentReasonCode,
     ) -> None: ...
 
     def reassign_member_to_counselor(
@@ -257,7 +333,38 @@ class PilotRepository(Protocol):
         preferences: MatchPreferencesInput,
     ) -> None: ...
 
+    def list_self_paced_suggestions(
+        self, member: AuthenticatedUser
+    ) -> Sequence[SelfPacedSuggestion]: ...
+
+    def set_suggestion_interest(
+        self,
+        member: AuthenticatedUser,
+        candidate_member_id: uuid.UUID,
+        status: SuggestionInterestStatus,
+    ) -> uuid.UUID | None: ...
+
     def generate_candidates(self, actor: AuthenticatedUser) -> int: ...
+
+    def list_historical_rematch_pairs(
+        self, actor: AuthenticatedUser
+    ) -> Sequence[HistoricalRematchPair]: ...
+
+    def request_rematch_authorization(
+        self,
+        actor: AuthenticatedUser,
+        member_a_id: uuid.UUID,
+        member_b_id: uuid.UUID,
+        reason_code: RematchReasonCode,
+    ) -> uuid.UUID: ...
+
+    def list_rematch_authorizations(
+        self, actor: AuthenticatedUser
+    ) -> Sequence[RematchAuthorizationView]: ...
+
+    def approve_rematch_authorization(
+        self, actor: AuthenticatedUser, authorization_id: uuid.UUID
+    ) -> None: ...
 
     def candidate_generation_diagnostics(
         self,
@@ -453,9 +560,43 @@ class PilotService:
         self,
         actor: AuthenticatedUser,
         consent_version_id: uuid.UUID,
+        acknowledgement_keys: frozenset[str] = frozenset(),
     ) -> None:
         self._require_role(actor, Role.MEMBER)
-        self._repository.accept_consent(actor.id, consent_version_id)
+        consent = self._repository.get_active_consent(actor.id)
+        required = {item.key for item in consent.required_acknowledgements}
+        if acknowledgement_keys != required:
+            raise ValidationError("Accept every required acknowledgement exactly.")
+        self._repository.accept_consent(
+            actor.id, consent_version_id, acknowledgement_keys
+        )
+
+    def community_covenant(self, actor: AuthenticatedUser) -> CommunityCovenantView:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.get_current_community_covenant(actor.id)
+
+    def accept_community_covenant(
+        self,
+        actor: AuthenticatedUser,
+        covenant_definition_id: uuid.UUID,
+        affirmation_keys: frozenset[str] = frozenset(),
+    ) -> None:
+        """Accept only the complete current covenant, never sensitive proxies.
+
+        Eligibility and matching must not use sexual orientation, attitudes
+        toward LGBT people, or proxy attributes. The covenant records only
+        explicit participation commitments and exact affirmation key names.
+        """
+        self._require_role(actor, Role.MEMBER)
+        covenant = self._repository.get_current_community_covenant(actor.id)
+        required = {item.key for item in covenant.required_affirmations}
+        if covenant.id != covenant_definition_id:
+            raise ValidationError("The covenant version is no longer current.")
+        if affirmation_keys != required:
+            raise ValidationError("Affirm every required commitment exactly.")
+        self._repository.accept_community_covenant(
+            actor.id, covenant_definition_id, affirmation_keys
+        )
 
     def profile(self, actor: AuthenticatedUser) -> ProfileInput | None:
         self._require_role(actor, Role.MEMBER)
@@ -475,7 +616,68 @@ class PilotService:
         )
         if any(not value.strip() for value in required_text):
             raise ValidationError("Complete every required profile field.")
+        if profile.denomination_code is DenominationCode.OTHER:
+            if not profile.denomination_other or not profile.denomination_other.strip():
+                raise ValidationError("Enter your denomination or church tradition.")
+            if len(profile.denomination_other.strip()) > 100:
+                raise ValidationError("Keep the denomination under 100 characters.")
+        elif profile.denomination_other is not None:
+            raise ValidationError("Other denomination text is only valid for Other.")
         self._repository.save_profile(actor.id, profile)
+
+    def introductory_session(self, actor: AuthenticatedUser) -> IntroductorySessionView:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.introductory_session(actor.id)
+
+    def member_introductory_session(
+        self, actor: AuthenticatedUser, member_id: uuid.UUID
+    ) -> IntroductorySessionView:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.introductory_session(member_id, actor.center_id)
+
+    def member_introductory_session_for_counselor(
+        self, actor: AuthenticatedUser, member_id: uuid.UUID
+    ) -> IntroductorySessionView:
+        self._require_role(actor, Role.COUNSELOR)
+        if not any(
+            item.id == member_id
+            for item in self._repository.list_assigned_members(actor)
+        ):
+            raise AuthorizationError("The member is not assigned to this counselor.")
+        return self._repository.introductory_session(member_id, actor.center_id)
+
+    def schedule_introductory_session(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        counselor_id: uuid.UUID,
+        scheduled_at: datetime,
+    ) -> IntroductorySessionView:
+        self._require_role(actor, Role.ADMIN)
+        if scheduled_at.tzinfo is None:
+            raise ValidationError("Scheduled time must include a timezone.")
+        if scheduled_at <= datetime.now(scheduled_at.tzinfo):
+            raise ValidationError("Schedule the session for a future time.")
+        return self._repository.schedule_introductory_session(
+            actor, member_id, counselor_id, scheduled_at
+        )
+
+    def cancel_introductory_session(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        reason_code: IntroductorySessionReasonCode,
+    ) -> IntroductorySessionView:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.cancel_introductory_session(
+            actor, member_id, reason_code
+        )
+
+    def complete_introductory_session(
+        self, actor: AuthenticatedUser, member_id: uuid.UUID
+    ) -> IntroductorySessionView:
+        self._require_role(actor, Role.COUNSELOR)
+        return self._repository.complete_introductory_session(actor, member_id)
 
     def assessment(self, actor: AuthenticatedUser) -> AssessmentView:
         self._require_role(actor, Role.MEMBER)
@@ -491,6 +693,27 @@ class PilotService:
         if not answers or any(value < 1 or value > 5 for value in answers.values()):
             raise ValidationError("Answer every assessment item from 1 to 5.")
         self._repository.submit_assessment(actor.id, assignment_id, answers)
+
+    def personality_inventory(
+        self, actor: AuthenticatedUser
+    ) -> PersonalityInventoryView:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.get_personality_inventory(actor.id)
+
+    def submit_personality_inventory(
+        self,
+        actor: AuthenticatedUser,
+        assignment_id: uuid.UUID,
+        answers: PersonalityAnswers,
+    ) -> None:
+        self._require_role(actor, Role.MEMBER)
+        if not answers or any(value < 1 or value > 5 for value in answers.values()):
+            raise ValidationError("Answer every personality item from 1 to 5.")
+        self._repository.submit_personality_inventory(actor.id, assignment_id, answers)
+
+    def personality_status(self, actor: AuthenticatedUser) -> PersonalityStatus:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.personality_status(actor.id)
 
     def progress(self, actor: AuthenticatedUser) -> MemberProgress:
         self._require_role(actor, Role.MEMBER)
@@ -535,6 +758,22 @@ class PilotService:
     ) -> None:
         self._require_role(actor, Role.ADMIN)
         self._repository.assign_counselor(actor, member_id, counselor_id)
+
+    def communities(self, actor: AuthenticatedUser) -> Sequence[CommunityView]:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.list_communities(actor)
+
+    def assign_community(
+        self,
+        actor: AuthenticatedUser,
+        member_id: uuid.UUID,
+        community_id: uuid.UUID,
+        reason_code: CommunityAssignmentReasonCode,
+    ) -> None:
+        self._require_role(actor, Role.ADMIN)
+        if not isinstance(reason_code, CommunityAssignmentReasonCode):
+            raise ValidationError("Select a valid community assignment reason.")
+        self._repository.assign_community(actor, member_id, community_id, reason_code)
 
     def reassign_member_to_counselor(
         self,
@@ -716,9 +955,66 @@ class PilotService:
             )
         self._repository.save_match_preferences(actor.id, preferences)
 
+    def self_paced_suggestions(
+        self, actor: AuthenticatedUser
+    ) -> Sequence[SelfPacedSuggestion]:
+        self._require_role(actor, Role.MEMBER)
+        return self._repository.list_self_paced_suggestions(actor)
+
+    def set_suggestion_interest(
+        self,
+        actor: AuthenticatedUser,
+        candidate_member_id: uuid.UUID,
+        status: SuggestionInterestStatus,
+    ) -> uuid.UUID | None:
+        self._require_role(actor, Role.MEMBER)
+        if status not in {
+            SuggestionInterestStatus.INTERESTED,
+            SuggestionInterestStatus.DISMISSED,
+        }:
+            raise ValidationError("Select interest or dismiss.")
+        return self._repository.set_suggestion_interest(
+            actor, candidate_member_id, status
+        )
+
     def generate_candidates(self, actor: AuthenticatedUser) -> int:
         self._require_role(actor, Role.ADMIN)
         return self._repository.generate_candidates(actor)
+
+    def historical_rematch_pairs(
+        self, actor: AuthenticatedUser
+    ) -> Sequence[HistoricalRematchPair]:
+        self._require_role(actor, Role.ADMIN)
+        return self._repository.list_historical_rematch_pairs(actor)
+
+    def request_rematch_authorization(
+        self,
+        actor: AuthenticatedUser,
+        member_a_id: uuid.UUID,
+        member_b_id: uuid.UUID,
+        reason_code: RematchReasonCode,
+    ) -> uuid.UUID:
+        self._require_role(actor, Role.ADMIN)
+        if member_a_id == member_b_id:
+            raise ValidationError("Select two different members.")
+        if not isinstance(reason_code, RematchReasonCode):
+            raise ValidationError("Select a valid rematch reason.")
+        return self._repository.request_rematch_authorization(
+            actor, member_a_id, member_b_id, reason_code
+        )
+
+    def rematch_authorizations(
+        self, actor: AuthenticatedUser
+    ) -> Sequence[RematchAuthorizationView]:
+        if actor.role not in {Role.ADMIN, Role.COUNSELOR}:
+            raise AuthorizationError("This action is not available for your role.")
+        return self._repository.list_rematch_authorizations(actor)
+
+    def approve_rematch_authorization(
+        self, actor: AuthenticatedUser, authorization_id: uuid.UUID
+    ) -> None:
+        self._require_role(actor, Role.COUNSELOR)
+        self._repository.approve_rematch_authorization(actor, authorization_id)
 
     def candidate_generation_diagnostics(
         self,

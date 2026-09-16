@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from matchwell.domain.pilot import DenominationCode
+
 
 class Gender(StrEnum):
     MAN = "man"
@@ -33,6 +35,28 @@ class CounselorReviewDecision(StrEnum):
 class MemberResponseDecision(StrEnum):
     ACCEPTED = "accepted"
     DECLINED = "declined"
+
+
+class SuggestionInterestStatus(StrEnum):
+    INTERESTED = "interested"
+    DISMISSED = "dismissed"
+    MATCHED = "matched"
+    WITHDRAWN = "withdrawn"
+
+
+class RematchReasonCode(StrEnum):
+    MEMBER_DECLINE_RECONSIDERED = "member_decline_reconsidered"
+    COUNSELOR_DECLINE_RECONSIDERED = "counselor_decline_reconsidered"
+    ENTITLEMENT_RESTORED = "entitlement_restored"
+    CIRCUMSTANCES_CHANGED = "circumstances_changed"
+    OPERATIONS_CORRECTION = "operations_correction"
+
+
+class RematchAuthorizationStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    CONSUMED = "consumed"
+    REVOKED = "revoked"
 
 
 MIN_PARTNER_AGE = 18
@@ -69,7 +93,7 @@ class CandidateEvidence:
     max_partner_age: int
     city: str
     state: str
-    denomination: str
+    denomination_code: DenominationCode
     relationship_intent: str
 
 
@@ -89,6 +113,7 @@ class CandidatePairDiagnostic:
     member_b_display_name: str
     eligible: bool
     reasons: tuple[str, ...]
+    rematch_authorization_status: RematchAuthorizationStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +124,30 @@ class CandidateGenerationDiagnostics:
     eligible_pairs: int
     members: tuple[CandidateMemberDiagnostic, ...]
     pairs: tuple[CandidatePairDiagnostic, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RematchAuthorizationView:
+    id: uuid.UUID
+    member_a_id: uuid.UUID
+    member_a_display_name: str
+    member_b_id: uuid.UUID
+    member_b_display_name: str
+    reason_code: RematchReasonCode
+    status: RematchAuthorizationStatus
+    counselor_a_approved: bool
+    counselor_b_approved: bool
+    requested_at: datetime
+    can_approve: bool
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalRematchPair:
+    member_a_id: uuid.UUID
+    member_a_display_name: str
+    member_b_id: uuid.UUID
+    member_b_display_name: str
+    latest_closed_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,9 +224,16 @@ class MatchScorer:
         a: CandidateEvidence,
         b: CandidateEvidence,
     ) -> ScoreContribution:
-        value_a = a.denomination.strip().casefold()
-        value_b = b.denomination.strip().casefold()
-        points = self.DENOMINATION_WEIGHT if value_a and value_a == value_b else 0.0
+        excluded = {
+            DenominationCode.OTHER,
+            DenominationCode.PREFER_NOT_TO_SAY,
+        }
+        points = (
+            self.DENOMINATION_WEIGHT
+            if a.denomination_code == b.denomination_code
+            and a.denomination_code not in excluded
+            else 0.0
+        )
         return ScoreContribution("Denomination", self.DENOMINATION_WEIGHT, points)
 
     def _age(
@@ -222,6 +278,24 @@ class CandidateReviewItem:
     my_decision: CounselorReviewDecision
     partner_counselor_decision: CounselorReviewDecision
     created_at: datetime
+    personality_explanation: str = (
+        "Personality reflections are optional; compatibility is not assessed."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SelfPacedSuggestion:
+    member_id: uuid.UUID
+    display_name: str
+    age_band: str
+    general_location: str
+    denomination: str | None
+    relationship_intent: str
+    score: float
+    explanations: tuple[str, ...]
+    personality_explanation: str
+    interest_status: SuggestionInterestStatus | None
+    incoming_interest: bool
 
 
 @dataclass(frozen=True, slots=True)

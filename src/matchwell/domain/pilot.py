@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 
 from matchwell.domain.access import AccountStatus, Role
-from matchwell.domain.readiness import TOTAL_ORDINARY_REQUIREMENTS, ReadinessResult
+from matchwell.domain.readiness import ReadinessResult
 
 # A stable, non-human identity used to attribute provider-callback-driven
 # audit events, matching billing's ``BILLING_SYSTEM_ACTOR_ID`` pattern and
@@ -45,6 +45,133 @@ class ScreeningReasonCode(StrEnum):
     MANUAL_REVIEW_REQUIRED = "manual_review_required"
     EXPIRED = "expired"
     OTHER_OPERATIONAL = "other_operational"
+
+
+class MatchingMode(StrEnum):
+    COUNSELOR_BASED = "counselor_based"
+    SELF_PACED = "self_paced"
+
+
+class CommunityAssignmentReasonCode(StrEnum):
+    PILOT_PLACEMENT = "pilot_placement"
+    MEMBER_REQUEST = "member_request"
+    OPERATIONS_CORRECTION = "operations_correction"
+
+
+class DenominationCode(StrEnum):
+    BAPTIST = "baptist"
+    CATHOLIC = "catholic"
+    ANGLICAN_EPISCOPAL = "anglican_episcopal"
+    METHODIST_WESLEYAN = "methodist_wesleyan"
+    PRESBYTERIAN_REFORMED = "presbyterian_reformed"
+    PENTECOSTAL_CHARISMATIC = "pentecostal_charismatic"
+    ORTHODOX = "orthodox"
+    LUTHERAN = "lutheran"
+    SEVENTH_DAY_ADVENTIST = "seventh_day_adventist"
+    NON_DENOMINATIONAL = "non_denominational"
+    OTHER = "other"
+    PREFER_NOT_TO_SAY = "prefer_not_to_say"
+
+
+DENOMINATION_LABELS: dict[DenominationCode, str] = {
+    DenominationCode.BAPTIST: "Baptist",
+    DenominationCode.CATHOLIC: "Catholic",
+    DenominationCode.ANGLICAN_EPISCOPAL: "Anglican/Episcopal",
+    DenominationCode.METHODIST_WESLEYAN: "Methodist/Wesleyan",
+    DenominationCode.PRESBYTERIAN_REFORMED: "Presbyterian/Reformed",
+    DenominationCode.PENTECOSTAL_CHARISMATIC: "Pentecostal/Charismatic",
+    DenominationCode.ORTHODOX: "Orthodox",
+    DenominationCode.LUTHERAN: "Lutheran",
+    DenominationCode.SEVENTH_DAY_ADVENTIST: "Seventh-day Adventist",
+    DenominationCode.NON_DENOMINATIONAL: "Non-denominational",
+    DenominationCode.OTHER: "Other",
+    DenominationCode.PREFER_NOT_TO_SAY: "Prefer not to say",
+}
+
+
+def normalize_denomination(value: str) -> tuple[DenominationCode, str | None]:
+    normalized = " ".join(
+        value.strip().casefold().replace("-", " ").replace("/", " ").split()
+    )
+    aliases = {
+        "baptist": DenominationCode.BAPTIST,
+        "catholic": DenominationCode.CATHOLIC,
+        "roman catholic": DenominationCode.CATHOLIC,
+        "anglican": DenominationCode.ANGLICAN_EPISCOPAL,
+        "episcopal": DenominationCode.ANGLICAN_EPISCOPAL,
+        "anglican episcopal": DenominationCode.ANGLICAN_EPISCOPAL,
+        "methodist": DenominationCode.METHODIST_WESLEYAN,
+        "wesleyan": DenominationCode.METHODIST_WESLEYAN,
+        "methodist wesleyan": DenominationCode.METHODIST_WESLEYAN,
+        "presbyterian": DenominationCode.PRESBYTERIAN_REFORMED,
+        "reformed": DenominationCode.PRESBYTERIAN_REFORMED,
+        "presbyterian reformed": DenominationCode.PRESBYTERIAN_REFORMED,
+        "pentecostal": DenominationCode.PENTECOSTAL_CHARISMATIC,
+        "charismatic": DenominationCode.PENTECOSTAL_CHARISMATIC,
+        "pentecostal charismatic": DenominationCode.PENTECOSTAL_CHARISMATIC,
+        "orthodox": DenominationCode.ORTHODOX,
+        "lutheran": DenominationCode.LUTHERAN,
+        "seventh day adventist": DenominationCode.SEVENTH_DAY_ADVENTIST,
+        "sda": DenominationCode.SEVENTH_DAY_ADVENTIST,
+        "non denominational": DenominationCode.NON_DENOMINATIONAL,
+        "nondenominational": DenominationCode.NON_DENOMINATIONAL,
+    }
+    if not normalized:
+        return DenominationCode.PREFER_NOT_TO_SAY, None
+    code = aliases.get(normalized)
+    return (code, None) if code is not None else (DenominationCode.OTHER, value.strip())
+
+
+class IntroductorySessionStatus(StrEnum):
+    AVAILABLE = "available"
+    SCHEDULED = "scheduled"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class IntroductorySessionReasonCode(StrEnum):
+    MEMBER_REQUESTED = "member_requested"
+    COUNSELOR_UNAVAILABLE = "counselor_unavailable"
+    OPERATIONS_RESCHEDULE = "operations_reschedule"
+
+
+@dataclass(frozen=True, slots=True)
+class ConsentAcknowledgement:
+    key: str
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class CovenantAffirmation:
+    key: str
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class CommunityCovenantView:
+    id: uuid.UUID
+    policy_key: str
+    display_version: str
+    revision: int
+    effective_at: datetime
+    title: str
+    body_markdown: str
+    required_affirmations: tuple[CovenantAffirmation, ...]
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IntroductorySessionView:
+    id: uuid.UUID
+    member_id: uuid.UUID
+    status: IntroductorySessionStatus
+    counselor_id: uuid.UUID | None
+    counselor_name: str | None
+    scheduled_at: datetime | None
+    completed_at: datetime | None
+    reason_code: IntroductorySessionReasonCode | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +234,10 @@ class ProfileInput:
     birth_date: date
     faith_affirmed: bool
     relationship_intent: str
-    denomination: str
     city: str
     state: str
+    denomination_code: DenominationCode = DenominationCode.PREFER_NOT_TO_SAY
+    denomination_other: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +246,7 @@ class ConsentView:
     title: str
     version: str
     body_markdown: str
+    required_acknowledgements: tuple[ConsentAcknowledgement, ...]
     accepted: bool
 
 
@@ -144,6 +273,7 @@ class MemberProgress:
     counselor_status: CounselorDecisionStatus
     screening_status: ScreeningStatus
     community_name: str
+    matching_mode: MatchingMode = MatchingMode.COUNSELOR_BASED
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +289,9 @@ class OperationsMember:
     readiness: ReadinessResult
     account_status: AccountStatus = AccountStatus.ACTIVE
     counselor_needs_reassignment: bool = False
+    community_id: uuid.UUID | None = None
+    community_name: str = ""
+    matching_mode: MatchingMode = MatchingMode.COUNSELOR_BASED
 
     @property
     def eligible(self) -> bool:
@@ -166,7 +299,14 @@ class OperationsMember:
 
     @property
     def readiness_completed_count(self) -> int:
-        return TOTAL_ORDINARY_REQUIREMENTS - len(self.readiness.unmet_requirements)
+        return self.readiness.completed_ordinary_requirement_count
+
+
+@dataclass(frozen=True, slots=True)
+class CommunityView:
+    id: uuid.UUID
+    name: str
+    matching_mode: MatchingMode
 
 
 @dataclass(frozen=True, slots=True)

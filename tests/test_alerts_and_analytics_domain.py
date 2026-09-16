@@ -2,6 +2,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
+from covenant_helpers import seed_community_covenant
 from test_matching_repository import (
     Pilot,
     _bootstrap_admin_and_counselors,
@@ -77,6 +78,7 @@ def pilot() -> Pilot:
                 is_active=True,
             )
         )
+        seed_community_covenant(session)
         session.add(
             PilotPlanRecord(
                 id=uuid.uuid4(),

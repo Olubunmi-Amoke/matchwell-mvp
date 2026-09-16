@@ -17,6 +17,7 @@ from matchwell.domain.matching import (
     CounselorReviewDecision,
     Gender,
     MatchPreferencesInput,
+    RematchReasonCode,
     SafetyCategory,
 )
 from matchwell.domain.pilot import ProfileInput
@@ -97,7 +98,6 @@ def test_underage_profile_is_rejected() -> None:
                 birth_date=date.today().replace(year=date.today().year - 17),
                 faith_affirmed=True,
                 relationship_intent="Committed relationship",
-                denomination="",
                 city="Nashville",
                 state="Tennessee",
             ),
@@ -113,7 +113,6 @@ def test_faith_affirmation_is_required() -> None:
                 birth_date=date(1990, 1, 1),
                 faith_affirmed=False,
                 relationship_intent="Committed relationship",
-                denomination="",
                 city="Nashville",
                 state="Tennessee",
             ),
@@ -129,6 +128,45 @@ def test_admin_workspace_rejects_member() -> None:
 def test_only_admin_can_view_candidate_diagnostics(role: Role) -> None:
     with pytest.raises(AuthorizationError):
         service().candidate_generation_diagnostics(actor(role))
+
+
+def test_only_admin_can_request_rematch_authorization() -> None:
+    with pytest.raises(AuthorizationError):
+        service().request_rematch_authorization(
+            actor(Role.COUNSELOR),
+            uuid.uuid4(),
+            uuid.uuid4(),
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
+
+
+def test_only_counselor_can_approve_rematch_authorization() -> None:
+    with pytest.raises(AuthorizationError):
+        service().approve_rematch_authorization(actor(Role.ADMIN), uuid.uuid4())
+
+
+def test_member_cannot_view_rematch_authorizations() -> None:
+    with pytest.raises(AuthorizationError):
+        service().rematch_authorizations(actor(Role.MEMBER))
+
+
+def test_rematch_request_validates_distinct_members_and_reason() -> None:
+    admin = actor(Role.ADMIN)
+    member_id = uuid.uuid4()
+    with pytest.raises(ValidationError):
+        service().request_rematch_authorization(
+            admin,
+            member_id,
+            member_id,
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
+    with pytest.raises(ValidationError):
+        service().request_rematch_authorization(
+            admin,
+            uuid.uuid4(),
+            uuid.uuid4(),
+            cast(RematchReasonCode, "free-text"),
+        )
 
 
 @pytest.mark.parametrize("role", [Role.MEMBER, Role.COUNSELOR])

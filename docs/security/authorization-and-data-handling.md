@@ -20,8 +20,9 @@
 | Member | Own readiness data and authorized relationship workspaces |
 | Counselor | Assigned members and counselor-owned operational records |
 | Counselor supervisor | Explicitly delegated oversight scope |
-| Center administrator | Operational records for authorized Centers |
-| Safety staff | Global safety records according to assigned privilege |
+| Member Operations (existing Center administrator role) | Invites, accounts, readiness coordination, counselor and community assignment, Center-scoped audited rematch requests, introductory-session scheduling, billing operations, and operational records for authorized Centers |
+| Counselor Operations (existing counselor role) | Assigned-member intake, counselor-based match review, neutral personality compatibility in relevant match views, approval of only their currently assigned member's side of a rematch request, introductory-session completion, and guided journeys only |
+| Trust & Safety (safety responsibility, not a broad HR role) | Reports, blocks, holds, account-safety actions, and escalation according to assigned privilege |
 | Platform administrator | Explicit platform operations; no implicit access to sensitive content |
 | Worker or provider callback | Named machine operation only |
 
@@ -34,10 +35,33 @@ endpoints.
 | Data | Handling |
 | --- | --- |
 | Assessment answers | Store only in the assessments boundary; never log or include in general audit payloads |
+| Personality inventory | Optional versioned 20-item IPIP Big Five reflection. Store raw answers and derived scores only in dedicated sensitive tables. Never include them in audit, outbox, logs, analytics, admin queues, broad exports, readiness, eligibility, score/rank, or rejection. Members and authorized counselors may receive only neutral compatibility language in an otherwise authorized suggestion/match view. |
 | Counseling notes | Keep separate from structured readiness decisions; restrict to counseling purpose |
 | Screening reports | Do not copy broadly into Matchwell; retain only provider reference and minimum normalized status summary; screening reason/status codes are drawn from a fixed safe allow-list, never free text |
 | Payment data | Store only provider customer/subscription IDs, normalized status, dates, currency, and integer minor-unit amounts; never store card or bank details; Stripe secret keys and webhook secrets are environment secrets, never logged, audited, or placed in outbox payloads |
 | Identity evidence | Retain only required verification outcome and metadata |
+| Denomination | Store a stable allow-listed code and optional display text only for `other`; matching excludes `other` and `prefer_not_to_say` from denomination points |
+| Consent acknowledgements | Store the exact required acknowledgement keys accepted for the specific consent version; labels and document text remain on the immutable version |
+| Faith/community covenant | Store global immutable definitions and one version-specific acceptance per member. Acceptance records contain only the exact required affirmation keys and timestamp. Admin/counselor views may show the current covenant as missing, but never individual checkbox detail or inferred belief. Audit includes policy key, display version, revision, and key names only; never labels or narrative. |
+| Introductory session | Store the one-per-member benefit, constrained status/reason, assigned counselor, scheduling/completion timestamps, and transition timestamps; never free-text notes |
+| Rematch authorization | Store canonical member IDs, Center/community, constrained reason code, requesting operator, both required distinct current counselor identities and assignment IDs, separate approver identities, status, consumption/revocation timestamps, constrained revocation reason, and consumed proposal ID; never narrative, assessment, screening, report, or counseling detail |
+
+Rematch authorization never overrides safety. Blocks and reports are global
+across Centers, and current or historical pair safety restrictions make an
+authorization impossible and unusable. Proposal and authorization history is
+append-only and Center-scoped. Assignment, activity, readiness, safety, and
+open-proposal state are checked at request, approval, and consumption.
+Changing either counselor assignment revokes every live authorization involving
+that member. Open proposal membership is additionally guarded by a normalized,
+database-unique participant claim that is removed transactionally on closure.
+Community assignment is Member Operations-only and Center-scoped. Members
+cannot self-switch. Reassignment uses constrained reason codes, reevaluates
+readiness, closes pending review, withdraws interests, revokes incompatible
+rematch authorization, and fails while an introduced/active pair exists.
+Self-paced interest never grants discovery: a one-sided interest is visible
+only for a candidate who independently passes the ordinary suggestion query.
+Reciprocal activation, claims, history/rematch consumption, and both interest
+updates commit or roll back together.
 | Messages | Encrypt in transit (TLS); exclude content from telemetry and general audit payloads. See the encryption-at-rest note below -- the pilot does not add its own row-level encryption at rest |
 | Files and media | Store in private Blob containers with short-lived, purpose-bound access (target architecture; the pilot stores no member-uploaded files) |
 | Secrets | Store in Key Vault; access through managed identity where supported (target architecture). The pilot's actual secret handling is Streamlit `secrets.toml` / environment variables provided by the hosting platform -- see the pilot launch checklist for evidence requirements |
@@ -71,6 +95,8 @@ conflate:
 Immutable events are required for:
 
 - Consent acceptance and supersession
+- Faith/community covenant acceptance and supersession
+- Introductory-session scheduling, rescheduling, cancellation, and completion
 - Privileged access to sensitive records
 - Counselor assignment and structured decisions
 - Screening status transitions
@@ -81,7 +107,7 @@ Immutable events are required for:
 
 Each event includes actor, action, subject, timestamp, correlation ID, Center
 context when applicable, and safe decision metadata. Audit records exclude
-assessment answers, counseling notes, screening reports, message content,
+assessment and personality answers/scores, counseling notes, screening reports, message content,
 secrets, authentication tokens, and unnecessary personal data.
 
 ## Required tests
@@ -94,3 +120,17 @@ secrets, authentication tokens, and unnecessary personal data.
 - Machine identity permissions and callback authenticity
 - Sensitive-value exclusion from logs, telemetry, events, API errors, and audit
   payloads
+- Introductory-session one-per-member enforcement, valid transitions,
+  active assignment/account checks, and Center isolation
+
+  ## Protected and sensitive attitude policy guard
+
+  Matchwell does not implement, store, infer, audit, display, or match on an
+  `LGBT friendly` field, sexual orientation, attitudes toward LGBT people, or
+  proxy attributes. This replaces the previously proposed LGBT-friendliness
+  eligibility criterion because protected or sensitive attitude screening is not
+  necessary to enforce platform conduct and would create unjustified privacy and
+  discrimination risk. The configured Christian covenant and existing reciprocal
+  Man/Woman matching product scope remain in force. Covenant affirmation concerns
+  participation commitments only; it is not a theological or mental-health
+  diagnosis and never authorizes harassment, discrimination, or mistreatment.

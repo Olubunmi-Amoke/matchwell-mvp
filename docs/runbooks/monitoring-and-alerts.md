@@ -2,7 +2,7 @@
 
 Matchwell's pilot has no hosted monitoring provider. Monitoring consists of
 three things instead: structured JSON application logs, an administrator
-operations dashboard (**Pilot operations → Dashboard**), and this
+operations dashboard (**Member Operations → Dashboard**), and this
 documented set of thresholds and actions. This runbook describes how to
 read all three.
 
@@ -33,7 +33,7 @@ Every log line is a single JSON object with `timestamp`, `level`, `logger`,
 
 ## Admin operations dashboard
 
-Sign in as an administrator and open **Pilot operations → Dashboard**. It
+Sign in as an administrator and open **Member Operations → Dashboard**. It
 has two sections:
 
 1. **Alerts** -- the same metrics an external monitor would evaluate,

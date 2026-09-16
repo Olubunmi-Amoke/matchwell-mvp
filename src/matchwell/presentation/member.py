@@ -24,8 +24,13 @@ from matchwell.domain.matching import (
     MatchPreferencesInput,
     MemberResponseDecision,
     SafetyCategory,
+    SuggestionInterestStatus,
 )
-from matchwell.domain.pilot import ProfileInput
+from matchwell.domain.pilot import (
+    DENOMINATION_LABELS,
+    DenominationCode,
+    ProfileInput,
+)
 from matchwell.domain.readiness import TOTAL_ORDINARY_REQUIREMENTS
 from matchwell.presentation.theme import (
     Tone,
@@ -46,7 +51,7 @@ def render_dashboard(service: PilotService, actor: AuthenticatedUser) -> None:
         st.error(str(error))
         return
 
-    completed = TOTAL_ORDINARY_REQUIREMENTS - len(progress.readiness.unmet_requirements)
+    completed = progress.readiness.completed_ordinary_requirement_count
     with st.container(border=True):
         render_eyebrow(f"Stage: {humanize(progress.readiness.stage.value)}")
         st.progress(
@@ -68,6 +73,23 @@ def render_dashboard(service: PilotService, actor: AuthenticatedUser) -> None:
         st.metric("Counselor intake", humanize(progress.counselor_status.value))
     with right:
         st.metric("Screening", humanize(progress.screening_status.value))
+
+    try:
+        benefit = service.introductory_session(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+    else:
+        with st.container(border=True):
+            st.subheader("Complimentary introductory 1:1 session")
+            render_badges([(humanize(benefit.status.value), "info")])
+            if benefit.scheduled_at is not None:
+                st.write(f"**Scheduled:** {benefit.scheduled_at:%Y-%m-%d %H:%M %Z}")
+            if benefit.counselor_name:
+                st.write(f"**Counselor:** {benefit.counselor_name}")
+            st.caption(
+                "This is a one-time member benefit. If a scheduled session is "
+                "cancelled, Member Operations can reschedule the same benefit."
+            )
 
 
 def render_profile(service: PilotService, actor: AuthenticatedUser) -> None:
@@ -102,9 +124,24 @@ def render_profile(service: PilotService, actor: AuthenticatedUser) -> None:
             value=current.relationship_intent if current else "",
             max_chars=300,
         )
-        denomination = st.text_input(
-            "Denomination or church tradition (optional)",
-            value=current.denomination if current else "",
+        denomination_code = st.selectbox(
+            "Denomination or church tradition",
+            options=list(DenominationCode),
+            index=(
+                list(DenominationCode).index(current.denomination_code)
+                if current
+                else list(DenominationCode).index(DenominationCode.PREFER_NOT_TO_SAY)
+            ),
+            format_func=lambda item: DENOMINATION_LABELS[item],
+        )
+        denomination_other = (
+            st.text_input(
+                "Other denomination or church tradition",
+                value=current.denomination_other if current else "",
+                max_chars=100,
+            )
+            if denomination_code is DenominationCode.OTHER
+            else None
         )
         city = st.text_input("City", value=current.city if current else "")
         state = st.text_input("State", value=current.state if current else "")
@@ -119,9 +156,10 @@ def render_profile(service: PilotService, actor: AuthenticatedUser) -> None:
                     birth_date=birth_date,
                     faith_affirmed=faith_affirmed,
                     relationship_intent=relationship_intent,
-                    denomination=denomination,
                     city=city,
                     state=state,
+                    denomination_code=denomination_code,
+                    denomination_other=denomination_other,
                 ),
             )
         except MatchwellError as error:
@@ -146,18 +184,72 @@ def render_consent(service: PilotService, actor: AuthenticatedUser) -> None:
         return
 
     with st.form("consent"):
-        confirmed = st.checkbox("I have read and agree to this consent.")
+        accepted_keys = {
+            acknowledgement.key
+            for acknowledgement in consent.required_acknowledgements
+            if st.checkbox(
+                acknowledgement.label,
+                key=f"consent-ack-{acknowledgement.key}",
+            )
+        }
         submitted = st.form_submit_button("Accept consent", type="primary")
     if submitted:
-        if not confirmed:
-            st.error("Confirm that you agree before continuing.")
-            return
         try:
-            service.accept_consent(actor, consent.id)
+            service.accept_consent(actor, consent.id, frozenset(accepted_keys))
         except MatchwellError as error:
             st.error(str(error))
         else:
             st.success("Consent recorded.")
+            st.rerun()
+
+
+def render_community_covenant(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.title("Faith & community covenant")
+    try:
+        covenant = service.community_covenant(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+
+    st.subheader(covenant.title)
+    st.caption(
+        f"Current version: {covenant.display_version} · "
+        f"Revision {covenant.revision} · "
+        f"Effective {covenant.effective_at:%B %d, %Y}"
+    )
+    st.markdown(covenant.body_markdown)
+    if covenant.accepted:
+        st.success("You affirmed the current covenant.")
+        return
+
+    st.info(
+        "Each commitment is required for community readiness. "
+        "Your selection is recorded only when you submit the form."
+    )
+    with st.form("community-covenant"):
+        accepted_keys = {
+            affirmation.key
+            for affirmation in covenant.required_affirmations
+            if st.checkbox(
+                affirmation.label,
+                key=f"covenant-affirmation-{affirmation.key}",
+            )
+        }
+        submitted = st.form_submit_button(
+            "Affirm the covenant",
+            type="primary",
+        )
+    if submitted:
+        try:
+            service.accept_community_covenant(
+                actor,
+                covenant.id,
+                frozenset(accepted_keys),
+            )
+        except MatchwellError as error:
+            st.error(str(error))
+        else:
+            st.success("Your covenant affirmation was recorded.")
             st.rerun()
 
 
@@ -193,6 +285,49 @@ def render_assessment(service: PilotService, actor: AuthenticatedUser) -> None:
             st.error(str(error))
         else:
             st.success("Your assessment was submitted securely.")
+
+
+def render_personality(service: PilotService, actor: AuthenticatedUser) -> None:
+    st.title("Optional Personality Inventory")
+    st.caption(
+        "A non-diagnostic reflection aid. It never affects readiness, eligibility, "
+        "candidate score, rank, or rejection."
+    )
+    try:
+        inventory = service.personality_inventory(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    st.subheader(inventory.title)
+    st.write(inventory.description)
+    st.caption(
+        f"Version {inventory.version}. Items are adapted from the public-domain "
+        "International Personality Item Pool (IPIP)."
+    )
+    if inventory.completed:
+        st.success("Inventory complete. You may retake and update this version.")
+    answers: dict[str, int] = {}
+    with st.form("personality-inventory"):
+        for item in inventory.items:
+            answers[item.id] = st.slider(
+                item.prompt,
+                min_value=1,
+                max_value=5,
+                value=3,
+                help="1 means very inaccurate; 5 means very accurate.",
+                key=f"personality-{inventory.version}-{item.id}",
+            )
+        submitted = st.form_submit_button("Save personality reflection", type="primary")
+    if submitted:
+        try:
+            service.submit_personality_inventory(
+                actor, inventory.assignment_id, answers
+            )
+        except MatchwellError as error:
+            st.error(str(error))
+        else:
+            render_success_state("Your personality reflection was saved securely.")
+            st.rerun()
 
 
 def render_billing(service: PilotService, actor: AuthenticatedUser) -> None:
@@ -326,12 +461,92 @@ def render_matching(service: PilotService, actor: AuthenticatedUser) -> None:
             render_empty_state(
                 "Save your matching preferences above to enter the matching pool."
             )
-        else:
+        elif progress.matching_mode.value == "counselor_based":
             render_badges([("In the matching pool", "success")])
             st.write(
                 "A counselor reviews every candidate and must approve before "
                 "you receive an introduction."
             )
+        else:
+            render_badges([("Self-paced suggestions available", "success")])
+            st.write(
+                "Browse privacy-minimized suggestions below. Mutual interest "
+                "creates a match immediately."
+            )
+
+    if (
+        progress.matching_mode.value == "self_paced"
+        and progress.readiness.eligible
+        and preferences.completed
+    ):
+        st.subheader("Suggestions")
+        try:
+            suggestions = service.self_paced_suggestions(actor)
+        except MatchwellError as error:
+            st.error(str(error))
+            return
+        if not suggestions:
+            render_empty_state("No compatible suggestions are available right now.")
+        for suggestion in suggestions:
+            with st.container(border=True):
+                st.subheader(suggestion.display_name)
+                st.write(f"**Age band:** {suggestion.age_band}")
+                st.write(f"**General location:** {suggestion.general_location}")
+                if suggestion.denomination is not None:
+                    st.write(f"**Denomination:** {suggestion.denomination}")
+                st.write(f"**Relationship intent:** {suggestion.relationship_intent}")
+                st.write(f"**Compatibility score:** {round(suggestion.score)}")
+                for explanation in suggestion.explanations:
+                    st.caption(explanation)
+                st.caption(suggestion.personality_explanation)
+                if suggestion.incoming_interest:
+                    st.info(
+                        "This suggestion has also expressed interest. You can "
+                        "express interest to create a match or dismiss it."
+                    )
+                if suggestion.interest_status is not None:
+                    render_badges(
+                        [(humanize(suggestion.interest_status.value), "info")]
+                    )
+                left, right = st.columns(2)
+                with left:
+                    if st.button(
+                        f"Express interest in {suggestion.display_name}",
+                        key=f"interest-{suggestion.member_id}",
+                        type="primary",
+                    ):
+                        try:
+                            proposal_id = service.set_suggestion_interest(
+                                actor,
+                                suggestion.member_id,
+                                SuggestionInterestStatus.INTERESTED,
+                            )
+                        except MatchwellError as error:
+                            st.error(str(error))
+                        else:
+                            if proposal_id is None:
+                                render_success_state("Interest saved privately.")
+                            else:
+                                render_success_state(
+                                    "It is mutual — your match is active."
+                                )
+                            st.rerun()
+                with right:
+                    if st.button(
+                        f"Dismiss {suggestion.display_name}",
+                        key=f"dismiss-{suggestion.member_id}",
+                    ):
+                        try:
+                            service.set_suggestion_interest(
+                                actor,
+                                suggestion.member_id,
+                                SuggestionInterestStatus.DISMISSED,
+                            )
+                        except MatchwellError as error:
+                            st.error(str(error))
+                        else:
+                            render_success_state("Suggestion dismissed.")
+                            st.rerun()
 
 
 def render_introduction(service: PilotService, actor: AuthenticatedUser) -> None:

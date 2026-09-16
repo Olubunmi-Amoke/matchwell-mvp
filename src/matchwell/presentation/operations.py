@@ -1,8 +1,8 @@
-"""Counselor and administrator operations pages, redesigned around queues."""
+"""Counselor and Member Operations pages, redesigned around queues."""
 
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import cast
 
 import streamlit as st
@@ -21,9 +21,16 @@ from matchwell.domain.access import (
 from matchwell.domain.billing import SubscriptionStatus
 from matchwell.domain.errors import MatchwellError
 from matchwell.domain.journey import ReminderState
-from matchwell.domain.matching import CounselorReviewDecision
+from matchwell.domain.matching import (
+    CounselorReviewDecision,
+    RematchAuthorizationStatus,
+    RematchReasonCode,
+)
 from matchwell.domain.pilot import (
+    CommunityAssignmentReasonCode,
     CounselorDecisionStatus,
+    IntroductorySessionReasonCode,
+    IntroductorySessionStatus,
     InvitationInput,
     OperationsMember,
     ScreeningReasonCode,
@@ -41,8 +48,12 @@ from matchwell.presentation.theme import (
 
 
 def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
-    st.title("Pilot operations")
-    st.caption("Task-oriented queues for the pilot Center.")
+    st.title("Member Operations")
+    st.caption(
+        "Member Operations owns accounts, readiness coordination, scheduling, "
+        "and billing. Counselor Operations owns assigned-member services. "
+        "Trust & Safety owns reports, holds, and safety escalation."
+    )
     (
         dashboard_tab,
         invitation_tab,
@@ -84,6 +95,10 @@ def render_admin(service: PilotService, actor: AuthenticatedUser) -> None:
 
 def render_counselor(service: PilotService, actor: AuthenticatedUser) -> None:
     st.title("Counselor workspace")
+    st.caption(
+        "Counselor Operations: assigned-member intake, matching, introductory "
+        "sessions, and guided journeys. Trust & Safety handles safety reports."
+    )
     intake_tab, matching_tab, activity_tab, journey_tab, earnings_tab = st.tabs(
         [
             "Assigned members",
@@ -119,6 +134,11 @@ def _render_counselor_intake(
         return
 
     selected = _member_selector(members, "counselor-member")
+    try:
+        intro = service.member_introductory_session_for_counselor(actor, selected.id)
+    except MatchwellError as error:
+        st.error(str(error))
+        intro = None
     with st.container(border=True):
         render_eyebrow(f"Stage: {humanize(selected.readiness.stage.value)}")
         st.write(
@@ -140,6 +160,25 @@ def _render_counselor_intake(
             for explanation in selected.readiness.explanations:
                 st.write(f"- {explanation}")
         st.caption("Assessment answers are intentionally excluded from this queue.")
+        if intro is not None:
+            st.write(
+                "**Complimentary introductory session:** "
+                f"{humanize(intro.status.value)}"
+            )
+            if intro.scheduled_at is not None:
+                st.write(f"Scheduled {intro.scheduled_at:%Y-%m-%d %H:%M %Z}")
+            if intro.status is IntroductorySessionStatus.SCHEDULED:
+                if st.button(
+                    f"Mark {selected.display_name}'s introductory session complete",
+                    key=f"complete-intro-{selected.id}",
+                ):
+                    try:
+                        service.complete_introductory_session(actor, selected.id)
+                    except MatchwellError as error:
+                        st.error(str(error))
+                    else:
+                        render_success_state("Introductory session completed.")
+                        st.rerun()
 
     with st.form("counselor-decision"):
         status = st.selectbox(
@@ -175,6 +214,8 @@ def _render_counselor_matching(
     service: PilotService,
     actor: AuthenticatedUser,
 ) -> None:
+    _render_counselor_rematch_authorizations(service, actor)
+    st.divider()
     try:
         queue = service.candidate_queue(actor)
     except MatchwellError as error:
@@ -205,6 +246,7 @@ def _render_counselor_matching(
             st.caption("Why this candidate")
             for explanation in item.explanations:
                 st.write(f"- {explanation}")
+            st.write(f"- {item.personality_explanation}")
             with st.form(f"review-{item.proposal_id}"):
                 reason_code = st.text_input(
                     "Reason code (optional)",
@@ -239,6 +281,61 @@ def _render_counselor_matching(
                     st.error(str(error))
                 else:
                     render_success_state("Candidate review recorded.")
+                    st.rerun()
+
+
+def _render_counselor_rematch_authorizations(
+    service: PilotService, actor: AuthenticatedUser
+) -> None:
+    st.subheader("Rematch authorizations")
+    st.caption(
+        "Approve only your currently assigned member's side. Both current "
+        "counselors must approve before Member Operations can generate a "
+        "repeat proposal."
+    )
+    try:
+        authorizations = service.rematch_authorizations(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    pending = [
+        item
+        for item in authorizations
+        if item.status is RematchAuthorizationStatus.PENDING
+    ]
+    if not pending:
+        render_empty_state("No rematch authorizations are awaiting your review.")
+        return
+    for item in pending:
+        with st.container(border=True):
+            st.write(f"**{item.member_a_display_name} + {item.member_b_display_name}**")
+            render_badges(
+                [
+                    (
+                        "Member A approved"
+                        if item.counselor_a_approved
+                        else "Member A awaiting approval",
+                        "success" if item.counselor_a_approved else "warning",
+                    ),
+                    (
+                        "Member B approved"
+                        if item.counselor_b_approved
+                        else "Member B awaiting approval",
+                        "success" if item.counselor_b_approved else "warning",
+                    ),
+                ]
+            )
+            st.caption(f"Reason: {humanize(item.reason_code.value)}")
+            if item.can_approve and st.button(
+                "Approve my assigned member's side",
+                key=f"approve-rematch-{item.id}",
+            ):
+                try:
+                    service.approve_rematch_authorization(actor, item.id)
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state("Rematch authorization approval recorded.")
                     st.rerun()
 
 
@@ -366,6 +463,8 @@ def _render_counselor_journeys(
 
 
 def _render_admin_matching(service: PilotService, actor: AuthenticatedUser) -> None:
+    _render_admin_rematch_authorizations(service, actor)
+    st.divider()
     st.subheader("Candidate generation")
     st.write(
         "Generate deterministic, explainable candidate proposals for every "
@@ -435,7 +534,15 @@ def _render_candidate_diagnostics(
         for pair in diagnostics.pairs:
             label = f"{pair.member_a_display_name} + {pair.member_b_display_name}"
             if pair.eligible:
-                st.success(f"{label}: eligible for candidate generation.")
+                if (
+                    pair.rematch_authorization_status
+                    is RematchAuthorizationStatus.APPROVED
+                ):
+                    st.success(
+                        f"{label}: approved rematch authorization is ready to use."
+                    )
+                else:
+                    st.success(f"{label}: eligible for candidate generation.")
             else:
                 st.write(f"**{label}**")
                 for reason in pair.reasons:
@@ -444,6 +551,77 @@ def _render_candidate_diagnostics(
         render_empty_state(
             "At least two individually ready members are needed to evaluate a pair."
         )
+
+
+def _render_admin_rematch_authorizations(
+    service: PilotService, actor: AuthenticatedUser
+) -> None:
+    st.subheader("Audited rematch authorization")
+    st.caption(
+        "A repeat pair requires a constrained Member Operations request and "
+        "separate approval from both members' current counselors. Safety "
+        "history can never be overridden."
+    )
+    try:
+        pairs = service.historical_rematch_pairs(actor)
+        authorizations = service.rematch_authorizations(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        return
+    if pairs:
+        pair_by_label = {
+            f"{pair.member_a_display_name} + {pair.member_b_display_name}": pair
+            for pair in pairs
+        }
+        with st.form("request-rematch-authorization"):
+            selected_label = st.selectbox(
+                "Historical pair",
+                tuple(pair_by_label),
+            )
+            reason_code = st.selectbox(
+                "Constrained reason",
+                tuple(RematchReasonCode),
+                format_func=lambda value: humanize(value.value),
+            )
+            requested = st.form_submit_button("Request counselor approvals")
+        if requested:
+            selected = pair_by_label[selected_label]
+            try:
+                service.request_rematch_authorization(
+                    actor,
+                    selected.member_a_id,
+                    selected.member_b_id,
+                    reason_code,
+                )
+            except MatchwellError as error:
+                st.error(str(error))
+            else:
+                render_success_state("Rematch authorization requested.")
+                st.rerun()
+    else:
+        render_empty_state("No closed proposal history is available in this Center.")
+    if authorizations:
+        st.caption("Authorization status")
+        for item in authorizations:
+            render_badges(
+                [
+                    (
+                        f"{item.member_a_display_name} + {item.member_b_display_name}",
+                        "neutral",
+                    ),
+                    (humanize(item.status.value), "info"),
+                    (
+                        "Both counselor approvals recorded"
+                        if item.counselor_a_approved and item.counselor_b_approved
+                        else "Awaiting counselor approvals",
+                        (
+                            "success"
+                            if item.counselor_a_approved and item.counselor_b_approved
+                            else "warning"
+                        ),
+                    ),
+                ]
+            )
 
 
 def _render_invitations(service: PilotService, actor: AuthenticatedUser) -> None:
@@ -614,6 +792,8 @@ def _render_member_operations(
                 "Screening": humanize(item.screening_status.value),
                 "Hold": "Active" if item.hold_active else "None",
                 "Eligible": "Yes" if item.eligible else "No",
+                "Community": item.community_name,
+                "Matching mode": humanize(item.matching_mode.value),
                 "Account": humanize(item.account_status.value),
                 "Needs reassignment": (
                     "Yes" if item.counselor_needs_reassignment else ""
@@ -625,6 +805,120 @@ def _render_member_operations(
         use_container_width=True,
     )
     selected = _member_selector(members, "operations-member")
+    try:
+        communities = service.communities(actor)
+    except MatchwellError as error:
+        st.error(str(error))
+        communities = ()
+    st.subheader("Community assignment")
+    st.caption(
+        "Only Member Operations can change this Center-scoped assignment. "
+        "Readiness is reevaluated after a change."
+    )
+    if communities:
+        selected_community = st.selectbox(
+            "Community and matching mode",
+            options=communities,
+            index=next(
+                (
+                    index
+                    for index, community in enumerate(communities)
+                    if community.id == selected.community_id
+                ),
+                0,
+            ),
+            format_func=lambda community: (
+                f"{community.name} — {humanize(community.matching_mode.value)}"
+            ),
+            key=f"community-{selected.id}",
+        )
+        assignment_reason = st.selectbox(
+            "Community assignment reason",
+            options=list(CommunityAssignmentReasonCode),
+            format_func=lambda reason: humanize(reason.value),
+            key=f"community-reason-{selected.id}",
+        )
+        if st.button(
+            f"Assign {selected.display_name} to community",
+            key=f"assign-community-{selected.id}",
+        ):
+            try:
+                service.assign_community(
+                    actor,
+                    selected.id,
+                    selected_community.id,
+                    assignment_reason,
+                )
+            except MatchwellError as error:
+                st.error(str(error))
+            else:
+                render_success_state("Community assignment updated.")
+                st.rerun()
+    try:
+        intro = service.member_introductory_session(actor, selected.id)
+    except MatchwellError as error:
+        st.error(str(error))
+        intro = None
+
+    st.subheader("Complimentary introductory 1:1 session")
+    if intro is not None:
+        render_badges([(humanize(intro.status.value), "info")])
+        if intro.scheduled_at is not None:
+            st.write(f"Scheduled {intro.scheduled_at:%Y-%m-%d %H:%M %Z}")
+        if intro.counselor_name:
+            st.write(f"Counselor: {intro.counselor_name}")
+        if counselors and intro.status is not IntroductorySessionStatus.COMPLETED:
+            with st.form(f"intro-session-{selected.id}"):
+                intro_counselor = st.selectbox(
+                    "Assigned counselor for introductory session",
+                    options=counselors,
+                    format_func=lambda item: f"{item.name} ({item.email})",
+                )
+                intro_date = st.date_input(
+                    "Session date (UTC)", value=date.today() + timedelta(days=1)
+                )
+                intro_time = st.time_input("Session time (UTC)", value=time(12, 0))
+                st.caption(
+                    "Enter the appointment in UTC. The saved time is displayed as UTC."
+                )
+                schedule_submitted = st.form_submit_button(
+                    "Schedule or reschedule session", type="primary"
+                )
+            if schedule_submitted:
+                try:
+                    service.schedule_introductory_session(
+                        actor,
+                        selected.id,
+                        intro_counselor.id,
+                        datetime.combine(intro_date, intro_time, tzinfo=UTC),
+                    )
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state("Introductory session scheduled.")
+                    st.rerun()
+        if intro.status is IntroductorySessionStatus.SCHEDULED:
+            cancel_reason = st.selectbox(
+                "Cancellation reason",
+                options=list(IntroductorySessionReasonCode),
+                format_func=lambda item: humanize(item.value),
+                key=f"intro-cancel-reason-{selected.id}",
+            )
+            if st.button(
+                f"Cancel {selected.display_name}'s introductory session",
+                key=f"intro-cancel-{selected.id}",
+            ):
+                try:
+                    service.cancel_introductory_session(
+                        actor, selected.id, cancel_reason
+                    )
+                except MatchwellError as error:
+                    st.error(str(error))
+                else:
+                    render_success_state(
+                        "Session cancelled. The same benefit can be rescheduled."
+                    )
+                    st.rerun()
 
     if not selected.eligible:
         with st.container(border=True):

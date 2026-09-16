@@ -3,7 +3,12 @@ from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
 import pytest
+from covenant_helpers import (
+    accept_community_covenant,
+    seed_community_covenant,
+)
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from matchwell.application.pilot import PilotService
 from matchwell.domain.access import (
@@ -30,10 +35,13 @@ from matchwell.domain.matching import (
     MatchPreferencesInput,
     MemberResponseDecision,
     ProposalStatus,
+    RematchAuthorizationStatus,
+    RematchReasonCode,
     SafetyCategory,
 )
 from matchwell.domain.pilot import (
     CounselorDecisionStatus,
+    DenominationCode,
     InvitationInput,
     ProfileInput,
     ScreeningStatus,
@@ -49,6 +57,7 @@ from matchwell.infrastructure.persistence.models import (
     AssessmentDefinitionRecord,
     AuditEventRecord,
     CenterRecord,
+    CommunityCovenantDefinitionRecord,
     CommunityRecord,
     ConsentVersionRecord,
     CounselorAssignmentRecord,
@@ -56,6 +65,7 @@ from matchwell.infrastructure.persistence.models import (
     JourneyTemplateRecord,
     JourneyTemplateTaskRecord,
     MatchedPairMessageRecord,
+    MatchProposalParticipantClaimRecord,
     MatchProposalRecord,
     MemberBlockRecord,
     MemberMatchPreferencesRecord,
@@ -63,6 +73,7 @@ from matchwell.infrastructure.persistence.models import (
     OutboxMessageRecord,
     PairJourneyRecord,
     PilotPlanRecord,
+    RematchAuthorizationRecord,
     ScreeningCaseRecord,
     SubscriptionRecord,
     UserRecord,
@@ -103,6 +114,7 @@ def pilot() -> Pilot:
                 is_active=True,
             )
         )
+        seed_community_covenant(session)
         session.add(
             AssessmentDefinitionRecord(
                 id=uuid.uuid4(),
@@ -205,7 +217,7 @@ def _make_ready_member(
     birth_year: int,
     city: str,
     state: str,
-    denomination: str,
+    denomination_code: DenominationCode,
     intent: str,
     gender: Gender,
     min_partner_age: int,
@@ -219,13 +231,14 @@ def _make_ready_member(
             birth_date=date(birth_year, 1, 1),
             faith_affirmed=True,
             relationship_intent=intent,
-            denomination=denomination,
             city=city,
             state=state,
+            denomination_code=denomination_code,
         ),
     )
     consent = service.consent(member)
     service.accept_consent(member, consent.id)
+    accept_community_covenant(service, member)
     assessment = service.assessment(member)
     service.submit_assessment(
         member,
@@ -287,7 +300,7 @@ def _make_reciprocal_pair(
         birth_year=1990,
         city="Nashville",
         state="Tennessee",
-        denomination="Baptist",
+        denomination_code=DenominationCode.BAPTIST,
         intent="Seeking a committed Christian marriage",
         gender=Gender.MAN,
         min_partner_age=25,
@@ -303,7 +316,7 @@ def _make_reciprocal_pair(
         birth_year=1992,
         city="Nashville",
         state="Tennessee",
-        denomination="Baptist",
+        denomination_code=DenominationCode.BAPTIST,
         intent="Committed Christian marriage is my goal",
         gender=Gender.WOMAN,
         min_partner_age=28,
@@ -331,6 +344,20 @@ def _activate_pair(
         member_b, proposal_id, MemberResponseDecision.ACCEPTED
     )
     return proposal_id
+
+
+def _mutate_active_covenant_keys(sessions: DatabaseSessionFactory) -> None:
+    with sessions.session() as session, session.begin():
+        covenant = session.scalar(
+            select(CommunityCovenantDefinitionRecord).where(
+                CommunityCovenantDefinitionRecord.is_active.is_(True)
+            )
+        )
+        assert covenant is not None
+        covenant.required_affirmations = [
+            *covenant.required_affirmations,
+            {"key": "new_commitment", "label": "A newly required commitment."},
+        ]
 
 
 def test_full_two_member_matching_journey_activates_workspace(pilot: Pilot) -> None:
@@ -446,6 +473,69 @@ def test_active_pair_can_exchange_private_messages_with_different_counselors(
         assert outbox is not None
         assert "Hello Brooke!" not in str(audit.safe_metadata)
         assert "Hello Brooke!" not in str(outbox.payload)
+
+
+def test_fresh_covenant_readiness_closes_introduction_before_response(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    proposal_id = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(counselor_a, proposal_id, CounselorReviewDecision.APPROVED)
+    service.review_candidate(counselor_b, proposal_id, CounselorReviewDecision.APPROVED)
+    _mutate_active_covenant_keys(sessions)
+
+    with pytest.raises(ConflictError, match="no longer awaiting"):
+        service.respond_to_introduction(
+            member_a,
+            proposal_id,
+            MemberResponseDecision.ACCEPTED,
+        )
+
+    with sessions.session() as session:
+        proposal = session.get(MatchProposalRecord, proposal_id)
+        assert proposal is not None
+        assert proposal.status == ProposalStatus.CLOSED.value
+        assert proposal.closed_reason == "readiness_lost"
+        assert (
+            session.scalar(
+                select(
+                    func.count(MatchProposalParticipantClaimRecord.proposal_id)
+                ).where(MatchProposalParticipantClaimRecord.proposal_id == proposal_id)
+            )
+            == 0
+        )
+        assert (
+            session.scalar(
+                select(func.count(AuditEventRecord.id)).where(
+                    AuditEventRecord.action == "matching.closed",
+                    AuditEventRecord.subject_id == str(proposal_id),
+                )
+            )
+            == 1
+        )
+
+
+def test_fresh_covenant_readiness_blocks_active_messaging(pilot: Pilot) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service, admin, counselor_a, counselor_b, member_a, member_b
+    )
+    _mutate_active_covenant_keys(sessions)
+
+    with pytest.raises(ConflictError, match="no longer active"):
+        service.send_message(member_a, proposal_id, "This must not be sent.")
+
+    with sessions.session() as session:
+        proposal = session.get(MatchProposalRecord, proposal_id)
+        assert proposal is not None
+        assert proposal.status == ProposalStatus.CLOSED.value
+        assert proposal.closed_reason == "readiness_lost"
+        assert session.scalar(select(func.count(MatchedPairMessageRecord.id))) == 0
 
 
 def test_message_access_is_bounded_to_active_pair_participants(pilot: Pilot) -> None:
@@ -571,6 +661,35 @@ def test_counselor_assigns_journey_and_members_track_private_tasks(
         next(item for item in journey_a.tasks if item.id == shared_task.id).completed_at
         is None
     )
+
+
+def test_fresh_covenant_readiness_blocks_guided_journey_updates(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    proposal_id = _activate_pair(
+        service, admin, counselor_a, counselor_b, member_a, member_b
+    )
+    journey_id = service.assign_guided_journey(counselor_a, proposal_id)
+    journey = service.guided_journey(member_a, proposal_id)
+    assert journey is not None
+    _mutate_active_covenant_keys(sessions)
+
+    with pytest.raises(ConflictError, match="no longer active"):
+        service.set_journey_task_completion(
+            member_a,
+            journey_id,
+            journey.tasks[0].id,
+            completed=True,
+        )
+
+    with sessions.session() as session:
+        proposal = session.get(MatchProposalRecord, proposal_id)
+        assert proposal is not None
+        assert proposal.status == ProposalStatus.CLOSED.value
+        assert proposal.closed_reason == "readiness_lost"
 
 
 def test_check_in_reflection_is_private_except_to_members_own_counselor(
@@ -924,8 +1043,332 @@ def test_candidate_diagnostics_explain_prior_pair_and_safety_restriction(
     assert diagnostics.eligible_pairs == 0
     assert set(diagnostics.pairs[0].reasons) == {
         "A safety restriction prevents this pair from matching.",
-        "This pair already has proposal history and cannot be generated again.",
+        "This pair has ordinary proposal history and requires a rematch authorization.",
     }
+    with pytest.raises(ConflictError, match="Safety history"):
+        service.request_rematch_authorization(
+            admin,
+            member_a.id,
+            member_b.id,
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
+
+
+def test_rematch_requires_both_current_counselors_and_consumes_once(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    first = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(
+        counselor_a, first, CounselorReviewDecision.DECLINED, "not-ready"
+    )
+
+    assert service.generate_candidates(admin) == 0
+    diagnostic = service.candidate_generation_diagnostics(admin).pairs[0]
+    assert diagnostic.reasons == (
+        "This pair has ordinary proposal history and requires a rematch authorization.",
+    )
+
+    authorization_id = service.request_rematch_authorization(
+        admin,
+        member_a.id,
+        member_b.id,
+        RematchReasonCode.COUNSELOR_DECLINE_RECONSIDERED,
+    )
+    with pytest.raises(ConflictError):
+        service.request_rematch_authorization(
+            admin,
+            member_a.id,
+            member_b.id,
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
+    service.approve_rematch_authorization(counselor_a, authorization_id)
+    awaiting = service.candidate_generation_diagnostics(admin).pairs[0]
+    assert awaiting.reasons == (
+        "Rematch authorization is awaiting counselor approvals.",
+    )
+    assert service.generate_candidates(admin) == 0
+
+    service.approve_rematch_authorization(counselor_b, authorization_id)
+    approved = service.candidate_generation_diagnostics(admin).pairs[0]
+    assert approved.eligible
+    assert approved.rematch_authorization_status is RematchAuthorizationStatus.APPROVED
+    assert service.generate_candidates(admin) == 1
+    assert service.generate_candidates(admin) == 0
+
+    with sessions.session() as session:
+        proposals = session.scalars(
+            select(MatchProposalRecord).order_by(MatchProposalRecord.created_at)
+        ).all()
+        assert len(proposals) == 2
+        assert proposals[0].id == first
+        authorization = session.get(RematchAuthorizationRecord, authorization_id)
+        assert authorization is not None
+        assert authorization.status == RematchAuthorizationStatus.CONSUMED.value
+        assert authorization.consumed_proposal_id == proposals[1].id
+        actions = session.scalars(
+            select(AuditEventRecord.action).where(
+                AuditEventRecord.subject_id == str(authorization_id)
+            )
+        ).all()
+        assert actions == [
+            "matching.rematch_authorization_requested",
+            "matching.rematch_authorization_counselor_approved",
+            "matching.rematch_authorization_counselor_approved",
+            "matching.rematch_authorization_consumed",
+        ]
+        messages = session.scalars(
+            select(OutboxMessageRecord).where(
+                OutboxMessageRecord.event_type.like("matching.rematch_authorization_%")
+            )
+        ).all()
+        assert len(messages) == 4
+        assert all("not-ready" not in str(message.payload) for message in messages)
+        assert all(member_a.email not in str(message.payload) for message in messages)
+        assert all(member_b.email not in str(message.payload) for message in messages)
+
+
+def test_rematch_denies_wrong_or_stale_counselor(pilot: Pilot) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    counselor_c = _invite_and_sign_in(
+        service, admin, Role.COUNSELOR, "counselor-c@example.com", "counselor-c-sub"
+    )
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    first = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(counselor_a, first, CounselorReviewDecision.DECLINED)
+    authorization_id = service.request_rematch_authorization(
+        admin,
+        member_a.id,
+        member_b.id,
+        RematchReasonCode.CIRCUMSTANCES_CHANGED,
+    )
+
+    with pytest.raises(NotFoundError):
+        service.approve_rematch_authorization(counselor_c, authorization_id)
+    service.assign_counselor(admin, member_a.id, counselor_c.id)
+    with pytest.raises(ConflictError):
+        service.approve_rematch_authorization(counselor_a, authorization_id)
+    assert service.generate_candidates(admin) == 0
+
+
+def test_reassignment_revokes_authorization_and_away_back_needs_fresh_request(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    counselor_c = _invite_and_sign_in(
+        service, admin, Role.COUNSELOR, "counselor-c@example.com", "counselor-c-sub"
+    )
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    first = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(counselor_a, first, CounselorReviewDecision.DECLINED)
+    old_id = service.request_rematch_authorization(
+        admin,
+        member_a.id,
+        member_b.id,
+        RematchReasonCode.CIRCUMSTANCES_CHANGED,
+    )
+    service.approve_rematch_authorization(counselor_a, old_id)
+
+    service.assign_counselor(admin, member_a.id, counselor_c.id)
+    service.record_counselor_decision(
+        counselor_c, member_a.id, CounselorDecisionStatus.APPROVED
+    )
+    service.assign_counselor(admin, member_a.id, counselor_a.id)
+    service.record_counselor_decision(
+        counselor_a, member_a.id, CounselorDecisionStatus.APPROVED
+    )
+
+    with pytest.raises(ConflictError, match="no longer pending"):
+        service.approve_rematch_authorization(counselor_a, old_id)
+    fresh_id = service.request_rematch_authorization(
+        admin,
+        member_a.id,
+        member_b.id,
+        RematchReasonCode.CIRCUMSTANCES_CHANGED,
+    )
+    assert fresh_id != old_id
+    with sessions.session() as session:
+        old = session.get(RematchAuthorizationRecord, old_id)
+        fresh = session.get(RematchAuthorizationRecord, fresh_id)
+        current = session.scalar(
+            select(CounselorAssignmentRecord).where(
+                CounselorAssignmentRecord.member_id == member_a.id,
+                CounselorAssignmentRecord.ended_at.is_(None),
+            )
+        )
+        assert old is not None and fresh is not None and current is not None
+        assert old.status == RematchAuthorizationStatus.REVOKED.value
+        assert old.revocation_reason_code == "assignment_changed"
+        if fresh.member_a_id == member_a.id:
+            assert fresh.counselor_assignment_a_id == current.id
+            assert fresh.counselor_assignment_a_id != old.counselor_assignment_a_id
+        else:
+            assert fresh.counselor_assignment_b_id == current.id
+            assert fresh.counselor_assignment_b_id != old.counselor_assignment_b_id
+
+
+def test_rematch_requires_two_distinct_current_counselors(pilot: Pilot) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    first = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(counselor_a, first, CounselorReviewDecision.DECLINED)
+    service.assign_counselor(admin, member_b.id, counselor_a.id)
+
+    with pytest.raises(ConflictError, match="two distinct current counselors"):
+        service.request_rematch_authorization(
+            admin,
+            member_a.id,
+            member_b.id,
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
+
+
+def test_proposal_participant_claims_enforce_cross_side_uniqueness_and_release(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    proposal_id = service.candidate_queue(counselor_a)[0].proposal_id
+    with sessions.session() as session:
+        claims = session.scalars(
+            select(MatchProposalParticipantClaimRecord).where(
+                MatchProposalParticipantClaimRecord.proposal_id == proposal_id
+            )
+        ).all()
+        assert {claim.member_id for claim in claims} == {member_a.id, member_b.id}
+        conflicting_proposal = MatchProposalRecord(
+            id=uuid.uuid4(),
+            center_id=admin.center_id,
+            community_id=session.scalar(select(CommunityRecord.id)),
+            member_a_id=uuid.uuid4(),
+            member_b_id=member_a.id,
+            status=ProposalStatus.PENDING_REVIEW.value,
+            score=1,
+            score_breakdown=[],
+            counselor_a_decision=CounselorReviewDecision.PENDING.value,
+            counselor_b_decision=CounselorReviewDecision.PENDING.value,
+        )
+        session.add(conflicting_proposal)
+        session.add(
+            MatchProposalParticipantClaimRecord(
+                proposal_id=conflicting_proposal.id, member_id=member_a.id
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.flush()
+        session.rollback()
+
+    service.review_candidate(counselor_a, proposal_id, CounselorReviewDecision.DECLINED)
+    with sessions.session() as session:
+        assert (
+            session.scalar(
+                select(func.count(MatchProposalParticipantClaimRecord.member_id)).where(
+                    MatchProposalParticipantClaimRecord.proposal_id == proposal_id
+                )
+            )
+            == 0
+        )
+
+
+def test_rematch_enforces_open_and_center_boundaries(pilot: Pilot) -> None:
+    service, _ = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    with pytest.raises(ConflictError, match="still open"):
+        service.request_rematch_authorization(
+            admin,
+            member_a.id,
+            member_b.id,
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
+    other_center_admin = AuthenticatedUser(
+        id=admin.id,
+        email=admin.email,
+        name=admin.name,
+        role=Role.ADMIN,
+        center_id=uuid.uuid4(),
+    )
+    with pytest.raises(NotFoundError):
+        service.request_rematch_authorization(
+            other_center_admin,
+            member_a.id,
+            member_b.id,
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
+
+
+def test_new_safety_history_makes_approved_authorization_unusable(
+    pilot: Pilot,
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    first = service.candidate_queue(counselor_a)[0].proposal_id
+    service.review_candidate(counselor_a, first, CounselorReviewDecision.DECLINED)
+    authorization_id = service.request_rematch_authorization(
+        admin,
+        member_a.id,
+        member_b.id,
+        RematchReasonCode.CIRCUMSTANCES_CHANGED,
+    )
+    service.approve_rematch_authorization(counselor_a, authorization_id)
+    service.approve_rematch_authorization(counselor_b, authorization_id)
+    with sessions.session() as session, session.begin():
+        session.add(
+            MemberBlockRecord(
+                center_id=admin.center_id,
+                blocker_id=member_a.id,
+                blocked_id=member_b.id,
+                category=SafetyCategory.SAFETY_CONCERN.value,
+                context=None,
+            )
+        )
+
+    assert service.generate_candidates(admin) == 0
+    with sessions.session() as session:
+        authorization = session.get(RematchAuthorizationRecord, authorization_id)
+        assert authorization is not None
+        assert authorization.status == RematchAuthorizationStatus.APPROVED.value
+        assert authorization.consumed_at is None
+
+
+@pytest.mark.parametrize(
+    "closed_reason", ["member_block", "member_report", "hold_applied"]
+)
+def test_safety_history_can_never_be_authorized(
+    pilot: Pilot, closed_reason: str
+) -> None:
+    service, sessions = pilot
+    admin, counselor_a, counselor_b = _bootstrap_admin_and_counselors(service)
+    member_a, member_b = _make_reciprocal_pair(service, admin, counselor_a, counselor_b)
+    assert service.generate_candidates(admin) == 1
+    with sessions.session() as session, session.begin():
+        proposal = session.scalar(select(MatchProposalRecord))
+        assert proposal is not None
+        proposal.status = ProposalStatus.CLOSED.value
+        proposal.closed_reason = closed_reason
+        proposal.closed_at = datetime.now(UTC)
+
+    with pytest.raises(ConflictError, match="Safety history"):
+        service.request_rematch_authorization(
+            admin,
+            member_a.id,
+            member_b.id,
+            RematchReasonCode.CIRCUMSTANCES_CHANGED,
+        )
 
 
 def test_admin_reassigns_member_to_counselor_and_closes_active_workflows(
@@ -1164,7 +1607,7 @@ def test_member_without_match_preferences_is_excluded(pilot: Pilot) -> None:
         birth_year=1990,
         city="Nashville",
         state="Tennessee",
-        denomination="Baptist",
+        denomination_code=DenominationCode.BAPTIST,
         intent="Seeking a committed Christian marriage",
         gender=Gender.MAN,
         min_partner_age=25,
@@ -1180,13 +1623,14 @@ def test_member_without_match_preferences_is_excluded(pilot: Pilot) -> None:
             birth_date=date(1992, 1, 1),
             faith_affirmed=True,
             relationship_intent="Committed Christian marriage",
-            denomination="Baptist",
+            denomination_code=DenominationCode.BAPTIST,
             city="Nashville",
             state="Tennessee",
         ),
     )
     consent = service.consent(member_b)
     service.accept_consent(member_b, consent.id)
+    accept_community_covenant(service, member_b)
     assessment = service.assessment(member_b)
     service.submit_assessment(
         member_b,
@@ -1310,7 +1754,7 @@ def test_generation_assigns_each_member_to_at_most_one_candidate(
         birth_year=1993,
         city="Nashville",
         state="Tennessee",
-        denomination="Baptist",
+        denomination_code=DenominationCode.BAPTIST,
         intent="Seeking a committed Christian marriage",
         gender=Gender.WOMAN,
         min_partner_age=28,
@@ -1609,7 +2053,7 @@ def test_same_counselor_for_both_members_resolves_in_one_review(
         birth_year=1990,
         city="Nashville",
         state="Tennessee",
-        denomination="Baptist",
+        denomination_code=DenominationCode.BAPTIST,
         intent="Seeking a committed Christian marriage",
         gender=Gender.MAN,
         min_partner_age=25,
@@ -1625,7 +2069,7 @@ def test_same_counselor_for_both_members_resolves_in_one_review(
         birth_year=1992,
         city="Nashville",
         state="Tennessee",
-        denomination="Baptist",
+        denomination_code=DenominationCode.BAPTIST,
         intent="Committed Christian marriage is my goal",
         gender=Gender.WOMAN,
         min_partner_age=28,
