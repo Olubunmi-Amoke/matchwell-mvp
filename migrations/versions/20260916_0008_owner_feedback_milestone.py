@@ -113,15 +113,15 @@ def upgrade() -> None:
         sa.Column("required_acknowledgements", sa.JSON(), nullable=True),
     )
     op.execute("UPDATE consent_versions SET required_acknowledgements = '[]'")
-    op.alter_column("consent_versions", "required_acknowledgements", nullable=False)
+    with op.batch_alter_table("consent_versions") as batch:
+        batch.alter_column("required_acknowledgements", nullable=False)
     op.add_column(
         "consent_acceptances",
         sa.Column("accepted_acknowledgement_keys", sa.JSON(), nullable=True),
     )
     op.execute("UPDATE consent_acceptances SET accepted_acknowledgement_keys = '[]'")
-    op.alter_column(
-        "consent_acceptances", "accepted_acknowledgement_keys", nullable=False
-    )
+    with op.batch_alter_table("consent_acceptances") as batch:
+        batch.alter_column("accepted_acknowledgement_keys", nullable=False)
 
     with op.batch_alter_table("member_profiles") as batch:
         batch.alter_column("denomination", new_column_name="denomination_legacy")
