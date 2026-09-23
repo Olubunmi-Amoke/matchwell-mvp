@@ -312,6 +312,13 @@ uv run pytest
 - [Accessibility checklist](docs/runbooks/accessibility-checklist.md)
 - [ADR 0001: Modular monolith](docs/decisions/0001-modular-monolith.md)
 
+## Project governance
+
+- [Contributing guide](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
+- [Proprietary license](LICENSE)
+
 ## Intended repository layout
 
 ```text

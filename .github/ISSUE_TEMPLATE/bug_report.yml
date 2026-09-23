@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible product or engineering defect.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Matchwell. Do not include credentials,
+        production data, member information, private messages, counselor notes,
+        assessment answers, screening details, or payment data.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and pull requests for this problem.
+          required: true
+        - label: This report contains no secrets or sensitive personal data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+      placeholder: Describe the defect and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use only synthetic data.
+      placeholder: |
+        1. Sign in as a synthetic test role...
+        2. Open...
+        3. Select...
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Expected acceptance criteria
+      description: State the observable behavior that would resolve this issue.
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Affected workspace
+      options:
+        - Member
+        - Counselor
+        - Member Operations
+        - Webhook or background processing
+        - Infrastructure or deployment
+        - Documentation
+        - Unknown
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision or environment
+      description: Commit SHA, branch, or sanitized environment name.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Add logs or screenshots only after removing all sensitive data.

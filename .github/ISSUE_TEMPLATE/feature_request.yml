@@ -1,0 +1,59 @@
+name: Feature request
+description: Propose a testable Matchwell product improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user outcome and safety/privacy implications. Do not include
+        real member data or other sensitive information.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and pull requests for this request.
+          required: true
+        - label: This request contains no secrets or sensitive personal data.
+          required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: User outcome
+      description: Who needs this, and what should they be able to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Current problem
+      description: What prevents that outcome today?
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Acceptance criteria
+      description: List observable, testable conditions.
+      placeholder: |
+        - Given...
+        - When...
+        - Then...
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Security, privacy, and safety considerations
+      description: Consider authorization, Center isolation, sensitive data, auditability, blocking, reporting, and holds.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and alternatives
+      description: What is included, deferred, or intentionally excluded?
+    validations:
+      required: true
